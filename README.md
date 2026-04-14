@@ -1,30 +1,52 @@
 # DMuon
 
-> Dedicated parameter ownership for distributed training with matrix optimizers.
+> Dedicated ownership for Muon on PyTorch FSDP2 \
+> **One owner. One Newton-Schulz. Zero optimizer all-gather.**
 
-DMuon makes [Muon](https://arxiv.org/abs/2502.16982) work efficiently with PyTorch FSDP2. Each parameter is assigned to a single owner rank — the owner runs Newton-Schulz locally with **zero extra communication** and **1/R compute**.
+<p align="center">
+  <img src="assets/dmuon-banner.png" alt="DMuon: Standard FSDP2+Muon vs DMuon" width="100%" />
+</p>
+
+<p align="center">
+  <a href="https://pytorch.org/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-FSDP2-EE4C2C?logo=pytorch&logoColor=white"></a>
+  <a href="#tp-compatibility"><img alt="TP Compatible" src="https://img.shields.io/badge/Tensor_Parallel-compatible-blue"></a>
+  <img alt="CUDA" src="https://img.shields.io/badge/CUDA-enabled-76B900?logo=nvidia&logoColor=white">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-black"></a>
+  <img alt="status" src="https://img.shields.io/badge/status-research--preview-orange">
+</p>
+
+DMuon makes [Muon](https://arxiv.org/abs/2502.16982) work efficiently with PyTorch FSDP2 by assigning each matrix parameter to a single **owner rank**.
+
+Instead of all-gathering full gradients and redundantly running Newton-Schulz on every rank, DMuon uses a dedicated ownership model:
+
+- **Broadcast** full parameters from owner in forward
+- **Reduce** gradients to owner in backward
+- **Owner-only Newton-Schulz** in the optimizer step
+
+This eliminates extra optimizer communication and cuts redundant NS compute from R times to 1 time.
 
 ## Why DMuon?
+
+Standard FSDP2 makes matrix optimizers inefficient.
 
 Matrix optimizers (Muon, Shampoo, SOAP) need the **full gradient matrix** for Newton-Schulz orthogonalization. With standard FSDP2, this means either:
 
 - All-gathering the full gradient to every rank (**extra communication**)
 - Every rank running NS independently (**R times redundant compute**)
 
-DMuon eliminates both: the owner already has the complete gradient after `reduce`, and only the owner runs NS.
+DMuon eliminates both. The owner already has the complete gradient after `reduce`, and only the owner runs NS.
 
-```
-                    Standard FSDP2 + Muon          DMuon
-Optimizer comm      all-gather full gradient        zero
-NS compute          R times (every rank)            1 time (owner only)
-```
+| | Standard FSDP2 + Muon | DMuon |
+|---|---|---|
+| Optimizer comm | all-gather full gradient | **zero** |
+| NS compute | R times (every rank) | **1 time** (owner only) |
 
 ## Getting Started
 
 ### Install
 
 ```bash
-git clone https://github.com/user/dmuon && cd dmuon
+git clone https://github.com/StarrickLiu/dmuon && cd dmuon
 pip install -e .
 ```
 
@@ -42,7 +64,7 @@ for layer in model.layers:
 fully_shard(model, mesh=dp_mesh)
 ```
 
-That's it. Forward, backward, and optimizer communication are handled by hooks.
+That's it. Forward broadcast, backward reduce, and owner-only optimizer execution are handled by hooks.
 
 ### Full Training Example
 
@@ -62,47 +84,35 @@ for layer in model.layers:
     fully_shard(layer, mesh=mesh)
 fully_shard(model, mesh=mesh)
 
-# Get this rank's owned params for optimizer
-owned = dmuon.get_owned_params(model, mesh.get_local_rank())
+# Muon optimizer (handles dedicated + FSDP2 params automatically)
+optimizer = dmuon.Muon(model, lr=0.02, ns_steps=5, adamw_lr=1e-3)
 
 # Training loop
 for batch in dataloader:
+    optimizer.zero_grad()
     loss = model(batch).loss
     loss.backward()
-
-    # Muon step — only on owned params, zero communication
-    for dp in owned:
-        if dp._reduced_grad is not None:
-            update = newton_schulz(dp._reduced_grad)
-            dp._owned_data.add_(update, alpha=-lr)
-            dp._reduced_grad = None
+    optimizer.step()
 ```
 
 ## How It Works
 
-### Two Parallel Systems
-
 DMuon runs **alongside** FSDP2 — each manages a disjoint set of parameters:
 
-```
-Model Parameters
-    |
-    +-- proj layers (q/k/v/o/gate/up/down_proj)  -->  DMuon
-    |     storage:   owner has full param, others empty
-    |     forward:   broadcast from owner
-    |     backward:  reduce to owner
-    |     optimizer: owner runs NS (zero comm)
-    |
-    +-- other params (layernorm, embedding)  ---------> FSDP2
-          storage:   every rank has 1/R shard
-          forward:   all-gather
-          backward:  reduce-scatter
-          optimizer: every rank updates shard (SGD/AdamW)
-```
+**Dedicated parameters** (proj layers — q/k/v/o/gate/up/down_proj):
+- Owner rank stores the full parameter; others hold empty placeholders
+- Forward: broadcast from owner
+- Backward: reduce to owner
+- Optimizer: owner runs Newton-Schulz (zero communication)
 
-### Composition via `ignored_params`
+**Standard parameters** (layernorm, embedding, etc.):
+- Normal FSDP2 sharding (1/R shard per rank)
+- Forward: all-gather; Backward: reduce-scatter
+- Optimizer: every rank updates its shard (AdamW)
 
-DMuon integrates with FSDP2 the same way Activation Checkpointing does — through hooks on the same module, with no modifications to FSDP2 internals:
+### FSDP2 Composition
+
+DMuon integrates with FSDP2 through hooks on the same module, with no modifications to FSDP2 internals:
 
 1. `dedicate_params()` marks parameters with `_dedicated_owner_rank`
 2. On `import dmuon`, a monkey-patch makes `fully_shard()` auto-skip marked params
@@ -132,14 +142,25 @@ Within a DP group, all ranks share the same TP position, so broadcasting a TP sh
 
 **8 x A800-SXM4-80GB, bf16, seq=2048, bs=2**
 
-| Model | FSDP2+AdamW | DMuon | Overhead | DMuon Opt |
-|:------|----------:|------:|--------:|------:|
-| Qwen2.5-1.5B | 328 ms | 340 ms | +4% | 31 ms |
-| Llama-3.2-3B | 599 ms | 660 ms | +10% | 99 ms |
-| Qwen2.5-7B | 1,108 ms | 1,222 ms | +10% | 189 ms |
-| Llama-3.1-8B | 1,188 ms | 1,349 ms | +13% | 260 ms |
+### Total Step Time
 
-DMuon adds **4-13% overhead** vs FSDP2+AdamW for Muon training (Newton-Schulz orthogonalization on proj layers). Compared to naive FSDP2+Muon (all-gather grad + redundant NS), DMuon optimizer is **12-15x faster**.
+| Model | FSDP2+AdamW | FSDP2+Muon | DMuon | vs AdamW |
+|:------|----------:|-----------:|------:|------:|
+| Qwen2.5-1.5B | 328 ms | 684 ms | 340 ms | +4% |
+| Llama-3.2-3B | 599 ms | 1,810 ms | 660 ms | +10% |
+| Qwen2.5-7B | 1,108 ms | 3,985 ms | 1,222 ms | +10% |
+| Llama-3.1-8B | 1,188 ms | 4,617 ms | 1,349 ms | +13% |
+
+### Optimizer-Only Time
+
+| Model | AdamW | FSDP2+Muon | DMuon | Speedup |
+|:------|------:|-----------:|------:|------:|
+| Qwen2.5-1.5B | 17 ms | 373 ms | 31 ms | **12.0x** |
+| Llama-3.2-3B | 27 ms | 1,232 ms | 99 ms | **12.5x** |
+| Qwen2.5-7B | 53 ms | 2,917 ms | 189 ms | **15.5x** |
+| Llama-3.1-8B | 56 ms | 3,468 ms | 260 ms | **13.3x** |
+
+DMuon adds **4-13% total overhead** vs FSDP2+AdamW — the cost of using a matrix optimizer. The optimizer step itself is **12-15x faster** than naive FSDP2+Muon, from two factors: 1/8 parameter sharding (~8x) and Gram NS with SYRK kernel (~1.6x).
 
 All benchmarks verified: every rank produces identical loss values. See [docs/llm_benchmark.md](docs/llm_benchmark.md) for detailed phase breakdown.
 
