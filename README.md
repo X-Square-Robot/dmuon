@@ -166,9 +166,10 @@ Broadcast wins for large parameters (>100 MB) and scales better with DP group si
 - [x] FSDP2 composition
 - [x] TP compatibility
 - [x] LLM benchmarks (Qwen2.5, Llama-3)
-- [ ] Gram NS with TP SYRK decomposition (O(m^2) TP comm instead of O(mn))
-- [ ] Prefetch pipeline
-- [ ] Gradient accumulation
+- [x] Gram NS with TP SYRK decomposition (O(m^2) TP comm instead of O(mn))
+- [x] CuteDSL SYRK kernel (5/7 Gram NS ops, 1.4-1.5x E2E speedup)
+- [x] Prefetch pipeline (forward + backward)
+- [ ] Gradient accumulation (`no_sync` context manager)
 - [ ] State dict save/load
 
 See [TODO.md](TODO.md) for detailed implementation plans.
