@@ -20,14 +20,14 @@
 
 | Method | Forward | Backward | Optimizer | Total | Peak Mem |
 |--------|--------:|---------:|----------:|------:|---------:|
-| FSDP2+AdamW | 111.1 ms | 200.4 ms | 16.9 ms | 328.5 ms | 23.5 GB |
-| DDP+Muon | 94.7 ms | 240.5 ms | 2,371.3 ms | 2,706.6 ms | 28.4 GB |
-| FSDP2+Muon | 110.7 ms | 203.0 ms | 2,465.8 ms | 2,779.5 ms | 23.5 GB |
-| DMuon | 113.3 ms | 193.7 ms | 32.4 ms | 339.4 ms | 26.8 GB |
+| FSDP2+AdamW | 109.9 ms | 200.5 ms | 17.3 ms | 327.6 ms | 23.5 GB |
+| DDP+Muon | 91.7 ms | 212.6 ms | 320.7 ms | 625.0 ms | 28.4 GB |
+| FSDP2+Muon | 109.0 ms | 201.8 ms | 373.0 ms | 683.8 ms | 23.5 GB |
+| DMuon | 114.9 ms | 193.8 ms | 31.1 ms | 339.9 ms | 26.8 GB |
 
-**DMuon vs FSDP2+AdamW:** +3% overhead (339 vs 328 ms)
-**DMuon vs DDP+Muon:** 8.0x faster
-**DMuon vs FSDP2+Muon:** 8.2x faster
+**DMuon vs FSDP2+AdamW:** +4% overhead (340 vs 328 ms)
+**DMuon vs DDP+Muon:** 1.8x faster (optimizer: 10.3x)
+**DMuon vs FSDP2+Muon:** 2.0x faster (optimizer: 12.0x)
 
 ---
 
@@ -35,14 +35,14 @@
 
 | Method | Forward | Backward | Optimizer | Total | Peak Mem |
 |--------|--------:|---------:|----------:|------:|---------:|
-| FSDP2+AdamW | 197.2 ms | 376.0 ms | 26.4 ms | 599.6 ms | 29.7 GB |
-| DDP+Muon | 166.9 ms | 437.1 ms | 2,771.7 ms | 3,375.7 ms | 40.6 GB |
-| FSDP2+Muon | 199.8 ms | 382.2 ms | 2,937.7 ms | 3,519.7 ms | 29.7 GB |
-| DMuon | 196.3 ms | 364.8 ms | 99.4 ms | 660.4 ms | 38.4 GB |
+| FSDP2+AdamW | 197.5 ms | 374.9 ms | 26.5 ms | 598.9 ms | 29.7 GB |
+| DDP+Muon | 164.4 ms | 397.7 ms | 1,108.6 ms | 1,670.7 ms | 40.6 GB |
+| FSDP2+Muon | 198.1 ms | 379.3 ms | 1,232.2 ms | 1,809.5 ms | 29.7 GB |
+| DMuon | 197.1 ms | 363.7 ms | 98.8 ms | 659.6 ms | 38.4 GB |
 
-**DMuon vs FSDP2+AdamW:** +10% overhead (660 vs 600 ms)
-**DMuon vs DDP+Muon:** 5.1x faster
-**DMuon vs FSDP2+Muon:** 5.3x faster
+**DMuon vs FSDP2+AdamW:** +10% overhead (660 vs 599 ms)
+**DMuon vs DDP+Muon:** 2.5x faster (optimizer: 11.2x)
+**DMuon vs FSDP2+Muon:** 2.7x faster (optimizer: 12.5x)
 
 ---
 
@@ -52,12 +52,12 @@ DDP cannot fit 7B model in single GPU memory.
 
 | Method | Forward | Backward | Optimizer | Total | Peak Mem |
 |--------|--------:|---------:|----------:|------:|---------:|
-| FSDP2+AdamW | 358.4 ms | 701.3 ms | 53.9 ms | 1,113.6 ms | 48.8 GB |
-| FSDP2+Muon | 365.7 ms | 710.8 ms | 22,390.7 ms | 23,467.1 ms | 48.8 GB |
-| DMuon | 368.1 ms | 669.9 ms | 189.2 ms | 1,227.2 ms | 65.2 GB |
+| FSDP2+AdamW | 356.0 ms | 698.8 ms | 53.1 ms | 1,107.9 ms | 48.8 GB |
+| FSDP2+Muon | 362.6 ms | 705.5 ms | 2,917.2 ms | 3,985.3 ms | 48.8 GB |
+| DMuon | 367.0 ms | 666.3 ms | 188.8 ms | 1,222.1 ms | 65.2 GB |
 
-**DMuon vs FSDP2+AdamW:** +10% overhead (1,227 vs 1,114 ms)
-**DMuon vs FSDP2+Muon:** 19.1x faster
+**DMuon vs FSDP2+AdamW:** +10% overhead (1,222 vs 1,108 ms)
+**DMuon vs FSDP2+Muon:** 3.3x faster (optimizer: 15.5x)
 
 ---
 
@@ -67,12 +67,12 @@ DDP cannot fit 8B model in single GPU memory.
 
 | Method | Forward | Backward | Optimizer | Total | Peak Mem |
 |--------|--------:|---------:|----------:|------:|---------:|
-| FSDP2+AdamW | 380.4 ms | 756.6 ms | 55.0 ms | 1,192.0 ms | 48.4 GB |
-| FSDP2+Muon | 388.6 ms | 766.2 ms | 13,715.1 ms | 14,869.9 ms | 48.4 GB |
-| DMuon | 371.3 ms | 718.1 ms | 261.7 ms | 1,351.1 ms | 68.7 GB |
+| FSDP2+AdamW | 378.8 ms | 753.4 ms | 55.5 ms | 1,187.7 ms | 48.4 GB |
+| FSDP2+Muon | 386.5 ms | 762.2 ms | 3,467.9 ms | 4,616.7 ms | 48.4 GB |
+| DMuon | 369.5 ms | 718.9 ms | 260.4 ms | 1,348.7 ms | 68.7 GB |
 
-**DMuon vs FSDP2+AdamW:** +13% overhead (1,351 vs 1,192 ms)
-**DMuon vs FSDP2+Muon:** 11.0x faster
+**DMuon vs FSDP2+AdamW:** +13% overhead (1,349 vs 1,188 ms)
+**DMuon vs FSDP2+Muon:** 3.4x faster (optimizer: 13.3x)
 
 ---
 
@@ -82,31 +82,40 @@ DDP cannot fit 8B model in single GPU memory.
 
 | Model | FSDP2+AdamW | DDP+Muon | FSDP2+Muon | DMuon | vs AdamW |
 |-------|----------:|--------:|-----------:|------:|------:|
-| Qwen2.5-1.5B | 328 | 2,707 | 2,780 | 339 | +3% |
-| Llama-3.2-3B | 600 | 3,376 | 3,520 | 660 | +10% |
-| Qwen2.5-7B | 1,114 | — | 23,467 | 1,227 | +10% |
-| Llama-3.1-8B | 1,192 | — | 14,870 | 1,351 | +13% |
+| Qwen2.5-1.5B | 328 | 625 | 684 | 340 | +4% |
+| Llama-3.2-3B | 599 | 1,671 | 1,810 | 660 | +10% |
+| Qwen2.5-7B | 1,108 | — | 3,985 | 1,222 | +10% |
+| Llama-3.1-8B | 1,188 | — | 4,617 | 1,349 | +13% |
 
 ### Optimizer-Only Time (ms)
 
-| Model | AdamW | DDP+Muon | FSDP2+Muon | DMuon |
-|-------|------:|--------:|-----------:|------:|
-| Qwen2.5-1.5B | 16.9 | 2,371 | 2,466 | 32.4 |
-| Llama-3.2-3B | 26.4 | 2,772 | 2,938 | 99.4 |
-| Qwen2.5-7B | 53.9 | — | 22,391 | 189.2 |
-| Llama-3.1-8B | 55.0 | — | 13,715 | 261.7 |
+| Model | AdamW | DDP+Muon | FSDP2+Muon | DMuon | Speedup vs FSDP2+Muon |
+|-------|------:|--------:|-----------:|------:|------:|
+| Qwen2.5-1.5B | 17.3 | 320.7 | 373.0 | 31.1 | 12.0x |
+| Llama-3.2-3B | 26.5 | 1,108.6 | 1,232.2 | 98.8 | 12.5x |
+| Qwen2.5-7B | 53.1 | — | 2,917.2 | 188.8 | 15.5x |
+| Llama-3.1-8B | 55.5 | — | 3,467.9 | 260.4 | 13.3x |
 
 ### Key Observations
 
-1. **DMuon adds 3-13% overhead** vs FSDP2+AdamW. The overhead comes from the Muon optimizer step (Newton-Schulz orthogonalization on proj layers), which is the cost of using a matrix optimizer instead of AdamW.
+1. **DMuon adds 4-13% overhead** vs FSDP2+AdamW. The overhead comes from the Muon optimizer step (Newton-Schulz orthogonalization on proj layers), which is the cost of using a matrix optimizer instead of AdamW.
 
-2. **DMuon is 5-19x faster** than naive FSDP2+Muon. Without DMuon, using Muon with FSDP2 requires per-parameter all-gather + redundant NS on every rank, making the optimizer step 100-400x slower than AdamW. DMuon reduces this to 2-5x slower than AdamW by running NS only on the owner rank.
+2. **DMuon is 12-15x faster** (optimizer-only) than naive FSDP2+Muon. Without DMuon, using Muon with FSDP2 requires per-parameter all-gather + redundant NS on every rank, making the optimizer step 20-60x slower than AdamW. DMuon reduces this to 2-5x slower than AdamW by running NS only on the owner rank with 1/8 parameters.
 
 3. **Forward/backward times are similar** across all methods (~same model, same compute). The difference is entirely in the optimizer step.
 
-4. **DMuon uses more memory** than FSDP2 (26-69 GB vs 23-48 GB) because the owner stores full parameters. This is the memory-compute tradeoff of dedicated ownership.
+4. **DMuon uses more memory** than FSDP2 (27-69 GB vs 24-48 GB) because the owner stores full parameters. This is the memory-compute tradeoff of dedicated ownership.
 
-5. **DMuon optimizer scales with model size**: 32ms (1.5B) → 99ms (3B) → 189ms (7B) → 262ms (8B). The owner runs NS on ~1/8 of all proj params, with CuteDSL SYRK accelerating 5/7 symmetric operations.
+5. **DMuon optimizer scales with model size**: 31ms (1.5B) -> 99ms (3B) -> 189ms (7B) -> 260ms (8B). The owner runs NS on ~1/8 of all proj params, with CuteDSL SYRK accelerating 5/7 symmetric operations.
+
+### Where Does the 12-15x Speedup Come From?
+
+DMuon optimizer speedup over FSDP2+Muon decomposes into two factors:
+
+- **1/8 sharding**: each rank owns ~1/8 of proj params -> ~8x reduction
+- **Gram NS + SYRK**: operates on (min(m,n), min(m,n)) Gram space with SYRK kernel -> ~1.6x additional speedup
+
+Combined: ~8 x 1.6 = ~12.8x, consistent with measured 12-15x.
 
 ---
 

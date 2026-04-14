@@ -37,14 +37,24 @@ def make_llama_config():
 
 
 def newton_schulz_baseline(G, steps=5):
-    """Baseline NS used in DDP+Muon (every rank, redundant)."""
+    """Baseline NS used in DDP+Muon (every rank, redundant).
+
+    Transposes when m > n so NS operates on the smaller (n, n) Gram space,
+    matching standard Muon practice.
+    """
     a, b, c = 3.4445, -4.7750, 2.0315
-    X = G / (G.norm() + 1e-7)
+    X = G.float()
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.T
+    X = X / (X.norm() + 1e-7)
     X = X.to(torch.bfloat16)
     for _ in range(steps):
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
+    if transposed:
+        X = X.T
     return X
 
 

@@ -134,12 +134,12 @@ Within a DP group, all ranks share the same TP position, so broadcasting a TP sh
 
 | Model | FSDP2+AdamW | DMuon | Overhead | DMuon Opt |
 |:------|----------:|------:|--------:|------:|
-| Qwen2.5-1.5B | 328 ms | 339 ms | +3% | 32 ms |
-| Llama-3.2-3B | 600 ms | 660 ms | +10% | 99 ms |
-| Qwen2.5-7B | 1,114 ms | 1,227 ms | +10% | 189 ms |
-| Llama-3.1-8B | 1,192 ms | 1,351 ms | +13% | 262 ms |
+| Qwen2.5-1.5B | 328 ms | 340 ms | +4% | 31 ms |
+| Llama-3.2-3B | 599 ms | 660 ms | +10% | 99 ms |
+| Qwen2.5-7B | 1,108 ms | 1,222 ms | +10% | 189 ms |
+| Llama-3.1-8B | 1,188 ms | 1,349 ms | +13% | 260 ms |
 
-DMuon adds **3-13% overhead** vs FSDP2+AdamW for Muon training (Newton-Schulz orthogonalization on proj layers). Compared to naive FSDP2+Muon (all-gather grad + redundant NS), DMuon is **4-19x faster**.
+DMuon adds **4-13% overhead** vs FSDP2+AdamW for Muon training (Newton-Schulz orthogonalization on proj layers). Compared to naive FSDP2+Muon (all-gather grad + redundant NS), DMuon optimizer is **12-15x faster**.
 
 All benchmarks verified: every rank produces identical loss values. See [docs/llm_benchmark.md](docs/llm_benchmark.md) for detailed phase breakdown.
 
