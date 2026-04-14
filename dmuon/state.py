@@ -1,10 +1,25 @@
-"""DedicatedState: hook management for dedicated parameter groups."""
+"""DedicatedState: hook management for dedicated parameter groups.
+
+Registers forward pre/post hooks and backward hooks on a layer module:
+- pre_forward: dispatch broadcast on broadcast_stream, wait, finalize
+- post_forward: reshard, record post-forward order, register backward hooks
+- pre_backward: unshard (dispatch + wait), prefetch next layer
+- post_backward: reduce grads (dispatch + wait), reshard
+"""
+
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
+from .comm import DedicatedCommContext
 from .group import DedicatedParamGroup
+
+
+def _is_backward_pass() -> bool:
+    """Check if we are inside a backward pass (used to guard AC recompute)."""
+    return torch._C._current_graph_task_id() != -1
 
 
 class _DedicatedPreBackward(torch.autograd.Function):
@@ -17,24 +32,39 @@ class _DedicatedPreBackward(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grads):
-        # Pre-backward: unshard params so backward can compute gradients
-        ctx.group.unshard()
+        group = ctx.group
+        # Unshard: dispatch (no-op if already prefetched) + wait
+        group.unshard()
+        group.wait_for_unshard()
+        # Prefetch next layer's unshard (dispatch only, no wait)
+        group._backward_prefetch()
         return (None,) + grads
 
 
 class DedicatedState:
-    """Manages hooks for dedicated parameters on a module.
+    """Manages hooks for dedicated parameters on a layer module.
 
     Registers forward pre/post hooks and backward hooks:
     - pre_forward: broadcast params from owners (unshard)
-    - post_forward: reshard + register pre-backward hook via autograd Function
-    - post_backward: reduce grads to owners + reshard (via param grad hooks)
+    - post_forward: reshard + record post-forward order + register backward hooks
+    - pre_backward: unshard + prefetch next layer (via autograd Function)
+    - post_backward: reduce grads + reshard (via param grad hooks)
     """
 
-    def __init__(self, module: nn.Module, group: DedicatedParamGroup):
+    def __init__(
+        self,
+        module: nn.Module,
+        group: DedicatedParamGroup,
+        comm_ctx: DedicatedCommContext,
+        reshard_after_forward: bool = True,
+    ):
         self.module = module
         self.group = group
+        self.comm_ctx = comm_ctx
+        self.reshard_after_forward = reshard_after_forward
         self._grad_hook_handles: list = []
+        # Linked by api.py for forward prefetch (next layer's group)
+        self._next_group: Optional[DedicatedParamGroup] = None
 
         # Register hooks (after FSDP2 hooks since FSDP2 uses prepend=True)
         self._pre_forward_handle = module.register_forward_pre_hook(
@@ -43,18 +73,27 @@ class DedicatedState:
         self._post_forward_handle = module.register_forward_hook(self._post_forward)
 
     def _pre_forward(self, module: nn.Module, args, kwargs):
-        """Broadcast dedicated params from owners."""
-        self.group.unshard()
+        """Dispatch broadcasts on broadcast_stream, wait, finalize params."""
+        self.group.unshard()            # no-op if already unsharded or prefetched
+        self.group.wait_for_unshard()   # no-op if already unsharded
+        # Forward prefetch: dispatch next layer's unshard (no wait)
+        if self._next_group is not None:
+            self._next_group.unshard()  # no-op if already unsharded
         return args, kwargs
 
     def _post_forward(self, module: nn.Module, input, output):
-        """Reshard dedicated params and register backward hooks."""
+        """Reshard params (if enabled), record forward order, register backward hooks."""
         # Register post-backward gradient hooks on unsharded params
         # (must do before reshard since we need the unsharded param refs)
         if torch.is_grad_enabled():
             self._register_grad_hooks()
 
-        self.group.reshard()
+        if self.reshard_after_forward:
+            self.group.reshard()
+
+        # Record post-forward order for backward prefetch (skip during AC recompute)
+        if not _is_backward_pass():
+            self.group._record_post_forward()
 
         # Register pre-backward hook via autograd Function
         if torch.is_grad_enabled():
@@ -82,7 +121,7 @@ class DedicatedState:
         return tree_unflatten(new_flat, spec)
 
     def _register_grad_hooks(self):
-        """Register hooks on parameters to trigger reduce after grad is computed."""
+        """Register hooks on parameters to trigger reduce after all grads computed."""
         # Remove previous hooks
         for handle in self._grad_hook_handles:
             handle.remove()
@@ -102,9 +141,17 @@ class DedicatedState:
 
         def make_hook(dedicated_param):
             def hook(grad):
+                # Forward grad to current _unsharded_param so reduce_grads can find it.
+                # Needed because reshard+re-unshard creates a NEW _unsharded_param,
+                # but autograd computes grad on the OLD one (from forward).
+                if dedicated_param._unsharded_param is not None:
+                    dedicated_param._unsharded_param.grad = grad
                 grad_count[0] += 1
                 if grad_count[0] >= total:
-                    # All grads computed — reduce to owners and reshard
+                    # All grads computed — dispatch reduce (async) + reshard.
+                    # Do NOT wait for reduce here — let it overlap with next layer's
+                    # backward. wait_for_reduce is deferred to before the optimizer step
+                    # via dmuon.wait_all_reduces(model).
                     self.group.reduce_grads()
                     self.group.reshard()
                 return grad

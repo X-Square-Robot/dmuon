@@ -15,6 +15,7 @@ def install_patch():
         return
 
     import torch.distributed.fsdp._fully_shard._fsdp_init as _fsdp_init
+    import torch.distributed.fsdp._fully_shard._fully_shard as _fully_shard_mod
 
     _original_fn = _fsdp_init._get_managed_states
 
@@ -27,7 +28,9 @@ def install_patch():
                     ignored_params.add(param)
         return _original_fn(modules, ignored_params)
 
+    # Patch both the definition site and the import site
     _fsdp_init._get_managed_states = _patched_get_managed_states
+    _fully_shard_mod._get_managed_states = _patched_get_managed_states
     _installed = True
 
 
@@ -38,7 +41,9 @@ def uninstall_patch():
         return
 
     import torch.distributed.fsdp._fully_shard._fsdp_init as _fsdp_init
+    import torch.distributed.fsdp._fully_shard._fully_shard as _fully_shard_mod
 
     _fsdp_init._get_managed_states = _original_fn
+    _fully_shard_mod._get_managed_states = _original_fn
     _original_fn = None
     _installed = False

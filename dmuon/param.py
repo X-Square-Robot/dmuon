@@ -74,6 +74,8 @@ class DedicatedParam:
             torch.empty(0, dtype=self._orig_dtype, device=device),
             requires_grad=self._requires_grad,
         )
+        # Mark placeholder so the FSDP2 patch also ignores it
+        self._placeholder._dedicated_owner_rank = owner_rank
 
         # Unsharded parameter (populated after broadcast)
         self._unsharded_param: Optional[nn.Parameter] = None
@@ -100,17 +102,29 @@ class DedicatedParam:
     def numel(self) -> int:
         return self._orig_size.numel()
 
+    @property
+    def tp_group(self) -> Optional[dist.ProcessGroup]:
+        """Get TP process group if this is a DTensor param."""
+        if self.is_dtensor and self._tp_spec is not None:
+            return self._tp_spec.mesh.get_group(mesh_dim=0)
+        return None
+
     # ---- unshard (broadcast) ----
 
-    def alloc_and_broadcast(self, async_op: bool = True) -> Optional[dist.Work]:
-        """Allocate buffer and broadcast from owner."""
+    def alloc_and_broadcast(self, async_op: bool = False) -> Optional[dist.Work]:
+        """Allocate buffer and broadcast from owner.
+
+        When called from DedicatedParamGroup, async_op=False is used because the
+        caller is already on the dedicated broadcast_stream. Stream-based dispatch
+        replaces Work-based async.
+        """
         # Use compute_dtype (bf16) for communication if available, else orig_dtype
         comm_dtype = self._compute_dtype or self._orig_dtype
         buf = torch.empty(self._orig_size, dtype=comm_dtype, device=self.device)
         if self.is_owner:
             assert self._owned_data is not None, "Owner must have _owned_data"
             buf.copy_(self._owned_data.to(comm_dtype))
-        work = dist.broadcast(
+        work = dist.broadcast( 
             buf, src=self._owner_global_rank, group=self.dp_group, async_op=async_op
         )
         self._broadcast_buf = buf
@@ -138,7 +152,7 @@ class DedicatedParam:
 
     # ---- gradient reduction ----
 
-    def reduce_grad(self, async_op: bool = True) -> Optional[dist.Work]:
+    def reduce_grad(self, async_op: bool = False) -> Optional[dist.Work]:
         """Reduce gradient to owner rank."""
         if self._unsharded_param is None or self._unsharded_param.grad is None:
             return None

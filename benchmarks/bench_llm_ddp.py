@@ -26,7 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dmuon import dedicate_params
+from dmuon import Muon, dedicate_params, wait_all_reduces
 from dmuon.utils import get_owned_params
 
 
@@ -87,8 +87,8 @@ def bench_fn(fn, warmup=3, repeat=8):
 
 def run_ddp_muon(build_fn, device, mesh, rank, world_size):
     """DDP: every rank has full model, all-reduce grads, then NS locally."""
-    seq_len = 64
-    batch_size = 1
+    seq_len = 2048
+    batch_size = 2
 
     torch.manual_seed(42)
     model, model_name = build_fn(device)
@@ -140,8 +140,8 @@ def run_ddp_muon(build_fn, device, mesh, rank, world_size):
 def run_dmuon(build_fn, device, mesh, rank, world_size):
     """DMuon: dedicated ownership, owner-only NS."""
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
-    seq_len = 64
-    batch_size = 1
+    seq_len = 2048
+    batch_size = 2
 
     torch.manual_seed(42)
     model, model_name = build_fn(device)
@@ -154,39 +154,27 @@ def run_dmuon(build_fn, device, mesh, rank, world_size):
         model, mesh,
         predicate=lambda name, param: "proj" in name and param.ndim == 2,
         compute_dtype=torch.bfloat16,
+        reshard_after_forward=False,
     )
     for layer in model.model.layers:
         fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
     fully_shard(model, mesh=mesh, mp_policy=mp_policy)
 
-    owned = get_owned_params(model, mesh.get_local_rank())
+    optimizer = Muon(model, lr=0.01, ns_steps=5, adamw_lr=0.01)
 
     if rank == 0:
         n_dedicated = sum(1 for m in model.modules() if hasattr(m, '_dedicated_state')
                           for _ in m._dedicated_state.group.params)
-        print(f"    Dedicated params: {n_dedicated}, rank 0 owns: {len(owned)}")
+        print(f"    Dedicated params: {n_dedicated}, rank 0 owns: {len(optimizer._dedicated_params)}")
 
     input_ids = torch.randint(0, 1000, (batch_size, seq_len), device=device)
     labels = torch.randint(0, 1000, (batch_size, seq_len), device=device)
 
     def step():
+        optimizer.zero_grad()
         out = model(input_ids=input_ids, labels=labels)
         out.loss.backward()
-        for dp in owned:
-            if dp._reduced_grad is not None:
-                G = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1).to(torch.bfloat16)
-                update = newton_schulz(G)
-                dp._owned_data.add_(update.view(dp._owned_data.shape).to(dp._owned_data.dtype), alpha=-0.01)
-                dp._reduced_grad = None
-        for module in model.modules():
-            state = getattr(module, '_get_fsdp_state', lambda: None)()
-            if state is None or state._fsdp_param_group is None:
-                continue
-            for fp in state._fsdp_param_group.fsdp_params:
-                if fp.sharded_param.grad is not None:
-                    fp.sharded_param._local_tensor.add_(
-                        fp.sharded_param.grad._local_tensor, alpha=-0.01)
-                    fp.sharded_param.grad = None
+        optimizer.step()
         return out.loss.item()
 
     dmuon_ms = bench_fn(step)
@@ -221,8 +209,8 @@ def run_dmuon(build_fn, device, mesh, rank, world_size):
 def run_fsdp_redundant(build_fn, device, mesh, rank, world_size):
     """FSDP2 + redundant NS: all-gather grad per param, every rank runs NS."""
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
-    seq_len = 64
-    batch_size = 1
+    seq_len = 2048
+    batch_size = 2
     local_rank = mesh.get_local_rank()
 
     torch.manual_seed(42)

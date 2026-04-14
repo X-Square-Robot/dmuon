@@ -6,22 +6,43 @@ and performs Newton-Schulz orthogonalization locally — zero extra communicatio
 
 Usage::
 
-    from dmuon import dedicate_params
+    import dmuon
     from torch.distributed.fsdp import fully_shard
 
-    dedicate_params(model, dp_mesh, predicate=lambda n, p: "proj" in n)
+    dmuon.dedicate_params(model, dp_mesh, predicate=lambda n, p: "proj" in n)
     for layer in model.layers:
         fully_shard(layer, mesh=dp_mesh)
     fully_shard(model, mesh=dp_mesh)
+
+    optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95)
+
+    for batch in dataloader:
+        optimizer.zero_grad()
+        loss = model(batch).loss
+        loss.backward()
+        optimizer.step()
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .api import dedicate_params
+from .comm import DedicatedCommContext
+from .optim import Muon, get_ns_backend, gram_newton_schulz, newton_schulz
 from .patch import install_patch
-from .utils import get_dedicated_params, get_owned_params
+from .utils import get_comm_ctx, get_dedicated_params, get_owned_params, wait_all_reduces
 
 # Auto-install monkey-patch so fully_shard() skips dedicated params
 install_patch()
 
-__all__ = ["dedicate_params", "get_dedicated_params", "get_owned_params"]
+__all__ = [
+    "dedicate_params",
+    "Muon",
+    "newton_schulz",
+    "gram_newton_schulz",
+    "get_ns_backend",
+    "get_comm_ctx",
+    "get_dedicated_params",
+    "get_owned_params",
+    "DedicatedCommContext",
+    "wait_all_reduces",
+]

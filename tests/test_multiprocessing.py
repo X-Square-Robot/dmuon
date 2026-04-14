@@ -13,19 +13,9 @@ import torch.nn as nn
 # Add parent dir to path for import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dmuon.comm import DedicatedCommContext
 from dmuon.group import DedicatedParamGroup
 from dmuon.param import DedicatedParam
-
-
-def setup():
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    torch.cuda.set_device(rank)
-    return rank, dist.get_world_size()
-
-
-def cleanup():
-    dist.destroy_process_group()
 
 
 def log(rank, msg):
@@ -33,17 +23,16 @@ def log(rank, msg):
         print(msg, flush=True)
 
 
-def test_single_param_broadcast():
-    """Test: owner broadcasts full param, all ranks receive same data."""
-    rank, world_size = setup()
-    device = torch.device("cuda", rank)
-    group = dist.group.WORLD
+def make_comm_ctx(device):
+    return DedicatedCommContext(device)
 
-    # Create a parameter owned by rank 2
+
+def test_single_param_broadcast(rank, world_size, device, dp_group):
+    """Test: owner broadcasts full param, all ranks receive same data."""
+    comm_ctx = make_comm_ctx(device)
+
     owner_rank = 2
     param = nn.Parameter(torch.randn(64, 128, device=device))
-    # All ranks should have the same initial value for verification
-    # Set a known value on owner
     if rank == owner_rank:
         param.data.fill_(42.0)
 
@@ -51,15 +40,10 @@ def test_single_param_broadcast():
     module.weight = param
 
     d_param = DedicatedParam(
-        param=param,
-        module=module,
-        param_name="weight",
-        owner_rank=owner_rank,
-        dp_group=group,
-        device=device,
+        param=param, module=module, param_name="weight",
+        owner_rank=owner_rank, dp_group=dp_group, device=device,
     )
 
-    # After init: owner has data, non-owner has empty
     if rank == owner_rank:
         assert d_param._owned_data is not None
         assert d_param._owned_data.shape == (64, 128)
@@ -67,34 +51,27 @@ def test_single_param_broadcast():
     else:
         assert d_param._owned_data is None
 
-    # Unshard (broadcast)
-    work = d_param.alloc_and_broadcast(async_op=True)
-    if work is not None:
-        work.wait()
-    d_param.finish_unshard()
+    param_group = DedicatedParamGroup([d_param], comm_ctx)
+    param_group.unshard()
+    param_group.wait_for_unshard()
 
-    # All ranks should now have the same param value
     assert d_param._unsharded_param is not None
     assert d_param._unsharded_param.shape == (64, 128)
     assert d_param._unsharded_param.data.mean().item() == 42.0, (
         f"Rank {rank}: expected 42.0, got {d_param._unsharded_param.data.mean().item()}"
     )
 
-    # Reshard
     d_param.reshard()
     assert d_param._unsharded_param is None
 
+    torch.cuda.synchronize()
     log(rank, "PASSED: test_single_param_broadcast")
-    cleanup()
 
 
-def test_group_packed_broadcast():
+def test_group_packed_broadcast(rank, world_size, device, dp_group):
     """Test: DedicatedParamGroup packs same-owner params and broadcasts correctly."""
-    rank, world_size = setup()
-    device = torch.device("cuda", rank)
-    group = dist.group.WORLD
+    comm_ctx = make_comm_ctx(device)
 
-    # Create 3 params with different owners
     modules = []
     d_params = []
     expected_values = {0: 10.0, 1: 20.0, 2: 30.0}
@@ -104,67 +81,52 @@ def test_group_packed_broadcast():
         if rank == owner:
             m.weight.data.fill_(val)
         d_param = DedicatedParam(
-            param=m.weight,
-            module=m,
-            param_name="weight",
-            owner_rank=owner,
-            dp_group=group,
-            device=device,
+            param=m.weight, module=m, param_name="weight",
+            owner_rank=owner, dp_group=dp_group, device=device,
         )
         modules.append(m)
         d_params.append(d_param)
 
-    # Create group
-    param_group = DedicatedParamGroup(d_params)
+    param_group = DedicatedParamGroup(d_params, comm_ctx)
 
-    # Unshard
     param_group.unshard()
+    param_group.wait_for_unshard()
 
-    # Verify all ranks have correct values
     for i, (owner, val) in enumerate(expected_values.items()):
         actual = d_params[i]._unsharded_param.data.mean().item()
         assert abs(actual - val) < 1e-5, (
             f"Rank {rank}, param {i} (owner={owner}): expected {val}, got {actual}"
         )
 
-    # Reshard
     param_group.reshard()
 
+    torch.cuda.synchronize()
     log(rank, "PASSED: test_group_packed_broadcast")
-    cleanup()
 
 
-def test_gradient_reduce():
+def test_gradient_reduce(rank, world_size, device, dp_group):
     """Test: gradients are correctly reduced to owner."""
-    rank, world_size = setup()
-    device = torch.device("cuda", rank)
-    group = dist.group.WORLD
+    comm_ctx = make_comm_ctx(device)
 
     owner_rank = 3
     m = nn.Linear(32, 16, bias=False, device=device)
     m.weight.data.fill_(1.0)
 
     d_param = DedicatedParam(
-        param=m.weight,
-        module=m,
-        param_name="weight",
-        owner_rank=owner_rank,
-        dp_group=group,
-        device=device,
+        param=m.weight, module=m, param_name="weight",
+        owner_rank=owner_rank, dp_group=dp_group, device=device,
     )
 
-    param_group = DedicatedParamGroup([d_param])
+    param_group = DedicatedParamGroup([d_param], comm_ctx)
 
-    # Unshard
     param_group.unshard()
+    param_group.wait_for_unshard()
 
-    # Simulate gradient: each rank has grad = rank + 1
     d_param._unsharded_param.grad = torch.full_like(d_param._unsharded_param.data, float(rank + 1))
 
-    # Reduce grads (AVG)
     param_group.reduce_grads()
+    param_group.wait_for_reduce()
 
-    # Owner should have avg gradient = (1+2+...+8)/8 = 4.5
     if rank == owner_rank:
         assert d_param._reduced_grad is not None
         expected_avg = sum(range(1, world_size + 1)) / world_size
@@ -172,65 +134,46 @@ def test_gradient_reduce():
         assert abs(actual - expected_avg) < 1e-4, (
             f"Owner rank {rank}: expected avg grad {expected_avg}, got {actual}"
         )
-    else:
-        # Non-owner should not have reduced grad (or it's None)
-        pass
 
-    # Reshard
     param_group.reshard()
 
+    torch.cuda.synchronize()
     log(rank, "PASSED: test_gradient_reduce")
-    cleanup()
 
 
-def test_forward_backward_e2e():
+def test_forward_backward_e2e(rank, world_size, device, dp_group):
     """Test: full forward + backward with DedicatedParamGroup."""
-    rank, world_size = setup()
-    device = torch.device("cuda", rank)
-    group = dist.group.WORLD
+    comm_ctx = make_comm_ctx(device)
 
-    # Simple model: 2 linears
     linear1 = nn.Linear(32, 64, bias=False, device=device)
     linear2 = nn.Linear(64, 16, bias=False, device=device)
 
-    # Make all ranks start with same weights
     torch.manual_seed(42)
     linear1.weight.data = torch.randn(64, 32, device=device)
     linear2.weight.data = torch.randn(16, 64, device=device)
 
-    # Dedicate linear1 to rank 0, linear2 to rank 1
     d_param1 = DedicatedParam(
-        param=linear1.weight,
-        module=linear1,
-        param_name="weight",
-        owner_rank=0,
-        dp_group=group,
-        device=device,
+        param=linear1.weight, module=linear1, param_name="weight",
+        owner_rank=0, dp_group=dp_group, device=device,
     )
     d_param2 = DedicatedParam(
-        param=linear2.weight,
-        module=linear2,
-        param_name="weight",
-        owner_rank=1,
-        dp_group=group,
-        device=device,
+        param=linear2.weight, module=linear2, param_name="weight",
+        owner_rank=1, dp_group=dp_group, device=device,
     )
 
-    param_group = DedicatedParamGroup([d_param1, d_param2])
+    param_group = DedicatedParamGroup([d_param1, d_param2], comm_ctx)
 
-    # Forward
     param_group.unshard()
+    param_group.wait_for_unshard()
     x = torch.randn(4, 32, device=device)
     y = linear2(linear1(x))
     loss = y.sum()
 
-    # Backward
     loss.backward()
 
-    # Reduce grads
     param_group.reduce_grads()
+    param_group.wait_for_reduce()
 
-    # Verify owner has grads
     if rank == 0:
         assert d_param1._reduced_grad is not None, "Rank 0 should have grad for linear1"
         assert d_param1._reduced_grad.shape == (64, 32)
@@ -240,11 +183,18 @@ def test_forward_backward_e2e():
 
     param_group.reshard()
 
+    torch.cuda.synchronize()
     log(rank, "PASSED: test_forward_backward_e2e")
-    cleanup()
 
 
 if __name__ == "__main__":
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dp_group = dist.group.WORLD
+
     test_name = sys.argv[1] if len(sys.argv) > 1 else "all"
 
     tests = {
@@ -256,12 +206,17 @@ if __name__ == "__main__":
 
     if test_name == "all":
         for name, fn in tests.items():
-            print(f"\n{'=' * 60}")
-            print(f"Running: {name}")
-            print(f"{'=' * 60}")
-            fn()
+            log(rank, f"\n{'=' * 60}")
+            log(rank, f"Running: {name}")
+            log(rank, f"{'=' * 60}")
+            dist.barrier()
+            fn(rank, world_size, device, dp_group)
+            dist.barrier()
     elif test_name in tests:
-        tests[test_name]()
+        tests[test_name](rank, world_size, device, dp_group)
     else:
-        print(f"Unknown test: {test_name}. Available: {list(tests.keys())}")
+        if rank == 0:
+            print(f"Unknown test: {test_name}. Available: {list(tests.keys())}")
         sys.exit(1)
+
+    dist.destroy_process_group()

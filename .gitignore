@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -5,5 +6,35 @@ dist/
 build/
 .eggs/
 *.so
+
+# Tools
 .ruff_cache/
 .pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+*.env
+
+# PyTorch / CUDA
+*.pt
+*.pth
+*.bin
+
+# Profiling traces
+*.json.gz
+profile_traces/
+benchmarks/profiles/
+
+# CuteDSL kernel cache
+dmuon_kernel_cache/
+
+# OS
+.DS_Store
+Thumbs.db

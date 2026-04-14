@@ -14,6 +14,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+syrk = [
+    "nvidia-cutlass-dsl>=4.4.2",
+    "apache-tvm-ffi>=0.1.6,<0.2",
+    "torch-c-dlpack-ext",
+]
 dev = [
     "pytest",
     "ruff",

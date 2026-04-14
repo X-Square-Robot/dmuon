@@ -173,6 +173,28 @@ Broadcast wins for large parameters (>100 MB) and scales better with DP group si
 
 See [TODO.md](TODO.md) for detailed implementation plans.
 
+## Acknowledgments
+
+The Gram Newton-Schulz iteration in DMuon is adapted from
+[Dao-AILab/gram-newton-schulz](https://github.com/Dao-AILab/gram-newton-schulz),
+including per-step coefficients, restart mechanism, and the SYRK symmetry optimization.
+
+The CuteDSL SYRK kernel is adapted from [quack](https://github.com/Dao-AILab/quack)
+by Tri Dao et al.
+
+## Citation
+
+If you use DMuon, please also cite:
+
+```bibtex
+@misc{GramNewtonSchulz,
+  title   = {Gram Newton-Schulz},
+  author  = {Jack Zhang and Noah Amsel and Berlin Chen and Tri Dao},
+  year    = {2026},
+  url     = {https://dao-ailab.github.io/blog/2026/gram-newton-schulz/}
+}
+```
+
 ## License
 
 Apache 2.0
