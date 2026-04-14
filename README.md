@@ -130,34 +130,18 @@ Within a DP group, all ranks share the same TP position, so broadcasting a TP sh
 
 ## Benchmarks
 
-**8 x A800-SXM4-80GB, bf16, seq_len=64**
+**8 x A800-SXM4-80GB, bf16, seq=2048, bs=2**
 
-### vs DDP + Muon
+| Model | FSDP2+AdamW | DMuon | Overhead | DMuon Opt |
+|:------|----------:|------:|--------:|------:|
+| Qwen2.5-1.5B | 328 ms | 339 ms | +3% | 32 ms |
+| Llama-3.2-3B | 600 ms | 660 ms | +10% | 99 ms |
+| Qwen2.5-7B | 1,114 ms | 1,227 ms | +10% | 189 ms |
+| Llama-3.1-8B | 1,192 ms | 1,351 ms | +13% | 262 ms |
 
-| Model | DDP + Muon | DMuon | Speedup |
-|:------|----------:|------:|--------:|
-| Qwen2.5-1.5B | 2,444 ms | 219 ms | **11.2x** |
-| Llama-3.2-3B | 2,840 ms | 267 ms | **10.6x** |
+DMuon adds **3-13% overhead** vs FSDP2+AdamW for Muon training (Newton-Schulz orthogonalization on proj layers). Compared to naive FSDP2+Muon (all-gather grad + redundant NS), DMuon is **4-19x faster**.
 
-### vs FSDP2 + Muon
-
-| Model | FSDP2 + Muon | DMuon | Speedup |
-|:------|------------:|------:|--------:|
-| Qwen2.5-7B | 21,672 ms | 427 ms | **50.7x** |
-| Llama-3.1-8B | 13,424 ms | 461 ms | **29.1x** |
-
-All benchmarks verified: every rank produces identical loss values.
-
-### Communication Primitives
-
-| Data Size | AllGather | 5x Broadcast | Winner |
-|:----------|--------:|--------:|:-------|
-| 3.7 MB | 0.08 ms | 0.18 ms | AllGather |
-| 25.7 MB | 0.53 ms | 0.66 ms | AllGather |
-| 135.8 MB | 1.85 ms | 1.65 ms | **Broadcast** |
-| 466 MB | 5.75 ms | 3.80 ms | **Broadcast** |
-
-Broadcast wins for large parameters (>100 MB) and scales better with DP group size.
+All benchmarks verified: every rank produces identical loss values. See [docs/llm_benchmark.md](docs/llm_benchmark.md) for detailed phase breakdown.
 
 ## Roadmap
 
@@ -185,7 +169,16 @@ by Tri Dao et al.
 
 ## Citation
 
-If you use DMuon, please also cite:
+```bibtex
+@misc{DMuon,
+  title   = {DMuon: Dedicated Parameter Ownership for Distributed Muon Training},
+  author  = {Xingchen Liu},
+  year    = {2026},
+  url     = {https://github.com/StarrickLiu/dmuon}
+}
+```
+
+DMuon builds on Gram Newton-Schulz. If you use the Gram NS iteration, please also cite:
 
 ```bibtex
 @misc{GramNewtonSchulz,
