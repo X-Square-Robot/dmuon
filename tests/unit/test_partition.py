@@ -1,5 +1,8 @@
 """Unit tests for the partition algorithm (single GPU, no dist required)."""
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import pytest
 import torch.nn as nn
 

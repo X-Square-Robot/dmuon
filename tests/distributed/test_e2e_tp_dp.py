@@ -20,7 +20,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from dmuon import dedicate_params
 from dmuon.utils import get_owned_params
