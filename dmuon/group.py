@@ -167,8 +167,19 @@ class DedicatedParamGroup:
                         continue
 
                     if len(params_with_grad) == 1:
-                        params_with_grad[0].reduce_grad(async_op=False)
-                        self._pending_reduce.append((None, params_with_grad))
+                        # Single param: reduce in-place and save grad tensor reference.
+                        # Must save ref here because reshard() will set _unsharded_param=None
+                        # before wait_for_reduce() can read it.
+                        p = params_with_grad[0]
+                        grad = p._unsharded_param.grad.data
+                        if _DTensor is not None and isinstance(grad, _DTensor):
+                            grad = grad._local_tensor
+                        grad = grad.contiguous()
+                        global_owner = dist.get_global_rank(dp_group, owner_rank)
+                        dist.reduce(grad, dst=global_owner, op=dist.ReduceOp.AVG,
+                                    group=dp_group)
+                        p._unsharded_param.grad = None
+                        self._pending_reduce.append((grad.view(-1), params_with_grad))
                     else:
                         packed_buf = self._packed_reduce(owner_rank, params_with_grad)
                         self._pending_reduce.append((packed_buf, params_with_grad))
@@ -186,14 +197,12 @@ class DedicatedParamGroup:
 
         torch.cuda.current_stream().wait_event(self._reduce_event)
 
-        # Now safe to unpack — reduce is complete
-        for packed_buf, params in self._pending_reduce:
-            if packed_buf is not None:
-                self._unpack_reduced_grads(packed_buf, params)
-
-        # Owner saves gradients, all ranks clear grad
-        for p in self.params:
-            p.save_grad_on_owner()
+        # Now safe to unpack — reduce is complete.
+        # All paths (single-param and packed) store a buffer in _pending_reduce,
+        # so _unpack_reduced_grads handles both uniformly.
+        for buf, params in self._pending_reduce:
+            if buf is not None:
+                self._unpack_reduced_grads(buf, params)
 
         self._reduce_event = None
         self._pending_reduce = []

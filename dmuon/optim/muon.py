@@ -27,7 +27,6 @@ class Muon(Optimizer):
         momentum: Momentum coefficient for dedicated params.
         weight_decay: Weight decay for dedicated params.
         ns_steps: Number of Newton-Schulz iterations.
-        ns_backend: ``"compiled"`` (default) or ``"gram"`` (TP-correct).
         adamw_lr: AdamW learning rate for symmetric params.
         adamw_betas: AdamW beta coefficients.
         adamw_weight_decay: AdamW weight decay.
@@ -59,7 +58,6 @@ class Muon(Optimizer):
         momentum: float = 0.95,
         weight_decay: float = 0.0,
         ns_steps: int = 5,
-        ns_backend: str = "compiled",
         adamw_lr: float = 1e-3,
         adamw_betas: tuple[float, float] = (0.9, 0.999),
         adamw_weight_decay: float = 0.01,
@@ -67,7 +65,6 @@ class Muon(Optimizer):
     ):
         self.model = model
         self._ns_steps = ns_steps
-        self._ns_backend = ns_backend
 
         # Discover dedicated params owned by this rank
         comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
@@ -162,7 +159,9 @@ class Muon(Optimizer):
             buf = state["momentum_buffer"]
 
             # Newton-Schulz orthogonalization
-            if self._ns_backend == "gram" and dp.is_dtensor and dp.tp_group is not None:
+            # TP params need gram_newton_schulz (TP all-reduce for exact Gram matrix)
+            # Non-TP params use newton_schulz (which internally uses Gram NS + SYRK)
+            if dp.is_dtensor and dp.tp_group is not None:
                 update = gram_newton_schulz(buf, dp.tp_group, self._ns_steps)
             else:
                 update = newton_schulz(buf, self._ns_steps)

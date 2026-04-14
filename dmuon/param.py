@@ -135,6 +135,11 @@ class DedicatedParam:
         self._unsharded_param = nn.Parameter(self._broadcast_buf, requires_grad=self._requires_grad)
         self._broadcast_buf = None
         self._set_module_param(self._unsharded_param)
+        # For DTensor params, _set_module_param creates a NEW DTensor-wrapped
+        # Parameter on the module. Update _unsharded_param to point to that actual
+        # module parameter so autograd gradients are visible via _unsharded_param.grad.
+        if self.is_dtensor:
+            self._unsharded_param = getattr(self.module, self.param_name)
 
     # ---- reshard ----
 
