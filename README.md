@@ -95,6 +95,31 @@ for batch in dataloader:
     optimizer.step()
 ```
 
+### Checkpoint Save / Load
+
+```python
+import dmuon
+
+# Save (all ranks call get, rank 0 saves to disk)
+model_sd = dmuon.get_model_state_dict(model)
+optim_sd = dmuon.get_optimizer_state_dict(model, optimizer)
+if dist.get_rank() == 0:
+    torch.save({"model": model_sd, "optim": optim_sd}, "checkpoint.pt")
+dist.barrier()
+
+# Load (resume training from checkpoint)
+ckpt = torch.load("checkpoint.pt", map_location="cpu")
+dmuon.set_model_state_dict(model, ckpt["model"])
+dmuon.set_optimizer_state_dict(model, optimizer, ckpt["optim"])
+```
+
+Model state dicts are in standard format — compatible with single-GPU `torch.save`/`torch.load` and HuggingFace checkpoints. Loading a pretrained checkpoint (without optimizer state) works the same way:
+
+```python
+pretrained_sd = torch.load("pretrained_model.pt", map_location="cpu")
+dmuon.set_model_state_dict(model, pretrained_sd)
+```
+
 ## How It Works
 
 DMuon runs **alongside** FSDP2 — each manages a disjoint set of parameters:
@@ -174,8 +199,8 @@ All benchmarks verified: every rank produces identical loss values. See [docs/ll
 - [x] Gram NS with TP SYRK decomposition (O(m^2) TP comm instead of O(mn))
 - [x] CuteDSL SYRK kernel (5/7 Gram NS ops, 1.4-1.5x E2E speedup)
 - [x] Prefetch pipeline (forward + backward)
-- [ ] Gradient accumulation (`no_sync` context manager)
-- [ ] State dict save/load
+- [x] Gradient accumulation (default + `no_sync` context manager)
+- [x] State dict save/load (full state dict, compatible with single-GPU and HuggingFace)
 
 See [TODO.md](TODO.md) for detailed implementation plans.
 

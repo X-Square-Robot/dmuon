@@ -1,5 +1,6 @@
 """Utility functions."""
 
+from contextlib import contextmanager
 from typing import Optional
 
 import torch.nn as nn
@@ -38,3 +39,43 @@ def wait_all_reduces(model: nn.Module) -> None:
     for module in model.modules():
         if hasattr(module, "_dedicated_state"):
             module._dedicated_state.group.wait_for_reduce()
+
+
+@contextmanager
+def no_sync(model: nn.Module):
+    """Context manager to disable gradient reduction for gradient accumulation.
+
+    Within this context, backward passes skip reduce communication and
+    accumulate gradients locally. On the next backward outside this context,
+    the accumulated gradients are merged and reduced normally.
+
+    This also disables FSDP2's gradient sync for symmetric parameters.
+
+    Usage::
+
+        for i, batch in enumerate(dataloader):
+            ctx = dmuon.no_sync(model) if (i + 1) % accum_steps != 0 else nullcontext()
+            with ctx:
+                loss = model(batch).loss / accum_steps
+                loss.backward()
+            if (i + 1) % accum_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+    """
+    # Disable reduce for dedicated params
+    groups = []
+    for module in model.modules():
+        if hasattr(module, "_dedicated_state"):
+            group = module._dedicated_state.group
+            groups.append(group)
+            group.reduce_grads_enabled = False
+    # Disable reduce-scatter for FSDP2 symmetric params
+    if hasattr(model, "set_requires_gradient_sync"):
+        model.set_requires_gradient_sync(False)
+    try:
+        yield
+    finally:
+        for group in groups:
+            group.reduce_grads_enabled = True
+        if hasattr(model, "set_requires_gradient_sync"):
+            model.set_requires_gradient_sync(True)

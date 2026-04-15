@@ -26,10 +26,16 @@ Usage::
 __version__ = "0.2.0"
 
 from .api import dedicate_params
+from .checkpoint import (
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+)
 from .comm import DedicatedCommContext
 from .optim import Muon, get_ns_backend, gram_newton_schulz, newton_schulz
 from .patch import install_patch
-from .utils import get_comm_ctx, get_dedicated_params, get_owned_params, wait_all_reduces
+from .utils import get_comm_ctx, get_dedicated_params, get_owned_params, no_sync, wait_all_reduces
 
 # Auto-install monkey-patch so fully_shard() skips dedicated params
 install_patch()
@@ -44,5 +50,10 @@ __all__ = [
     "get_dedicated_params",
     "get_owned_params",
     "DedicatedCommContext",
+    "no_sync",
     "wait_all_reduces",
+    "get_model_state_dict",
+    "set_model_state_dict",
+    "get_optimizer_state_dict",
+    "set_optimizer_state_dict",
 ]

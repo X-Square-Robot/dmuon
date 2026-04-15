@@ -14,22 +14,21 @@ Implemented in `DedicatedState`:
 - Forward prefetch: `_next_group.unshard()` in `_pre_forward` (linked via `api.py`)
 - Backward prefetch: `_backward_prefetch()` in `_DedicatedPreBackward.backward`
 
-### Gradient Accumulation (no_sync)
+### ~~Gradient Accumulation~~ ✅ Done
 
-```python
-class DedicatedParamGroup:
-    reduce_grads_enabled: bool = True  # set False during no_sync
-```
-
-When disabled, non-owner accumulates full gradient locally (higher memory).
+Two modes supported:
+- **Default**: every backward reduces to owner, `_reduced_grad` accumulates automatically. Zero API changes.
+- **no_sync**: `dmuon.no_sync(model)` context manager skips reduce, accumulates locally, merges on next sync step. Also controls FSDP2 symmetric params.
 
 ## Medium Priority
 
-### State Dict Save/Load
+### ~~State Dict Save/Load~~ ✅ Done
 
-- Owner saves complete parameter
-- Load: distribute to owner based on partition
-- Conversion: DMuon checkpoint ↔ standard FSDP2 checkpoint ↔ single-GPU
+Implemented in `dmuon/checkpoint.py`:
+- `get_model_state_dict()` / `set_model_state_dict()`: full state dict for model params
+- `get_optimizer_state_dict()` / `set_optimizer_state_dict()`: Muon + AdamW states
+- Dedicated params: broadcast from owner. FSDP2 params: manual all-gather/shard.
+- Compatible with single-GPU `torch.save`/`torch.load` and HuggingFace checkpoints.
 
 ### Owner Zero-Copy Optimization
 

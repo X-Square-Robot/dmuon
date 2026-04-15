@@ -86,6 +86,9 @@ class DedicatedParam:
         # Reduced gradient (on owner, after backward)
         self._reduced_grad: Optional[torch.Tensor] = None
 
+        # Accumulated gradient for no_sync gradient accumulation (all ranks)
+        self._accumulated_grad: Optional[torch.Tensor] = None
+
         # Set module to sharded state
         self._set_module_param(self._placeholder)
 

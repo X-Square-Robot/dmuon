@@ -144,9 +144,43 @@ class DedicatedParamGroup:
         """Dispatch gradient reduces on reduce_stream. Does NOT wait.
 
         Call wait_for_reduce() to synchronize and unpack gradients on owner.
+
+        When ``reduce_grads_enabled`` is False (no_sync mode), gradients are
+        accumulated locally on every rank without communication. The accumulated
+        gradients are merged into the next sync reduce automatically.
         """
         if not self.reduce_grads_enabled:
+            # no_sync: accumulate full gradients locally (no communication)
+            for p in self.params:
+                if p._unsharded_param is None or p._unsharded_param.grad is None:
+                    continue
+                grad = p._unsharded_param.grad.data
+                if _DTensor is not None and isinstance(grad, _DTensor):
+                    grad = grad._local_tensor
+                if p._accumulated_grad is not None:
+                    p._accumulated_grad.add_(grad)
+                else:
+                    p._accumulated_grad = grad.clone()
+                p._unsharded_param.grad = None
             return
+
+        # Flush any pending reduce from a previous backward (gradient accumulation
+        # without optimizer.step). This ensures _reduced_grad is accumulated before
+        # we dispatch a new reduce that would overwrite _pending_reduce/_reduce_event.
+        if self._reduce_event is not None:
+            self.wait_for_reduce()
+
+        # Merge any accumulated gradients from prior no_sync steps
+        for p in self.params:
+            if p._accumulated_grad is not None and p._unsharded_param is not None:
+                if p._unsharded_param.grad is not None:
+                    grad = p._unsharded_param.grad.data
+                    if _DTensor is not None and isinstance(grad, _DTensor):
+                        grad = grad._local_tensor
+                    grad.add_(p._accumulated_grad)
+                else:
+                    p._unsharded_param.grad = p._accumulated_grad.clone()
+                p._accumulated_grad = None
 
         reduce_stream = self.comm_ctx.reduce_stream
         # Ensure gradients are computed before reduce_stream reads them
@@ -241,6 +275,7 @@ class DedicatedParamGroup:
         """Unpack reduced gradients from packed buffer to owner's _reduced_grad.
 
         Must be called after reduce is complete (after wait_for_reduce event sync).
+        Accumulates onto existing _reduced_grad if present (gradient accumulation).
         """
         dp_group = params[0].dp_group
         owner_rank = params[0].owner_rank
@@ -248,7 +283,11 @@ class DedicatedParamGroup:
             offset = 0
             for p in params:
                 n = p.numel
-                p._reduced_grad = packed[offset : offset + n].view(p._orig_size).clone()
+                new_grad = packed[offset : offset + n].view(p._orig_size)
+                if p._reduced_grad is not None:
+                    p._reduced_grad.add_(new_grad)
+                else:
+                    p._reduced_grad = new_grad.clone()
                 offset += n
 
     # ---- backward prefetch ----

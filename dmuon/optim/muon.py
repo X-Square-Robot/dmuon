@@ -229,11 +229,15 @@ class Muon(Optimizer):
     def zero_grad(self, set_to_none: bool = True):
         """Clear gradients.
 
-        Dedicated params' gradients (_reduced_grad) are cleared in step().
-        This only needs to clear FSDP2 params' gradients.
+        Clears FSDP2 params' gradients and dedicated params' accumulated
+        gradients (from gradient accumulation).  Dedicated params' _reduced_grad
+        is normally cleared in step(), but is also cleared here for safety.
         """
         for p in self._fsdp_params:
             if set_to_none:
                 p.grad = None
             elif p.grad is not None:
                 p.grad.zero_()
+        for dp in self._dedicated_params:
+            dp._reduced_grad = None
+            dp._accumulated_grad = None
