@@ -212,8 +212,9 @@ All benchmarks verified: every rank produces identical loss values. See [docs/ll
 
 ### Planned
 
-- [ ] Multi-node scaling (16-64 GPUs)
+- [ ] Multi-node scaling (16-256 GPUs)
 - [ ] Larger model benchmarks (14B+)
+- [ ] DeepSpeed ZeRO integration
 - [ ] Optimizer generalization (L-only Shampoo, SOAP-Muon hybrid)
 - [ ] Communication & memory profiling
 - [ ] CI/CD (GitHub Actions)

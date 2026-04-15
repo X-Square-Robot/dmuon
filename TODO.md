@@ -59,6 +59,10 @@ Extend DMuon's ownership model beyond Muon:
 - torch.profiler traces showing broadcast/reduce overlap with compute
 - Per-rank memory breakdown across model sizes
 
+### DeepSpeed ZeRO Integration
+
+Extend DMuon beyond FSDP2 to support DeepSpeed ZeRO. The core dedicated ownership algorithm (broadcast/reduce) is framework-portable — only needs two hooks: (1) tell ZeRO to skip dedicated params, (2) register forward/backward hooks. Validates DMuon's framework-portable design claim.
+
 ### Ablation Studies
 
 - Gram NS vs standard NS (communication savings)
