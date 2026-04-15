@@ -191,18 +191,35 @@ All benchmarks verified: every rank produces identical loss values. See [docs/ll
 
 ## Roadmap
 
-- [x] Core ownership model
+### Done
+
+- [x] Core ownership model (broadcast/reduce/owner-only NS)
 - [x] Balanced partition with concurrency constraints
-- [x] FSDP2 composition
+- [x] FSDP2 composition (zero modification to FSDP2 internals)
 - [x] TP compatibility
-- [x] LLM benchmarks (Qwen2.5, Llama-3)
+- [x] LLM step time benchmarks (Qwen2.5, Llama-3, 8xA800)
 - [x] Gram NS with TP SYRK decomposition (O(m^2) TP comm instead of O(mn))
 - [x] CuteDSL SYRK kernel (5/7 Gram NS ops, 1.4-1.5x E2E speedup)
 - [x] Prefetch pipeline (forward + backward)
 - [x] Gradient accumulation (default + `no_sync` context manager)
-- [x] State dict save/load (full state dict, compatible with single-GPU and HuggingFace)
+- [x] State dict save/load (compatible with single-GPU and HuggingFace)
 
-See [TODO.md](TODO.md) for detailed implementation plans.
+### In Progress
+
+- [ ] Convergence validation (loss curves vs AdamW vs Muon)
+- [ ] HSDP support (multi-node training)
+- [ ] Training examples (`examples/`)
+
+### Planned
+
+- [ ] Multi-node scaling (16-64 GPUs)
+- [ ] Larger model benchmarks (14B+)
+- [ ] Optimizer generalization (L-only Shampoo, SOAP-Muon hybrid)
+- [ ] Communication & memory profiling
+- [ ] CI/CD (GitHub Actions)
+- [ ] torch.compile support
+
+See [TODO.md](TODO.md) for details.
 
 ## Acknowledgments
 

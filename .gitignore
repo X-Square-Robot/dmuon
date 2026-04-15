@@ -35,6 +35,10 @@ benchmarks/profiles/
 # CuteDSL kernel cache
 dmuon_kernel_cache/
 
+# Research docs (private, not for public repo)
+docs/research_*.md
+docs/paper_strategy.md
+
 # OS
 .DS_Store
 Thumbs.db
