@@ -1,0 +1,118 @@
+site_name: DMuon
+site_description: Dedicated ownership for Muon on PyTorch FSDP2
+site_url: https://starrickliu.github.io/dmuon/
+repo_url: https://github.com/StarrickLiu/dmuon
+repo_name: StarrickLiu/dmuon
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: dmuon-light
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.tabs
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+extra_css:
+  - stylesheets/custom.css
+
+extra:
+  alternate:
+    - name: English
+      link: /dmuon/
+      lang: en
+    - name: 中文
+      link: /dmuon/zh/
+      lang: zh
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: folder
+      languages:
+        - locale: en
+          default: true
+          name: English
+          build: true
+        - locale: zh
+          name: 中文
+          build: true
+          nav:
+            - 首页: index.md
+            - 快速入门:
+              - 安装: getting-started/installation.md
+              - 快速开始: getting-started/quickstart.md
+              - 核心概念: getting-started/concepts.md
+            - 使用指南:
+              - 训练流程: guides/training.md
+              - 张量并行: guides/tp-support.md
+              - 检查点: guides/checkpoint.md
+              - 梯度累积: guides/grad-accumulation.md
+            - 参考手册:
+              - API 文档: reference/api.md
+              - Newton-Schulz 算法: reference/newton-schulz.md
+            - 示例:
+              - 数据并行: examples/basic-dp.md
+              - TP + DP: examples/tp-dp.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
+  - tables
+  - attr_list
+  - md_in_html
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - toc:
+      permalink: true
+
+extra_javascript:
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quick Start: getting-started/quickstart.md
+    - Core Concepts: getting-started/concepts.md
+  - Guides:
+    - Training: guides/training.md
+    - Tensor Parallelism: guides/tp-support.md
+    - Checkpointing: guides/checkpoint.md
+    - Gradient Accumulation: guides/grad-accumulation.md
+  - Reference:
+    - API Reference: reference/api.md
+    - Newton-Schulz Variants: reference/newton-schulz.md
+  - Examples:
+    - Data Parallel: examples/basic-dp.md
+    - TP + DP: examples/tp-dp.md

@@ -8,8 +8,10 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 
+from typing import Union
+
 from ..utils import get_owned_params, wait_all_reduces
-from .newton_schulz import gram_newton_schulz, newton_schulz
+from .newton_schulz import NewtonSchulz
 
 
 class Muon(Optimizer):
@@ -31,6 +33,21 @@ class Muon(Optimizer):
         adamw_betas: AdamW beta coefficients.
         adamw_weight_decay: AdamW weight decay.
         adamw_eps: AdamW epsilon.
+        ns_backend: Newton-Schulz backend configuration. Accepts a string
+            shorthand (``"gram"`` or ``"direct"``) or a fully configured
+            :class:`~dmuon.NewtonSchulz` object for custom coefficients::
+
+                # String shorthand (default coefficients)
+                optimizer = dmuon.Muon(model, ns_backend="gram")
+
+                # Custom coefficients
+                ns = dmuon.NewtonSchulz("direct", coefficients=dmuon.YOU_COEFFICIENTS)
+                optimizer = dmuon.Muon(model, ns_backend=ns)
+
+            ``"gram"`` uses Gram-space NS with SYRK acceleration and restarts.
+            ``"direct"`` uses classic parameter-space NS (Muon/Moonlight).
+            TP params requiring Gram decomposition always use
+            ``gram_newton_schulz`` regardless.
         nesterov: If True (default), use Nesterov momentum lookahead
             before NS orthogonalization: ``ns_input = grad + μ * buf``.
             Recommended by original Muon paper and used by Moonlight.
@@ -72,12 +89,21 @@ class Muon(Optimizer):
         adamw_betas: tuple[float, float] = (0.9, 0.999),
         adamw_weight_decay: float = 0.01,
         adamw_eps: float = 1e-8,
+        ns_backend: Union[str, NewtonSchulz] = "gram",
         nesterov: bool = True,
         per_head_ns: bool = True,
         block_diagonal_ns: bool = False,
     ):
+        if isinstance(ns_backend, str):
+            ns_backend = NewtonSchulz(backend=ns_backend)
+        if not isinstance(ns_backend, NewtonSchulz):
+            raise TypeError(
+                f"ns_backend must be 'gram', 'direct', or a NewtonSchulz instance, "
+                f"got {type(ns_backend).__name__}"
+            )
         self.model = model
         self._ns_steps = ns_steps
+        self._ns = ns_backend
         self._nesterov = nesterov
         self._per_head_ns = per_head_ns
         self._block_diagonal_ns = block_diagonal_ns
@@ -183,28 +209,30 @@ class Muon(Optimizer):
             #   Block-diag NS: skip all-reduce, use local Gram only (experimental)
             #   Exact Gram NS: all-reduce decomposable Gram → standard path
             #   Non-TP: local NS (pure DP, owner has full gradient)
+            ns = self._ns
+
             if dp.is_dtensor and dp.tp_group is not None:
                 shard_dim = dp.shard_dim
                 full_shape = dp.full_shape
                 m_full = full_shape[0]
-                n_full = full_shape[1] if full_shape.numel() > m_full else m_full
+                n_full = full_shape[1] if len(full_shape) > 1 else m_full
 
                 if self._per_head_ns and shard_dim == 0 and m_full < n_full:
                     # Per-head NS: each rank has complete KV heads
-                    update = newton_schulz(ns_input, self._ns_steps)
+                    update = ns.local(ns_input, self._ns_steps)
                 elif self._block_diagonal_ns:
                     # Block-diagonal NS: zero TP comm (experimental)
-                    update = gram_newton_schulz(
+                    update = ns.tp(
                         ns_input, dp.tp_group, self._ns_steps,
                         shard_dim=shard_dim, block_diagonal=True,
                     )
                 else:
                     # Exact Gram NS with TP all-reduce
-                    update = gram_newton_schulz(
+                    update = ns.tp(
                         ns_input, dp.tp_group, self._ns_steps, shard_dim=shard_dim,
                     )
             else:
-                update = newton_schulz(ns_input, self._ns_steps)
+                update = ns.local(ns_input, self._ns_steps)
 
             # Per-param scaling (Moonlight): 0.2 * sqrt(max(m, n))
             owned = dp._owned_data

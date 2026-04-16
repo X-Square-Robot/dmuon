@@ -61,6 +61,90 @@ DEFAULT_COEFFICIENTS = POLAR_EXPRESS_COEFFICIENTS
 DEFAULT_RESTART_ITERATIONS = [2]  # optimal for POLAR_EXPRESS per autotune
 
 
+# ---------------------------------------------------------------------------
+# NewtonSchulz — configurable NS backend object
+# ---------------------------------------------------------------------------
+class NewtonSchulz:
+    """Configurable Newton-Schulz backend.
+
+    Encapsulates the algorithm variant and coefficients so they can be
+    passed as a single object to :class:`~dmuon.Muon`.
+
+    Args:
+        backend: ``"gram"`` (default) for Gram-space NS with SYRK
+            acceleration and restarts, or ``"direct"`` for classic
+            parameter-space NS (Muon/Moonlight formulation).
+        coefficients: Per-step ``(a, b, c)`` coefficients.  ``None``
+            uses :data:`POLAR_EXPRESS_COEFFICIENTS`.
+        restart_iterations: Restart positions for Gram-space NS.
+            ``None`` uses ``[2]``.  Ignored when *backend* is
+            ``"direct"``.
+
+    Example::
+
+        import dmuon
+
+        # Default (Gram-space, Polar Express coefficients)
+        ns = dmuon.NewtonSchulz()
+
+        # Classic Muon with You coefficients
+        ns = dmuon.NewtonSchulz("direct", coefficients=dmuon.YOU_COEFFICIENTS)
+
+        optimizer = dmuon.Muon(model, lr=0.02, ns_backend=ns)
+    """
+
+    def __init__(
+        self,
+        backend: str = "gram",
+        coefficients: Optional[list[list[float]]] = None,
+        restart_iterations: Optional[list[int]] = None,
+    ):
+        if backend not in ("gram", "direct"):
+            raise ValueError(f"backend must be 'gram' or 'direct', got '{backend}'")
+        self.backend = backend
+        self.coefficients = coefficients
+        self.restart_iterations = restart_iterations
+
+    def local(self, G: Tensor, steps: int) -> Tensor:
+        """Run NS on a local (non-TP-decomposed) matrix.
+
+        Used for pure-DP params and TP per-head params.
+        """
+        if self.backend == "gram":
+            return gram_newton_schulz_local(
+                G, steps=steps,
+                coefficients=self.coefficients,
+                restart_iterations=self.restart_iterations,
+            )
+        return direct_newton_schulz(
+            G, steps=steps, coefficients=self.coefficients,
+        )
+
+    def tp(
+        self,
+        G_shard: Tensor,
+        tp_group: "dist.ProcessGroup",
+        steps: int,
+        shard_dim: Optional[int],
+        block_diagonal: bool = False,
+    ) -> Tensor:
+        """Run Gram NS with TP decomposition.
+
+        Always uses :func:`gram_newton_schulz` regardless of *backend*,
+        since TP Gram decomposition requires Gram-space iteration.
+        """
+        return gram_newton_schulz(
+            G_shard, tp_group, steps=steps,
+            coefficients=self.coefficients,
+            restart_iterations=self.restart_iterations,
+            shard_dim=shard_dim,
+            block_diagonal=block_diagonal,
+        )
+
+    def __repr__(self) -> str:
+        coeff = "default" if self.coefficients is None else f"{len(self.coefficients)}-step custom"
+        return f"NewtonSchulz(backend={self.backend!r}, coefficients={coeff})"
+
 
 # ---------------------------------------------------------------------------
 # Direct-space NS — standard Newton-Schulz in parameter space

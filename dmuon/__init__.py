@@ -33,7 +33,15 @@ from .checkpoint import (
     set_optimizer_state_dict,
 )
 from .comm import DedicatedCommContext
-from .optim import Muon, get_ns_backend, gram_newton_schulz, newton_schulz
+from .optim import (
+    POLAR_EXPRESS_COEFFICIENTS,
+    YOU_COEFFICIENTS,
+    Muon,
+    NewtonSchulz,
+    get_ns_backend,
+    gram_newton_schulz,
+    newton_schulz,
+)
 from .patch import install_patch
 from .utils import get_comm_ctx, get_dedicated_params, get_owned_params, no_sync, wait_all_reduces
 
@@ -43,6 +51,7 @@ install_patch()
 __all__ = [
     "dedicate_params",
     "Muon",
+    "NewtonSchulz",
     "newton_schulz",
     "gram_newton_schulz",
     "get_ns_backend",
@@ -56,4 +65,6 @@ __all__ = [
     "set_model_state_dict",
     "get_optimizer_state_dict",
     "set_optimizer_state_dict",
+    "YOU_COEFFICIENTS",
+    "POLAR_EXPRESS_COEFFICIENTS",
 ]

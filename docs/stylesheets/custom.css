@@ -1,0 +1,57 @@
+/* DMuon custom theme: #122e8a (deep indigo) + #f5efea (warm cream) */
+
+/* Light mode */
+[data-md-color-scheme="dmuon-light"] {
+  /* Primary brand color */
+  --md-primary-fg-color: #122e8a;
+  --md-primary-fg-color--light: #1a3fa0;
+  --md-primary-fg-color--dark: #0e2470;
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: #f5efea;
+
+  /* Accent */
+  --md-accent-fg-color: #1a3fa0;
+  --md-accent-fg-color--transparent: rgba(18, 46, 138, 0.1);
+  --md-accent-bg-color: #f5efea;
+
+  /* Background */
+  --md-default-bg-color: #f5efea;
+  --md-default-bg-color--light: #faf7f4;
+  --md-default-bg-color--lighter: #ffffff;
+  --md-default-bg-color--lightest: #ffffff;
+
+  /* Code blocks */
+  --md-code-bg-color: #ebe4dd;
+  --md-code-fg-color: #122e8a;
+
+  /* Typography */
+  --md-typeset-color: #2a2a2a;
+  --md-typeset-a-color: #122e8a;
+
+  /* Footer */
+  --md-footer-bg-color: #122e8a;
+  --md-footer-bg-color--dark: #0e2470;
+  --md-footer-fg-color: #f5efea;
+  --md-footer-fg-color--light: rgba(245, 239, 234, 0.7);
+  --md-footer-fg-color--lighter: rgba(245, 239, 234, 0.4);
+}
+
+/* Dark mode: keep Material's slate with indigo accents */
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #4a6cf7;
+  --md-primary-fg-color--light: #6082ff;
+  --md-primary-fg-color--dark: #3456d4;
+  --md-accent-fg-color: #6082ff;
+  --md-typeset-a-color: #6082ff;
+}
+
+/* Header bar */
+.md-header {
+  background-color: var(--md-primary-fg-color);
+}
+
+/* Navigation tabs */
+.md-tabs {
+  background-color: var(--md-primary-fg-color);
+}
+

@@ -42,3 +42,4 @@ docs/paper_strategy*.md
 # OS
 .DS_Store
 Thumbs.db
+site/
