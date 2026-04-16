@@ -112,6 +112,43 @@ class DedicatedParam:
             return self._tp_spec.mesh.get_group(mesh_dim=0)
         return None
 
+    @property
+    def shard_dim(self) -> Optional[int]:
+        """TP shard dimension: 0 (row-sharded) or 1 (col-sharded).
+
+        Returns None for non-DTensor params. Used by Gram NS to decide
+        which Gram matrix (L-side or R-side) decomposes under TP.
+        """
+        if self.is_dtensor and self._tp_spec is not None:
+            try:
+                from torch.distributed.tensor import Shard as _Shard
+            except ImportError:
+                return None
+            for p in self._tp_spec.placements:
+                if isinstance(p, _Shard):
+                    return p.dim
+        return None
+
+    @property
+    def full_shape(self) -> torch.Size:
+        """Full (unsharded) shape of the parameter.
+
+        For DTensor params, reconstructs the shape before TP sharding.
+        For non-DTensor params, returns ``_orig_size`` as-is.
+        """
+        if self.is_dtensor and self._tp_spec is not None:
+            try:
+                from torch.distributed.tensor import Shard as _Shard
+            except ImportError:
+                return self._orig_size
+            shape = list(self._orig_size)
+            for p in self._tp_spec.placements:
+                if isinstance(p, _Shard):
+                    tp_size = self._tp_spec.mesh.size(0)
+                    shape[p.dim] *= tp_size
+            return torch.Size(shape)
+        return self._orig_size
+
     # ---- unshard (broadcast) ----
 
     def alloc_and_broadcast(self, async_op: bool = False) -> Optional[dist.Work]:

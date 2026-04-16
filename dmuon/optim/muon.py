@@ -31,6 +31,16 @@ class Muon(Optimizer):
         adamw_betas: AdamW beta coefficients.
         adamw_weight_decay: AdamW weight decay.
         adamw_eps: AdamW epsilon.
+        nesterov: If True (default), use Nesterov momentum lookahead
+            before NS orthogonalization: ``ns_input = grad + μ * buf``.
+            Recommended by original Muon paper and used by Moonlight.
+        per_head_ns: If True (default), use per-head local NS for narrow
+            Shard(0) params (GQA k/v_proj) where full m < n. Each rank
+            orthogonalizes its heads independently with zero TP communication.
+        block_diagonal_ns: If True, skip Gram all-reduce for ALL TP params
+            and use local Gram only (block-diagonal approximation). Eliminates
+            all TP optimizer communication. Experimental — needs convergence
+            validation.
 
     Example::
 
@@ -62,9 +72,15 @@ class Muon(Optimizer):
         adamw_betas: tuple[float, float] = (0.9, 0.999),
         adamw_weight_decay: float = 0.01,
         adamw_eps: float = 1e-8,
+        nesterov: bool = True,
+        per_head_ns: bool = True,
+        block_diagonal_ns: bool = False,
     ):
         self.model = model
         self._ns_steps = ns_steps
+        self._nesterov = nesterov
+        self._per_head_ns = per_head_ns
+        self._block_diagonal_ns = block_diagonal_ns
 
         # Discover dedicated params owned by this rank
         comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
@@ -158,13 +174,37 @@ class Muon(Optimizer):
                 state["momentum_buffer"].mul_(mu).add_(grad)
             buf = state["momentum_buffer"]
 
-            # Newton-Schulz orthogonalization
-            # TP params need gram_newton_schulz (TP all-reduce for exact Gram matrix)
-            # Non-TP params use newton_schulz (which internally uses Gram NS + SYRK)
+            # Nesterov lookahead: ns_input = grad + μ * buf
+            # (standard Muon/Moonlight convention, gives better direction estimate)
+            ns_input = grad.add(buf, alpha=mu) if self._nesterov else buf
+
+            # Newton-Schulz orthogonalization — TP-aware routing:
+            #   Per-head NS: narrow Shard(0) (GQA k/v_proj) → local NS, zero TP comm
+            #   Block-diag NS: skip all-reduce, use local Gram only (experimental)
+            #   Exact Gram NS: all-reduce decomposable Gram → standard path
+            #   Non-TP: local NS (pure DP, owner has full gradient)
             if dp.is_dtensor and dp.tp_group is not None:
-                update = gram_newton_schulz(buf, dp.tp_group, self._ns_steps)
+                shard_dim = dp.shard_dim
+                full_shape = dp.full_shape
+                m_full = full_shape[0]
+                n_full = full_shape[1] if full_shape.numel() > m_full else m_full
+
+                if self._per_head_ns and shard_dim == 0 and m_full < n_full:
+                    # Per-head NS: each rank has complete KV heads
+                    update = newton_schulz(ns_input, self._ns_steps)
+                elif self._block_diagonal_ns:
+                    # Block-diagonal NS: zero TP comm (experimental)
+                    update = gram_newton_schulz(
+                        ns_input, dp.tp_group, self._ns_steps,
+                        shard_dim=shard_dim, block_diagonal=True,
+                    )
+                else:
+                    # Exact Gram NS with TP all-reduce
+                    update = gram_newton_schulz(
+                        ns_input, dp.tp_group, self._ns_steps, shard_dim=shard_dim,
+                    )
             else:
-                update = newton_schulz(buf, self._ns_steps)
+                update = newton_schulz(ns_input, self._ns_steps)
 
             # Per-param scaling (Moonlight): 0.2 * sqrt(max(m, n))
             owned = dp._owned_data

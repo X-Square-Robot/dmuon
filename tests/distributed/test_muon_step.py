@@ -179,7 +179,81 @@ def test_muon_momentum_accumulation(rank, world_size, device, mesh):
 
 
 # ---------------------------------------------------------------------------
-# Test 3: TP params get updated through gram_newton_schulz path
+# Test 3: Nesterov momentum — NS receives grad + μ*buf, not just buf
+# ---------------------------------------------------------------------------
+
+def test_muon_nesterov(rank, world_size, device, mesh):
+    """Verify Nesterov vs non-Nesterov produce different weight updates.
+
+    With nesterov=True (default), NS input is grad + μ*buf (lookahead).
+    With nesterov=False, NS input is buf.
+    The resulting weight updates should differ, proving Nesterov is active.
+    """
+
+    lr = 0.01
+    mu = 0.95
+
+    # --- Run with Nesterov=True ---
+    torch.manual_seed(0)
+    model1 = TinyModel().to(device)
+    dmuon.dedicate_params(model1, mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2)
+    for layer in model1.layers:
+        fully_shard(layer, mesh=mesh)
+    fully_shard(model1, mesh=mesh)
+    opt1 = dmuon.Muon(model1, lr=lr, momentum=mu, nesterov=True, adamw_lr=lr)
+
+    torch.manual_seed(42)
+    x = torch.randn(4, 256, device=device)
+    opt1.zero_grad()
+    model1(x).backward()
+    opt1.step()
+
+    # --- Run with Nesterov=False ---
+    torch.manual_seed(0)
+    model2 = TinyModel().to(device)
+    dmuon.dedicate_params(model2, mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2)
+    for layer in model2.layers:
+        fully_shard(layer, mesh=mesh)
+    fully_shard(model2, mesh=mesh)
+    opt2 = dmuon.Muon(model2, lr=lr, momentum=mu, nesterov=False, adamw_lr=lr)
+
+    torch.manual_seed(42)
+    x = torch.randn(4, 256, device=device)
+    opt2.zero_grad()
+    model2(x).backward()
+    opt2.step()
+
+    # --- Compare: weights should differ ---
+    if len(opt1._dedicated_params) == 0:
+        log(rank, "PASSED: test_muon_nesterov (no owned params)")
+        return
+
+    dp1 = opt1._dedicated_params[0]
+    dp2 = opt2._dedicated_params[0]
+    w1 = dp1._owned_data
+    w2 = dp2._owned_data
+
+    diff = (w1 - w2).abs().max().item()
+    assert diff > 1e-6, (
+        f"Rank {rank}: Nesterov=True and False produced identical weights "
+        f"(diff={diff}). Nesterov is not active."
+    )
+
+    # Also verify momentum buffers are the SAME (Nesterov only changes NS input, not buf)
+    buf1 = opt1.state[id(dp1)]["momentum_buffer"]
+    buf2 = opt2.state[id(dp2)]["momentum_buffer"]
+    buf_diff = (buf1 - buf2).abs().max().item()
+    assert buf_diff < 1e-6, (
+        f"Rank {rank}: momentum buffers differ (diff={buf_diff}). "
+        f"Nesterov should not affect buf accumulation."
+    )
+
+    torch.cuda.synchronize()
+    log(rank, f"PASSED: test_muon_nesterov (weight diff={diff:.6f}, buf diff={buf_diff:.2e})")
+
+
+# ---------------------------------------------------------------------------
+# Test 4: TP params get updated through gram_newton_schulz path
 # ---------------------------------------------------------------------------
 
 def test_muon_tp_path(rank, world_size, device, mesh):
@@ -275,6 +349,7 @@ if __name__ == "__main__":
     tests = {
         "reduced_grad": test_muon_reduced_grad_all_set,
         "momentum": test_muon_momentum_accumulation,
+        "nesterov": test_muon_nesterov,
         "tp_path": test_muon_tp_path,
     }
 

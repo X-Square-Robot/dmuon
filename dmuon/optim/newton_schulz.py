@@ -63,13 +63,64 @@ DEFAULT_RESTART_ITERATIONS = [2]  # optimal for POLAR_EXPRESS per autotune
 
 
 # ---------------------------------------------------------------------------
-# Compiled PyTorch fallback (uses per-step coefficients)
+# Direct-space NS — standard Newton-Schulz in parameter space
 # ---------------------------------------------------------------------------
+def direct_newton_schulz(
+    G: Tensor,
+    steps: int = 5,
+    eps: float = 1e-7,
+    coefficients: Optional[list[list[float]]] = None,
+) -> Tensor:
+    """Standard Newton-Schulz orthogonalization in direct (parameter) space.
+
+    Iterates on the full (m, n) matrix:
+    ``X_{k+1} = a_k X + b_k (X X^T) X + c_k (X X^T)^2 X``
+
+    This is the classic formulation used by Muon/Moonlight. Compared to
+    :func:`gram_newton_schulz_local` (Gram-space), direct NS is simpler but:
+
+    - Does not benefit from SYRK symmetry acceleration
+    - Does not support the restart mechanism
+    - Intermediate ops are (m, n) instead of (m, m)
+
+    Use this when you want the standard algorithm without Gram-space
+    optimizations, e.g., for baseline comparison or small matrices where
+    SYRK overhead is not justified.
+
+    Args:
+        G: Gradient matrix (m, n), any dtype.
+        steps: Number of NS iterations (used only if coefficients is None).
+        eps: Normalization epsilon.
+        coefficients: Per-step ``(a, b, c)`` coefficients. Length determines
+            number of iterations. Defaults to :data:`DEFAULT_COEFFICIENTS`.
+
+    Returns:
+        Orthogonalized update, same shape as G, in original dtype.
+    """
+    if coefficients is None:
+        coefficients = DEFAULT_COEFFICIENTS
+
+    original_dtype = G.dtype
+    X = G.float()
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.T
+    X = X / (X.norm() + eps)
+    X = X.half()
+    for a, b, c in coefficients:
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if transposed:
+        X = X.T
+    return X.to(original_dtype)
+
+
 @torch.compile
-def _compiled_newton_schulz(
+def _compiled_direct_newton_schulz(
     G: Tensor, coefficients: list[list[float]], eps: float = 1e-7
 ) -> Tensor:
-    """Compiled standard NS with per-step coefficients."""
+    """torch.compile'd variant of :func:`direct_newton_schulz`."""
     X = G.float()
     transposed = X.shape[0] > X.shape[1]
     if transposed:
@@ -86,7 +137,7 @@ def _compiled_newton_schulz(
 
 
 # ---------------------------------------------------------------------------
-# Standard NS — public API
+# Default NS — public API (routes to Gram-space by default)
 # ---------------------------------------------------------------------------
 def newton_schulz(
     G: Tensor,
@@ -95,11 +146,12 @@ def newton_schulz(
     coefficients: Optional[list[list[float]]] = None,
     restart_iterations: Optional[list[int]] = None,
 ) -> Tensor:
-    """Newton-Schulz orthogonalization with automatic backend selection.
+    """Newton-Schulz orthogonalization (default: Gram-space backend).
 
-    Uses Gram NS (Dao-AILab algorithm) by default for better precision
-    (per-step coefficients, restart mechanism, mixed-precision pipeline).
-    When CuteDSL SYRK is available, symmetric ops are accelerated.
+    Routes to :func:`gram_newton_schulz_local` by default for better
+    precision (per-step coefficients, restart mechanism, SYRK acceleration).
+
+    For the standard direct-space algorithm, use :func:`direct_newton_schulz`.
 
     Args:
         G: Gradient matrix (m, n), any dtype.
@@ -128,26 +180,38 @@ def gram_newton_schulz(
     eps: float = 1e-7,
     coefficients: Optional[list[list[float]]] = None,
     restart_iterations: Optional[list[int]] = None,
+    shard_dim: Optional[int] = None,
+    block_diagonal: bool = False,
 ) -> Tensor:
     """Gram Newton-Schulz with TP SYRK decomposition.
 
-    Adapted from Dao-AILab/gram-newton-schulz. Iterates on the (m, m) Gram
-    matrix instead of the full (m, n) matrix. Uses per-step coefficients and
-    restart mechanism for numerical stability.
+    Adapted from Dao-AILab/gram-newton-schulz. Iterates on the Gram matrix
+    instead of the full gradient. Uses per-step coefficients and restart
+    mechanism for numerical stability.
 
-    For SYRK operations (``R = X @ X^T`` and ``Z = c*R^2 + b*R``), uses
-    CuteDSL SYRK kernel when available (50% tile savings from symmetry).
+    The ``shard_dim`` parameter controls which Gram is used:
+
+    - **Shard(0)** (row-sharded): transpose to use R-side ``G^TG`` which
+      decomposes as ``Σ G_i^T G_i`` → all-reduce gives exact Gram.
+    - **Shard(1)** (col-sharded): use L-side ``GG^T`` which decomposes
+      as ``Σ G_i G_i^T`` → all-reduce gives exact Gram.
+
+    When ``block_diagonal=True``, the all-reduce is skipped and only the
+    local Gram is used (block-diagonal approximation, zero TP communication).
 
     Args:
-        G_shard: TP-sharded gradient (m, n/T) on this rank.
+        G_shard: TP-sharded gradient on this rank.
         tp_group: TP process group for all-reduce.
         steps: Ignored (determined by len(coefficients)).
         eps: Normalization epsilon.
         coefficients: Per-step coefficients. Defaults to POLAR_EXPRESS_COEFFICIENTS.
         restart_iterations: Iteration indices for restart. Defaults to [2].
+        shard_dim: TP shard dimension (0 or 1). Determines transpose direction.
+            If None, falls back to shape-based heuristic.
+        block_diagonal: If True, skip TP all-reduce (zero communication).
 
     Returns:
-        Orthogonalized update shard (m, n/T).
+        Orthogonalized update shard, same shape as input.
     """
     if coefficients is None:
         coefficients = DEFAULT_COEFFICIENTS
@@ -158,7 +222,15 @@ def gram_newton_schulz(
 
     # --- fp32 normalization (Dao-AILab precision strategy) ---
     X = G_shard.float()
-    transposed = X.shape[0] > X.shape[1]
+    if block_diagonal:
+        # Block-diagonal: use smaller local Gram (shape-based, no all-reduce)
+        transposed = X.shape[0] > X.shape[1]
+    elif shard_dim is not None:
+        # Shard(0) row-sharded: transpose → R-side G^TG decomposes
+        # Shard(1) col-sharded: don't transpose → L-side GG^T decomposes
+        transposed = (shard_dim == 0)
+    else:
+        transposed = X.shape[0] > X.shape[1]
     if transposed:
         X = X.T
     X = X / (X.norm() + eps)
@@ -174,7 +246,8 @@ def gram_newton_schulz(
         R = X @ X.T
 
     # --- TP all-reduce: exact Gram = Σ G_i @ G_i^T ---
-    dist.all_reduce(R, group=tp_group)
+    if not block_diagonal:
+        dist.all_reduce(R, group=tp_group)
 
     # --- Gram NS iterations with restarts (Dao-AILab algorithm) ---
     I = torch.eye(m, device=X.device, dtype=X.dtype) if not _use_syrk else None
@@ -192,7 +265,8 @@ def gram_newton_schulz(
                 _syrk_or_cublas(X, R)
             else:
                 R = X @ X.T
-            dist.all_reduce(R, group=tp_group)
+            if not block_diagonal:
+                dist.all_reduce(R, group=tp_group)
             Q = None
 
         if _use_syrk:
