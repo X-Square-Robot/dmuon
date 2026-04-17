@@ -53,6 +53,41 @@ class DedicatedParamGroup:
         # Unsharded state tracking (for reshard_after_forward=False)
         self._is_unsharded: bool = False
 
+        # Post-backward fast-path tracking: reset in _pre_forward, set True when
+        # reduce+reshard runs (either via _DedicatedPostBackward.backward fast path
+        # or via the autograd-engine root callback). Used by the fallback to skip
+        # groups that already ran.
+        self._post_backward_fired: bool = False
+
+        # Saved forward-time unsharded params. Autograd writes .grad to the
+        # tensor instances that were in the graph at forward time; after reshard
+        # + re-unshard in pre_backward, dp._unsharded_param points to a NEW
+        # tensor. post_backward transfers .grad from forward-time refs (saved
+        # here) to the current _unsharded_param. Populated in _pre_forward,
+        # cleared in _run_post_backward.
+        self._forward_time_params: Optional[list[tuple]] = None
+
+        # Cached per-owner metadata (FSDP2 alignment phase 1 — previously
+        # recomputed in every _packed_broadcast / _packed_reduce call).
+        self._dp_group: Optional[dist.ProcessGroup] = (
+            params[0].dp_group if params else None
+        )
+        self._comm_dtype: Optional[torch.dtype] = (
+            (params[0]._compute_dtype or params[0]._orig_dtype) if params else None
+        )
+        self._total_numel_by_owner: dict[int, int] = {
+            owner: sum(p.numel for p in owner_params)
+            for owner, owner_params in self._by_owner.items()
+        }
+        self._global_owner_ranks: dict[int, int] = (
+            {
+                owner: dist.get_global_rank(self._dp_group, owner)
+                for owner in self._by_owner
+            }
+            if self._dp_group is not None
+            else {}
+        )
+
     # ---- unshard (broadcast) — dispatch phase ----
 
     def unshard(self):
@@ -71,7 +106,7 @@ class DedicatedParamGroup:
         broadcast_stream.wait_stream(torch.cuda.current_stream())
 
         self._packed_bufs = []
-        dp_group = self.params[0].dp_group
+        dp_group = self._dp_group
         with torch.cuda.stream(broadcast_stream):
             # Coalesce all broadcasts into a single fused NCCL kernel
             with dist._coalescing_manager(group=dp_group, device=self.device):
@@ -107,21 +142,19 @@ class DedicatedParamGroup:
 
         Caller must be on broadcast_stream.
         """
-        total_numel = sum(p.numel for p in params)
-        # Use compute_dtype (e.g., bf16) for communication if available
-        comm_dtype = params[0]._compute_dtype or params[0]._orig_dtype
+        total_numel = self._total_numel_by_owner[owner_rank]
+        comm_dtype = self._comm_dtype
         buf = torch.empty(total_numel, dtype=comm_dtype, device=self.device)
 
-        # Owner: copy data into packed buffer (with dtype conversion)
-        dp_group = params[0].dp_group
+        # Owner: copy data into packed buffer (copy_ handles dtype conversion inline)
+        dp_group = self._dp_group
         if dp_group.rank() == owner_rank:
             offset = 0
             for p in params:
-                buf[offset : offset + p.numel].copy_(p._owned_data.to(comm_dtype).view(-1))
+                buf[offset : offset + p.numel].copy_(p._owned_data.view(-1))
                 offset += p.numel
 
-        global_owner = dist.get_global_rank(dp_group, owner_rank)
-        dist.broadcast(buf, src=global_owner, group=dp_group)
+        dist.broadcast(buf, src=self._global_owner_ranks[owner_rank], group=dp_group)
 
         # Store buffer ref and assign slices for finish_unshard
         self._packed_bufs.append(buf)
@@ -187,7 +220,7 @@ class DedicatedParamGroup:
         reduce_stream.wait_stream(torch.cuda.current_stream())
 
         self._pending_reduce = []
-        dp_group = self.params[0].dp_group
+        dp_group = self._dp_group
         with torch.cuda.stream(reduce_stream):
             # Coalesce all reduces into a single fused NCCL kernel
             with dist._coalescing_manager(group=dp_group, device=self.device):
@@ -209,9 +242,8 @@ class DedicatedParamGroup:
                         if _DTensor is not None and isinstance(grad, _DTensor):
                             grad = grad._local_tensor
                         grad = grad.contiguous()
-                        global_owner = dist.get_global_rank(dp_group, owner_rank)
-                        dist.reduce(grad, dst=global_owner, op=dist.ReduceOp.AVG,
-                                    group=dp_group)
+                        dist.reduce(grad, dst=self._global_owner_ranks[owner_rank],
+                                    op=dist.ReduceOp.AVG, group=dp_group)
                         p._unsharded_param.grad = None
                         self._pending_reduce.append((grad.view(-1), params_with_grad))
                     else:
@@ -260,9 +292,8 @@ class DedicatedParamGroup:
             return None
 
         packed = torch.cat(grad_list)
-        dp_group = params[0].dp_group
-        global_owner = dist.get_global_rank(dp_group, owner_rank)
-        dist.reduce(packed, dst=global_owner, op=dist.ReduceOp.AVG, group=dp_group)
+        dist.reduce(packed, dst=self._global_owner_ranks[owner_rank],
+                    op=dist.ReduceOp.AVG, group=self._dp_group)
 
         # Clear grads immediately (data is in packed buffer on reduce_stream)
         for p in params:
@@ -277,9 +308,8 @@ class DedicatedParamGroup:
         Must be called after reduce is complete (after wait_for_reduce event sync).
         Accumulates onto existing _reduced_grad if present (gradient accumulation).
         """
-        dp_group = params[0].dp_group
         owner_rank = params[0].owner_rank
-        if dp_group.rank() == owner_rank:
+        if self._dp_group.rank() == owner_rank:
             offset = 0
             for p in params:
                 n = p.numel
@@ -296,6 +326,12 @@ class DedicatedParamGroup:
         """Prefetch next layer's unshard during current layer's backward.
 
         Mirrors FSDP2's _backward_prefetch: uses reverse post-forward order.
+
+        Skip when the target group has already completed its backward (i.e.,
+        its ``_post_forward_indices`` is empty). Otherwise a prefetch would
+        dispatch a broadcast of pre-optim ``_owned_data``; if optim.step then
+        runs before the next forward consumes it, the subsequent forward
+        reads a stale weight value.
         """
         if not self._post_forward_indices:
             return
@@ -303,6 +339,8 @@ class DedicatedParamGroup:
         if (target_index := curr_index - 1) < 0:
             return
         target_group = self.comm_ctx.post_forward_order[target_index]
+        if not target_group._post_forward_indices:
+            return  # target already backward'd — prefetch would read stale data
         target_group.unshard()  # dispatch only — no wait
 
     def _record_post_forward(self) -> None:

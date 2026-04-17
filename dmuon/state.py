@@ -1,20 +1,26 @@
 """DedicatedState: hook management for dedicated parameter groups.
 
 Registers forward pre/post hooks and backward hooks on a layer module:
-- pre_forward: dispatch broadcast on broadcast_stream, wait, finalize
-- post_forward: reshard, record post-forward order, register backward hooks
-- pre_backward: unshard (dispatch + wait), prefetch next layer
-- post_backward: reduce grads (dispatch + wait), reshard
+- pre_forward: dispatch broadcast on broadcast_stream, wait, finalize,
+               register post-backward hook (reduce + reshard) on inputs
+- post_forward: reshard, record post-forward order, register pre-backward hook
+- pre_backward: unshard (dispatch + wait), prefetch next layer, queue root callback
+- post_backward: transfer grads from forward-time params, reduce grads, reshard
 """
 
 from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.utils._pytree import tree_flatten, tree_unflatten
+from torch.autograd import Variable
 
 from .comm import DedicatedCommContext
 from .group import DedicatedParamGroup
+
+try:
+    from torch.distributed.tensor import DTensor as _DTensor
+except ImportError:
+    _DTensor = None
 
 
 def _is_backward_pass() -> bool:
@@ -26,13 +32,18 @@ class _DedicatedPreBackward(torch.autograd.Function):
     """Autograd function that triggers parameter unshard before backward."""
 
     @staticmethod
-    def forward(ctx, group: DedicatedParamGroup, *tensors):
-        ctx.group = group
+    def forward(ctx, state: "DedicatedState", *tensors):
+        ctx.state = state
         return tensors
 
     @staticmethod
     def backward(ctx, *grads):
-        group = ctx.group
+        state = ctx.state
+        # First pre_backward of this backward pass queues the autograd-engine
+        # root callback once. Runs after the entire backward graph finishes
+        # and force-fires post_backward on any group whose fast path did not.
+        state._queue_root_post_backward_callback()
+        group = state.group
         # Unshard: dispatch (no-op if already prefetched) + wait
         group.unshard()
         group.wait_for_unshard()
@@ -41,14 +52,36 @@ class _DedicatedPreBackward(torch.autograd.Function):
         return (None,) + grads
 
 
+class _DedicatedPostBackward(torch.autograd.Function):
+    """Autograd function that triggers gradient reduce + reshard after backward.
+
+    Wraps INPUT tensors in pre_forward. In the autograd graph, this node sits
+    "upstream" of the module computation, so its backward fires AFTER the
+    module's backward has computed all parameter gradients.
+
+    This replaces the old register_hook + counter approach, which had CUDA
+    stream visibility issues causing sporadic NaN on multi-GPU.
+    """
+
+    @staticmethod
+    def forward(ctx, state: "DedicatedState", *tensors):
+        ctx.state = state
+        return tensors
+
+    @staticmethod
+    def backward(ctx, *grads):
+        ctx.state._run_post_backward()
+        return (None,) + grads
+
+
 class DedicatedState:
     """Manages hooks for dedicated parameters on a layer module.
 
     Registers forward pre/post hooks and backward hooks:
-    - pre_forward: broadcast params from owners (unshard)
-    - post_forward: reshard + record post-forward order + register backward hooks
-    - pre_backward: unshard + prefetch next layer (via autograd Function)
-    - post_backward: reduce grads + reshard (via param grad hooks)
+    - pre_forward: broadcast params (unshard) + register post-backward on inputs
+    - post_forward: reshard + record post-forward order + register pre-backward on outputs
+    - pre_backward: unshard + prefetch next layer (via _DedicatedPreBackward)
+    - post_backward: reduce grads + reshard (via _DedicatedPostBackward)
     """
 
     def __init__(
@@ -62,9 +95,12 @@ class DedicatedState:
         self.group = group
         self.comm_ctx = comm_ctx
         self.reshard_after_forward = reshard_after_forward
-        self._grad_hook_handles: list = []
         # Linked by api.py for forward prefetch (next layer's group)
         self._next_group: Optional[DedicatedParamGroup] = None
+
+        # Register self so the autograd-engine root callback can iterate all
+        # states and fire post_backward on any group whose fast path missed.
+        comm_ctx.all_states.append(self)
 
         # Register hooks (after FSDP2 hooks since FSDP2 uses prepend=True)
         self._pre_forward_handle = module.register_forward_pre_hook(
@@ -73,21 +109,34 @@ class DedicatedState:
         self._post_forward_handle = module.register_forward_hook(self._post_forward)
 
     def _pre_forward(self, module: nn.Module, args, kwargs):
-        """Dispatch broadcasts on broadcast_stream, wait, finalize params."""
+        """Dispatch broadcasts on broadcast_stream, wait, finalize params.
+
+        Also wraps an input tensor through _DedicatedPostBackward so that
+        gradient reduce + reshard fires after this module's backward.
+        """
         self.group.unshard()            # no-op if already unsharded or prefetched
         self.group.wait_for_unshard()   # no-op if already unsharded
         # Forward prefetch: dispatch next layer's unshard (no wait)
         if self._next_group is not None:
             self._next_group.unshard()  # no-op if already unsharded
+        # Reset fast-path flag for this forward — backward (fast path or root
+        # callback fallback) will set it True.
+        self.group._post_backward_fired = False
+        # Snapshot forward-time unsharded params. Autograd writes .grad to
+        # these instances; we transfer those grads to the re-unsharded params
+        # in post_backward. Accessible from both fast path and root fallback.
+        if torch.is_grad_enabled():
+            self.group._forward_time_params = [
+                (dp, dp._unsharded_param)
+                for dp in self.group.params
+                if dp._unsharded_param is not None and dp._requires_grad
+            ]
+            # Register post-backward hook on inputs (reduce + reshard after backward)
+            args, kwargs = self._register_post_backward(args, kwargs)
         return args, kwargs
 
     def _post_forward(self, module: nn.Module, input, output):
-        """Reshard params (if enabled), record forward order, register backward hooks."""
-        # Register post-backward gradient hooks on unsharded params
-        # (must do before reshard since we need the unsharded param refs)
-        if torch.is_grad_enabled():
-            self._register_grad_hooks()
-
+        """Reshard params (if enabled), record forward order, register pre-backward."""
         if self.reshard_after_forward:
             self.group.reshard()
 
@@ -100,64 +149,123 @@ class DedicatedState:
             output = self._register_pre_backward(output)
         return output
 
-    def _register_pre_backward(self, output):
-        """Wrap output through autograd Function to trigger unshard in backward."""
-        flat, spec = tree_flatten(output)
-        tensors = [t for t in flat if isinstance(t, torch.Tensor) and t.requires_grad]
-        if not tensors:
-            return output
+    # ---- post-backward fast path + fallback ------------------------------
 
-        processed = _DedicatedPreBackward.apply(self.group, *tensors)
+    def _run_post_backward(self) -> None:
+        """Execute grad transfer + reduce + reshard. Idempotent per forward.
 
-        tensor_idx = 0
-        new_flat = []
-        for item in flat:
-            if isinstance(item, torch.Tensor) and item.requires_grad:
-                new_flat.append(processed[tensor_idx])
-                tensor_idx += 1
-            else:
-                new_flat.append(item)
-
-        return tree_unflatten(new_flat, spec)
-
-    def _register_grad_hooks(self):
-        """Register hooks on parameters to trigger reduce after all grads computed."""
-        # Remove previous hooks
-        for handle in self._grad_hook_handles:
-            handle.remove()
-        self._grad_hook_handles.clear()
-
-        # Track how many grads we're waiting for
-        params_needing_grad = [
-            p
-            for p in self.group.params
-            if p._unsharded_param is not None and p._unsharded_param.requires_grad
-        ]
-        if not params_needing_grad:
+        Called either from _DedicatedPostBackward.backward (fast path) or from
+        the autograd-engine root callback (fallback, when no input required
+        gradient or was reachable through backward).
+        """
+        if self.group._post_backward_fired:
             return
+        # Transfer grads from forward-time params to current _unsharded_param.
+        # Needed because reshard + re-unshard (pre-backward) creates a NEW
+        # _unsharded_param, but autograd computed grad on the OLD one (from forward).
+        # Note: preserve grad as-is (DTensor stays DTensor) — .grad must match
+        # the DTensor-ness of the receiving tensor, so do NOT unwrap to local.
+        forward_params = self.group._forward_time_params or []
+        for dp, fwd_param in forward_params:
+            if fwd_param.grad is not None:
+                if dp._unsharded_param is not None:
+                    dp._unsharded_param.grad = fwd_param.grad.data
+                fwd_param.grad = None
+        # Release forward-time refs now that grads are transferred.
+        self.group._forward_time_params = None
 
-        grad_count = [0]
-        total = len(params_needing_grad)
+        self.group.reduce_grads()
+        self.group.reshard()
+        self.group._post_backward_fired = True
 
-        def make_hook(dedicated_param):
-            def hook(grad):
-                # Forward grad to current _unsharded_param so reduce_grads can find it.
-                # Needed because reshard+re-unshard creates a NEW _unsharded_param,
-                # but autograd computes grad on the OLD one (from forward).
-                if dedicated_param._unsharded_param is not None:
-                    dedicated_param._unsharded_param.grad = grad
-                grad_count[0] += 1
-                if grad_count[0] >= total:
-                    # All grads computed — dispatch reduce (async) + reshard.
-                    # Do NOT wait for reduce here — let it overlap with next layer's
-                    # backward. wait_for_reduce is deferred to before the optimizer step
-                    # via dmuon.wait_all_reduces(model).
-                    self.group.reduce_grads()
-                    self.group.reshard()
-                return grad
+    def _queue_root_post_backward_callback(self) -> None:
+        """Queue (at most once per backward) a callback that fires after the
+        entire backward graph finishes. Mirrors FSDP2's approach.
+        """
+        if self.comm_ctx.post_backward_final_callback_queued:
+            return
+        self.comm_ctx.post_backward_final_callback_queued = True
+        Variable._execution_engine.queue_callback(
+            lambda: _root_post_backward_final_callback(self.comm_ctx)
+        )
 
-            return hook
+    # ---- input/output wrapping (shallow scan, O(1) per call) -------------
 
-        for dp in params_needing_grad:
-            handle = dp._unsharded_param.register_hook(make_hook(dp))
-            self._grad_hook_handles.append(handle)
+    def _register_post_backward(self, args, kwargs):
+        """Wrap one input tensor through _DedicatedPostBackward if possible.
+
+        Only scans the top level of args and kwargs (no recursion into nested
+        dict/list/tuple). For transformer layers this hits immediately on
+        args[0] = hidden_states. For modules whose grad-requiring tensors are
+        nested (e.g., a VLA batch dict), the fast path is skipped and the
+        autograd-engine root callback (queued in _DedicatedPreBackward) runs
+        post_backward at the end of the backward pass instead.
+
+        Only ONE tensor needs wrapping — autograd topologically orders the
+        Function's backward after all computation that produced it, which
+        includes all param-grad computations of this module.
+        """
+        # Scan args top level
+        for i, obj in enumerate(args):
+            if isinstance(obj, torch.Tensor) and obj.requires_grad:
+                wrapped = _DedicatedPostBackward.apply(self, obj)[0]
+                new_args = args[:i] + (wrapped,) + args[i + 1:]
+                return new_args, kwargs
+        # Scan kwargs top level
+        for k, obj in kwargs.items():
+            if isinstance(obj, torch.Tensor) and obj.requires_grad:
+                wrapped = _DedicatedPostBackward.apply(self, obj)[0]
+                new_kwargs = dict(kwargs)
+                new_kwargs[k] = wrapped
+                return args, new_kwargs
+        # Shallow scan found nothing — rely on root callback fallback.
+        return args, kwargs
+
+    def _register_pre_backward(self, output):
+        """Wrap one output tensor through _DedicatedPreBackward (unshard trigger).
+
+        Shallow scan on the output to avoid pytree recursion on complex
+        returns. Transformer layers typically return a single tensor or a
+        short tuple; both cases are hit in O(1).
+        """
+        if isinstance(output, torch.Tensor):
+            if output.requires_grad:
+                return _DedicatedPreBackward.apply(self, output)[0]
+            return output
+        if isinstance(output, tuple):
+            for i, obj in enumerate(output):
+                if isinstance(obj, torch.Tensor) and obj.requires_grad:
+                    wrapped = _DedicatedPreBackward.apply(self, obj)[0]
+                    return output[:i] + (wrapped,) + output[i + 1:]
+        elif isinstance(output, list):
+            for i, obj in enumerate(output):
+                if isinstance(obj, torch.Tensor) and obj.requires_grad:
+                    wrapped = _DedicatedPreBackward.apply(self, obj)[0]
+                    new_out = list(output)
+                    new_out[i] = wrapped
+                    return new_out
+        elif isinstance(output, dict):
+            for k, obj in output.items():
+                if isinstance(obj, torch.Tensor) and obj.requires_grad:
+                    wrapped = _DedicatedPreBackward.apply(self, obj)[0]
+                    new_out = dict(output)
+                    new_out[k] = wrapped
+                    return new_out
+        return output
+
+
+def _root_post_backward_final_callback(comm_ctx: DedicatedCommContext) -> None:
+    """Run at the end of the backward pass (autograd engine callback).
+
+    Iterates every registered DedicatedState; any whose group did NOT fire
+    post_backward via the fast path gets its post_backward executed here.
+    This is the fallback for cases where no input tensor required gradient,
+    so _DedicatedPostBackward.backward never ran.
+    """
+    try:
+        for state in comm_ctx.all_states:
+            if state.group._post_backward_fired:
+                continue
+            state._run_post_backward()
+    finally:
+        comm_ctx.post_backward_final_callback_queued = False

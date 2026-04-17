@@ -6,12 +6,19 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from ._internal_utils import unsafe_setattr_param
+
 try:
     from torch.distributed.tensor import DTensor
     from torch.distributed.tensor._dtensor_spec import DTensorSpec
 except ImportError:
     DTensor = None
     DTensorSpec = None
+
+try:
+    from torch.distributed.tensor import Shard as _Shard
+except ImportError:
+    _Shard = None
 
 
 def _from_local_no_grad(tensor: torch.Tensor, spec: "DTensorSpec") -> "DTensor":
@@ -63,6 +70,13 @@ class DedicatedParam:
         self._compute_dtype = compute_dtype  # e.g. bf16 for mixed precision
         self._requires_grad = param.requires_grad
 
+        # Cached attrs (were @property, now computed once).
+        # Dependencies: is_dtensor, _tp_spec, _orig_size — all set above.
+        self.numel: int = self._orig_size.numel()
+        self.shard_dim: Optional[int] = self._compute_shard_dim()
+        self.full_shape: torch.Size = self._compute_full_shape()
+        self.tp_group: Optional[dist.ProcessGroup] = self._compute_tp_group()
+
         # Storage: owner keeps full data, others release
         if self.is_owner:
             self._owned_data = local_data.detach().clone()
@@ -99,48 +113,34 @@ class DedicatedParam:
                 _from_local_no_grad(param.data, self._tp_spec),
                 requires_grad=param.requires_grad,
             )
-        setattr(self.module, self.param_name, param)
+        unsafe_setattr_param(self.module, self.param_name, param)
 
-    @property
-    def numel(self) -> int:
-        return self._orig_size.numel()
+    # ---- cached-attr helpers (called once from __init__) ----
 
-    @property
-    def tp_group(self) -> Optional[dist.ProcessGroup]:
-        """Get TP process group if this is a DTensor param."""
+    def _compute_tp_group(self) -> Optional[dist.ProcessGroup]:
         if self.is_dtensor and self._tp_spec is not None:
             return self._tp_spec.mesh.get_group(mesh_dim=0)
         return None
 
-    @property
-    def shard_dim(self) -> Optional[int]:
+    def _compute_shard_dim(self) -> Optional[int]:
         """TP shard dimension: 0 (row-sharded) or 1 (col-sharded).
 
         Returns None for non-DTensor params. Used by Gram NS to decide
         which Gram matrix (L-side or R-side) decomposes under TP.
         """
-        if self.is_dtensor and self._tp_spec is not None:
-            try:
-                from torch.distributed.tensor import Shard as _Shard
-            except ImportError:
-                return None
+        if self.is_dtensor and self._tp_spec is not None and _Shard is not None:
             for p in self._tp_spec.placements:
                 if isinstance(p, _Shard):
                     return p.dim
         return None
 
-    @property
-    def full_shape(self) -> torch.Size:
+    def _compute_full_shape(self) -> torch.Size:
         """Full (unsharded) shape of the parameter.
 
         For DTensor params, reconstructs the shape before TP sharding.
         For non-DTensor params, returns ``_orig_size`` as-is.
         """
-        if self.is_dtensor and self._tp_spec is not None:
-            try:
-                from torch.distributed.tensor import Shard as _Shard
-            except ImportError:
-                return self._orig_size
+        if self.is_dtensor and self._tp_spec is not None and _Shard is not None:
             shape = list(self._orig_size)
             for p in self._tp_spec.placements:
                 if isinstance(p, _Shard):
@@ -163,7 +163,8 @@ class DedicatedParam:
         buf = torch.empty(self._orig_size, dtype=comm_dtype, device=self.device)
         if self.is_owner:
             assert self._owned_data is not None, "Owner must have _owned_data"
-            buf.copy_(self._owned_data.to(comm_dtype))
+            # copy_ handles dtype conversion inline — no .to() intermediate tensor
+            buf.copy_(self._owned_data)
         work = dist.broadcast( 
             buf, src=self._owner_global_rank, group=self.dp_group, async_op=async_op
         )
@@ -184,14 +185,17 @@ class DedicatedParam:
     # ---- reshard ----
 
     def reshard(self):
-        """Reshard: owner writes back, all ranks free unsharded buffer."""
+        """Reshard: all ranks free unsharded buffer and restore placeholder.
+
+        Note: no owner copy-back is needed. ``_owned_data`` is the
+        authoritative fp32 copy and is written only by the optimizer step.
+        ``_unsharded_param`` is the bf16 broadcast buffer that forward reads
+        but never writes (backward writes only ``.grad``), so copying its
+        contents back would just re-quantize fp32 owned data down to bf16
+        precision and waste HBM bandwidth on every forward.
+        """
         if self._unsharded_param is None:
             return
-        if self.is_owner:
-            data = self._unsharded_param.data
-            if self.is_dtensor and DTensor is not None and isinstance(data, DTensor):
-                data = data._local_tensor
-            self._owned_data.copy_(data)
         self._unsharded_param = None
         self._set_module_param(self._placeholder)
 

@@ -12,6 +12,7 @@ import torch
 
 if TYPE_CHECKING:
     from .group import DedicatedParamGroup
+    from .state import DedicatedState
 
 
 class DedicatedCommContext:
@@ -24,6 +25,14 @@ class DedicatedCommContext:
     Prefetch state:
         post_forward_order: records which groups ran forward, in order.
             Used in backward to determine the next group to prefetch.
+
+    Root post-backward fallback:
+        all_states: every DedicatedState registers itself here so the
+            autograd-engine callback can iterate and force-fire any group
+            whose fast-path post-backward did not run (e.g., when no input
+            tensor required gradient).
+        post_backward_final_callback_queued: guards the callback so it is
+            queued at most once per backward pass.
     """
 
     def __init__(self, device: torch.device):
@@ -31,6 +40,8 @@ class DedicatedCommContext:
         self.broadcast_stream = torch.cuda.Stream(device=device, priority=-1)
         self.reduce_stream = torch.cuda.Stream(device=device, priority=-1)
         self.post_forward_order: list[DedicatedParamGroup] = []
+        self.all_states: list[DedicatedState] = []
+        self.post_backward_final_callback_queued: bool = False
 
     def reset_post_forward_order(self) -> None:
         """Clear post-forward order. Call at the start of each forward pass."""
