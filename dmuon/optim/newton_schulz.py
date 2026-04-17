@@ -79,6 +79,11 @@ class NewtonSchulz:
         restart_iterations: Restart positions for Gram-space NS.
             ``None`` uses ``[2]``.  Ignored when *backend* is
             ``"direct"``.
+        deterministic: If ``True``, force all Gram-space matrix ops
+            through cuBLAS instead of the custom SYRK kernel.  This
+            guarantees bit-exact reproducibility across runs at the
+            cost of losing SYRK's symmetry-based acceleration (~1.5x).
+            Default ``False``.
 
     Example::
 
@@ -86,6 +91,9 @@ class NewtonSchulz:
 
         # Default (Gram-space, Polar Express coefficients)
         ns = dmuon.NewtonSchulz()
+
+        # Bit-exact reproducible
+        ns = dmuon.NewtonSchulz(deterministic=True)
 
         # Classic Muon with You coefficients
         ns = dmuon.NewtonSchulz("direct", coefficients=dmuon.YOU_COEFFICIENTS)
@@ -98,12 +106,14 @@ class NewtonSchulz:
         backend: str = "gram",
         coefficients: Optional[list[list[float]]] = None,
         restart_iterations: Optional[list[int]] = None,
+        deterministic: bool = False,
     ):
         if backend not in ("gram", "direct"):
             raise ValueError(f"backend must be 'gram' or 'direct', got '{backend}'")
         self.backend = backend
         self.coefficients = coefficients
         self.restart_iterations = restart_iterations
+        self.deterministic = deterministic
 
     def local(self, G: Tensor, steps: int) -> Tensor:
         """Run NS on a local (non-TP-decomposed) matrix.
@@ -115,6 +125,7 @@ class NewtonSchulz:
                 G, steps=steps,
                 coefficients=self.coefficients,
                 restart_iterations=self.restart_iterations,
+                deterministic=self.deterministic,
             )
         return direct_newton_schulz(
             G, steps=steps, coefficients=self.coefficients,
@@ -139,11 +150,13 @@ class NewtonSchulz:
             restart_iterations=self.restart_iterations,
             shard_dim=shard_dim,
             block_diagonal=block_diagonal,
+            deterministic=self.deterministic,
         )
 
     def __repr__(self) -> str:
         coeff = "default" if self.coefficients is None else f"{len(self.coefficients)}-step custom"
-        return f"NewtonSchulz(backend={self.backend!r}, coefficients={coeff})"
+        det = ", deterministic=True" if self.deterministic else ""
+        return f"NewtonSchulz(backend={self.backend!r}, coefficients={coeff}{det})"
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +279,7 @@ def gram_newton_schulz(
     restart_iterations: Optional[list[int]] = None,
     shard_dim: Optional[int] = None,
     block_diagonal: bool = False,
+    deterministic: bool = False,
 ) -> Tensor:
     """Gram Newton-Schulz with TP SYRK decomposition.
 
@@ -293,6 +307,7 @@ def gram_newton_schulz(
         shard_dim: TP shard dimension (0 or 1). Determines transpose direction.
             If None, falls back to shape-based heuristic.
         block_diagonal: If True, skip TP all-reduce (zero communication).
+        deterministic: If True, use cuBLAS for all ops (no SYRK kernel).
 
     Returns:
         Orthogonalized update shard, same shape as input.
@@ -322,7 +337,7 @@ def gram_newton_schulz(
 
     # --- Initial SYRK: R = X @ X^T ---
     m = X.shape[0]
-    _use_syrk = _HAS_SYRK and X.is_cuda
+    _use_syrk = _HAS_SYRK and X.is_cuda and not deterministic
     if _use_syrk:
         R = torch.empty(m, m, device=X.device, dtype=X.dtype)
         _syrk_or_cublas(X, R)
@@ -354,9 +369,11 @@ def gram_newton_schulz(
             Q = None
 
         if _use_syrk:
+            # Op 2: Z = c*R@R^T + b*R  (B==A, symmetric)
             _syrk_or_cublas(R, Z, C=R, alpha=c, beta=b)
 
             if Q is None:
+                # Op 3: Q = Z + a*I  (first iter, B==A, symmetric)
                 need_R_evolve = i < len(coefficients) - 1 and (i + 1) not in restart_iterations
                 if not need_R_evolve:
                     _syrk_or_cublas(R, Q_bufs[q_idx], C=R, alpha=c, beta=b, diag_add=a)
@@ -365,24 +382,27 @@ def gram_newton_schulz(
                     Q_bufs[q_idx].diagonal().add_(a)
                 Q = Q_bufs[q_idx]
             else:
+                # Op 4: Q_new = Z@Q^T + a*Q  (B!=A, NOT symmetric → cuBLAS)
                 q_next = 1 - q_idx
-                _syrk_or_cublas(Q, Q_bufs[q_next], B=Z, C=Q, beta=a)
+                torch.addmm(Q, Z, Q.T, alpha=1.0, beta=a, out=Q_bufs[q_next])
                 Q = Q_bufs[q_next]
                 q_idx = q_next
 
             if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:
-                _syrk_or_cublas(R, RZ_buf, B=Z, C=R, beta=a)
-                _syrk_or_cublas(Z, R_new, B=RZ_buf, C=RZ_buf, beta=a)
+                # Ops 5,6: B!=A, symmetric (Z,R,RZ are polynomials of same
+                # symmetric matrix → commute → result symmetric). SYRK OK.
+                _syrk_or_cublas(R, RZ_buf, B=Z, C=R, alpha=1.0, beta=a)
+                _syrk_or_cublas(RZ_buf, R_new, B=Z, C=RZ_buf, alpha=1.0, beta=a)
                 R = R_new
         else:
-            Z_t = torch.baddbmm(R, R, R, alpha=c, beta=b)
+            Z_t = torch.addmm(R, R, R, alpha=c, beta=b)
             if Q is None:
                 Q = Z_t + a * I
             else:
-                Q = torch.baddbmm(Q, Z_t, Q, beta=a)
+                Q = torch.addmm(Q, Z_t, Q, beta=a)
             if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:
-                RZ_t = torch.baddbmm(R, R, Z_t, beta=a)
-                R = torch.baddbmm(RZ_t, Z_t, RZ_t, beta=a)
+                RZ_t = torch.addmm(R, R, Z_t, beta=a)
+                R = torch.addmm(RZ_t, Z_t, RZ_t, beta=a)
 
     # --- Project back ---
     X = Q @ X
@@ -398,6 +418,7 @@ def gram_newton_schulz_local(
     eps: float = 1e-7,
     coefficients: Optional[list[list[float]]] = None,
     restart_iterations: Optional[list[int]] = None,
+    deterministic: bool = False,
 ) -> Tensor:
     """Gram NS without TP (single-rank). Uses Gram iteration for its precision
     benefits (restarts, per-step coefficients) even without TP sharding.
@@ -408,6 +429,7 @@ def gram_newton_schulz_local(
         eps: Normalization epsilon.
         coefficients: Per-step coefficients.
         restart_iterations: Iteration indices for restart.
+        deterministic: If True, use cuBLAS for all ops (no SYRK kernel).
 
     Returns:
         Orthogonalized update (m, n).
@@ -428,7 +450,7 @@ def gram_newton_schulz_local(
 
     # Initial SYRK: R = X @ X^T
     m = X.shape[0]
-    _use_syrk = _HAS_SYRK and X.is_cuda
+    _use_syrk = _HAS_SYRK and X.is_cuda and not deterministic
     if _use_syrk:
         R = torch.empty(m, m, device=X.device, dtype=X.dtype)
         _syrk_or_cublas(X, R)
@@ -454,32 +476,30 @@ def gram_newton_schulz_local(
             Q = None
 
         if _use_syrk:
-            # Z = c*R² + b*R (always needed for R evolve)
+            # Op 2: Z = c*R@R^T + b*R  (B==A, symmetric)
             _syrk_or_cublas(R, Z, C=R, alpha=c, beta=b)
 
             if Q is None:
-                # First/restart: Q = Z + a*I (fuse diag_add if last step or before restart)
+                # Op 3: Q = Z + a*I  (first iter, B==A, symmetric)
                 need_R_evolve = i < len(coefficients) - 1 and (i + 1) not in restart_iterations
                 if not need_R_evolve:
-                    # No R evolve needed, fuse Z+aI into single SYRK
                     _syrk_or_cublas(R, Q_bufs[q_idx], C=R, alpha=c, beta=b, diag_add=a)
                 else:
-                    # Need Z for R evolve, compute Q = Z + a*I via diag add on Z copy
                     Q_bufs[q_idx].copy_(Z)
                     Q_bufs[q_idx].diagonal().add_(a)
                 Q = Q_bufs[q_idx]
             else:
-                # Q_new = Q@Z + a*Q (write to OTHER buffer to avoid alias)
+                # Op 4: Q_new = Z@Q^T + a*Q  (B!=A, NOT symmetric → cuBLAS)
                 q_next = 1 - q_idx
-                _syrk_or_cublas(Q, Q_bufs[q_next], B=Z, C=Q, beta=a)
+                torch.addmm(Q, Z, Q.T, alpha=1.0, beta=a, out=Q_bufs[q_next])
                 Q = Q_bufs[q_next]
                 q_idx = q_next
 
             if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:
-                # RZ = R@Z + a*R (symmetric)
-                _syrk_or_cublas(R, RZ_buf, B=Z, C=R, beta=a)
-                # R = Z@RZ + a*RZ (symmetric)
-                _syrk_or_cublas(Z, R_new, B=RZ_buf, C=RZ_buf, beta=a)
+                # Ops 5,6: B!=A, symmetric (Z,R,RZ are polynomials of same
+                # symmetric matrix → commute → result symmetric). SYRK OK.
+                _syrk_or_cublas(R, RZ_buf, B=Z, C=R, alpha=1.0, beta=a)
+                _syrk_or_cublas(RZ_buf, R_new, B=Z, C=RZ_buf, alpha=1.0, beta=a)
                 R = R_new
         else:
             Z_t = torch.addmm(R, R, R, alpha=c, beta=b)

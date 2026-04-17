@@ -75,6 +75,7 @@ class SyrkSm80:
         tile_m=DEFAULT_TILE_M,
         tile_k=DEFAULT_TILE_K,
         num_stages=DEFAULT_NUM_STAGES,
+        skip_mirror=False,
     ):
         self.acc_dtype = acc_dtype
         self.a_dtype = a_dtype
@@ -82,6 +83,7 @@ class SyrkSm80:
         self.alpha_mode = alpha_mode
         self.beta_mode = beta_mode
         self.has_diag_add = diag_add_mode == 1
+        self.skip_mirror = skip_mirror
         self.tile_m = tile_m
         self.tile_k = tile_k
         self.num_stages = num_stages
@@ -367,17 +369,18 @@ class SyrkSm80:
         cute.autovec_copy(out, tCgD)
 
         # ── Mirror (dual-write upper triangle) ───────────────────────────
+        # skip_mirror=True: debug mode, only write lower triangle
+        do_mirror = const_expr(not self.skip_mirror)
         # Reuse sA smem as transpose buffer (mainloop is done)
         mirror_smem = storage.sA.get_tensor((self.tile_m, self.padded_n))
 
-        if is_diagonal:
-            # Diagonal tiles: element-wise mirror (few tiles, not perf-critical)
-            for i in cutlass.range_constexpr(cute.size(out)):
-                gr = trs + Int32(tCcD[i][0])
-                gc = tcs + Int32(tCcD[i][1])
-                if gr > gc:
-                    mD_mn[gc, gr] = out[i]
-        else:
+        if do_mirror and is_diagonal:
+            # Diagonal tiles: autovec_copy already wrote the full tile (both
+            # lower and upper triangle). Skip mirror to avoid double-write race
+            # that causes non-determinism when B!=A (different FP accumulation
+            # for (row,col) vs (col,row) produces ULP-level differences).
+            pass
+        elif do_mirror:
             # Off-diagonal tiles: smem transpose + coalesced global write
             # Phase 1: scatter MMA output into smem (row-major with padding)
             cute.arch.sync_threads()
@@ -408,6 +411,7 @@ def _compile_syrk_sm80(
     tile_m=DEFAULT_TILE_M,
     tile_k=DEFAULT_TILE_K,
     num_stages=DEFAULT_NUM_STAGES,
+    skip_mirror=False,
 ):
     m, k, l = cute.sym_int(), cute.sym_int(), cute.sym_int()
     div_a = 128 // a_dtype.width
@@ -435,6 +439,7 @@ def _compile_syrk_sm80(
         tile_m=tile_m,
         tile_k=tile_k,
         num_stages=num_stages,
+        skip_mirror=skip_mirror,
     )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(
@@ -465,13 +470,23 @@ def syrk_sm80(
     tile_m: int = DEFAULT_TILE_M,
     tile_k: int = DEFAULT_TILE_K,
     num_stages: int = DEFAULT_NUM_STAGES,
+    skip_mirror: bool = False,
+    _symmetric: bool = False,
 ) -> None:
     """SM80 symmetric GEMM: D = alpha * A @ B^T + beta * C + diag_add * I.
 
-    When B is None, computes SYRK: D = alpha * A @ A^T + beta * C + diag_add * I.
-    Only computes lower triangle + mirror write for symmetric output.
-    Requires that A @ B^T produces a symmetric result.
+    Only computes lower triangle + mirror write — result MUST be symmetric.
+    - B=None (default): true SYRK (A @ A^T), always symmetric.
+    - B!=A: caller must guarantee A @ B^T is symmetric and pass _symmetric=True.
+      The kernel produces WRONG upper-triangle values if the result is not symmetric.
     """
+    if B is not None and B.data_ptr() != A.data_ptr() and not _symmetric:
+        raise ValueError(
+            "syrk_sm80: B!=A requires _symmetric=True to confirm that "
+            "A @ B^T produces a symmetric result. For non-symmetric GEMM, "
+            "use torch.mm/torch.addmm (cuBLAS)."
+        )
+
     squeeze = A.ndim == 2
     if squeeze:
         A = A.unsqueeze(0)
@@ -521,6 +536,7 @@ def syrk_sm80(
         tile_m=tile_m,
         tile_k=tile_k,
         num_stages=num_stages,
+        skip_mirror=skip_mirror,
     )
 
     from dmuon.kernels.cache_utils import COMPILE_ONLY

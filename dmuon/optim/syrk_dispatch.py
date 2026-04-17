@@ -7,8 +7,11 @@ the winner.  The main entry point is ``syrk_or_cublas()``.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time as _time
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -49,6 +52,68 @@ def get_ns_backend() -> str:
 
 # Cache: (M, K, device_idx, dtype, has_C) -> (tile_m, tile_k, num_stages) or None
 _syrk_autotune_cache: dict[tuple, tuple | None] = {}
+
+
+def _get_autotune_cache_path() -> Path:
+    """Get path for persistent autotune cache file."""
+    cache_dir = os.environ.get("DMUON_CACHE_DIR")
+    if cache_dir:
+        p = Path(cache_dir)
+    else:
+        p = Path.home() / ".cache" / "dmuon"
+    p.mkdir(parents=True, exist_ok=True)
+    gpu_name = torch.cuda.get_device_name(0).replace(" ", "_") if torch.cuda.is_available() else "cpu"
+    return p / f"syrk_autotune_{gpu_name}.json"
+
+
+_DTYPE_TO_STR = {torch.float16: "fp16", torch.bfloat16: "bf16", torch.float32: "fp32"}
+_STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
+
+
+def _key_to_json(key: tuple) -> str:
+    """Serialize cache key to JSON-safe string."""
+    M, K, dev_idx, dtype, has_C = key
+    return json.dumps([M, K, dev_idx, _DTYPE_TO_STR.get(dtype, str(dtype)), has_C])
+
+
+def _json_to_key(s: str) -> tuple:
+    """Deserialize cache key from JSON string."""
+    M, K, dev_idx, dtype_str, has_C = json.loads(s)
+    return (M, K, dev_idx, _STR_TO_DTYPE.get(dtype_str, dtype_str), has_C)
+
+
+def _load_autotune_cache() -> None:
+    """Load persistent autotune cache from disk."""
+    global _syrk_autotune_cache
+    try:
+        path = _get_autotune_cache_path()
+        if path.exists():
+            with open(path) as f:
+                data = json.load(f)
+            for k, v in data.items():
+                key = _json_to_key(k)
+                _syrk_autotune_cache[key] = tuple(v) if v is not None else None
+            logger.info(f"Loaded {len(data)} autotune entries from {path}")
+    except Exception as e:
+        logger.debug(f"Could not load autotune cache: {e}")
+
+
+def _save_autotune_cache() -> None:
+    """Save autotune cache to disk."""
+    try:
+        path = _get_autotune_cache_path()
+        data = {}
+        for k, v in _syrk_autotune_cache.items():
+            data[_key_to_json(k)] = list(v) if v is not None else None
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.debug(f"Could not save autotune cache: {e}")
+
+
+# Load persistent cache at import time
+if HAS_SYRK:
+    _load_autotune_cache()
 
 
 def _bench_median(fn, warmup=5, repeat=20):
@@ -115,26 +180,30 @@ def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
     )
 
     _syrk_autotune_cache[key] = best_config
+    _save_autotune_cache()
     return best_config
 
 
 def syrk_or_cublas(A: Tensor, D: Tensor, B: Tensor | None = None,
                    C: Tensor | None = None, alpha: float = 1.0,
                    beta: float = 1.0, diag_add: float = 0.0) -> None:
-    """Call SYRK with autotuned config, or fall back to cuBLAS if cuBLAS is faster.
+    """Symmetric GEMM with autotuned SYRK or cuBLAS fallback.
 
     Computes D = alpha * A @ B^T + beta * C + diag_add * I.
     When B is None, B = A (true SYRK).
+    When B != A, the result MUST be symmetric (caller's responsibility).
     """
     M, K = A.shape[0], A.shape[1]
     has_C = C is not None
     BT = A.T if B is None else B.T
+    is_true_syrk = B is None or B.data_ptr() == A.data_ptr()
     config = _autotune_syrk(M, K, A.device, A.dtype, has_C)
     if config is not None:
         tile_m, tile_k, num_stages = config
         _syrk_sm80_fn(A, D, B=B, C=C, alpha=alpha, beta=beta,
                        diag_add=diag_add,
-                       tile_m=tile_m, tile_k=tile_k, num_stages=num_stages)
+                       tile_m=tile_m, tile_k=tile_k, num_stages=num_stages,
+                       _symmetric=not is_true_syrk)
     else:
         # cuBLAS fallback
         if has_C:
