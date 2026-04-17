@@ -43,3 +43,6 @@ docs/paper_strategy*.md
 .DS_Store
 Thumbs.db
 site/
+
+# Precision experiment artifacts (generated on demand)
+tests/precision/artifacts/
