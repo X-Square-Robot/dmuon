@@ -26,6 +26,14 @@ def _from_local_no_grad(tensor: torch.Tensor, spec: "DTensorSpec") -> "DTensor":
     return DTensor.from_local(tensor, spec.mesh, spec.placements, run_check=False)
 
 
+def _make_contiguous_stride(size: torch.Size) -> tuple[int, ...]:
+    """Compute row-major contiguous stride for ``size``."""
+    stride: list[int] = [1] * len(size)
+    for i in range(len(size) - 2, -1, -1):
+        stride[i] = stride[i + 1] * size[i + 1]
+    return tuple(stride)
+
+
 class DedicatedParam:
     """Manages one dedicated-ownership parameter.
 
@@ -91,11 +99,17 @@ class DedicatedParam:
         # Mark placeholder so the FSDP2 patch also ignores it
         self._placeholder._dedicated_owner_rank = owner_rank
 
-        # Unsharded parameter (populated after broadcast)
+        # Phase 2: _unsharded_param is created LATER by DedicatedParamGroup
+        # (see ``bind_to_packed_buffer``) as an ``as_strided`` view into the
+        # group's persistent per-owner packed buffer. This matches FSDP2's
+        # pattern where all an owner's params share one buffer and each
+        # Parameter is a stride-metadata view.
+        #
+        # Storage resizing happens on the group's packed buffer (one alloc /
+        # free per broadcast), not on individual Parameter storages.
         self._unsharded_param: Optional[nn.Parameter] = None
-
-        # Broadcast buffer (temporary, between alloc and finish)
-        self._broadcast_buf: Optional[torch.Tensor] = None
+        # True while group's packed buffer is allocated; False after reshard.
+        self._is_unsharded: bool = False
 
         # Reduced gradient (on owner, after backward)
         self._reduced_grad: Optional[torch.Tensor] = None
@@ -104,16 +118,26 @@ class DedicatedParam:
         self._accumulated_grad: Optional[torch.Tensor] = None
 
         # Set module to sharded state
-        self._set_module_param(self._placeholder)
+        unsafe_setattr_param(self.module, self.param_name, self._placeholder)
 
-    def _set_module_param(self, param: nn.Parameter):
-        """Set parameter on the module, handling DTensor wrapping."""
-        if self.is_dtensor and param.numel() > 0:
-            param = nn.Parameter(
-                _from_local_no_grad(param.data, self._tp_spec),
-                requires_grad=param.requires_grad,
-            )
-        unsafe_setattr_param(self.module, self.param_name, param)
+    def bind_to_packed_buffer(
+        self, packed_buf: torch.Tensor, storage_offset: int
+    ) -> None:
+        """Install ``_unsharded_param`` as an as_strided view into the group's
+        packed broadcast buffer at ``storage_offset``.
+
+        Called once by :class:`DedicatedParamGroup` after both are constructed.
+        The Parameter shares storage with ``packed_buf``; when the group
+        alloc/free's the packed buffer's storage, this view's storage also
+        resizes (it's the same Storage object).
+        """
+        contiguous_stride = _make_contiguous_stride(self._orig_size)
+        view = torch.as_strided(packed_buf, self._orig_size, contiguous_stride, storage_offset)
+        if self.is_dtensor:
+            wrapped = _from_local_no_grad(view, self._tp_spec)
+        else:
+            wrapped = view
+        self._unsharded_param = nn.Parameter(wrapped, requires_grad=self._requires_grad)
 
     # ---- cached-attr helpers (called once from __init__) ----
 
@@ -150,60 +174,37 @@ class DedicatedParam:
         return self._orig_size
 
     # ---- unshard (broadcast) ----
-
-    def alloc_and_broadcast(self, async_op: bool = False) -> Optional[dist.Work]:
-        """Allocate buffer and broadcast from owner.
-
-        When called from DedicatedParamGroup, async_op=False is used because the
-        caller is already on the dedicated broadcast_stream. Stream-based dispatch
-        replaces Work-based async.
-        """
-        # Use compute_dtype (bf16) for communication if available, else orig_dtype
-        comm_dtype = self._compute_dtype or self._orig_dtype
-        buf = torch.empty(self._orig_size, dtype=comm_dtype, device=self.device)
-        if self.is_owner:
-            assert self._owned_data is not None, "Owner must have _owned_data"
-            # copy_ handles dtype conversion inline — no .to() intermediate tensor
-            buf.copy_(self._owned_data)
-        work = dist.broadcast( 
-            buf, src=self._owner_global_rank, group=self.dp_group, async_op=async_op
-        )
-        self._broadcast_buf = buf
-        return work
+    # Phase 2: storage lives on the group's packed buffer. DedicatedParam
+    # only attaches/detaches its _unsharded_param from the module.
 
     def finish_unshard(self):
-        """Complete unshard after broadcast finishes."""
-        self._unsharded_param = nn.Parameter(self._broadcast_buf, requires_grad=self._requires_grad)
-        self._broadcast_buf = None
-        self._set_module_param(self._unsharded_param)
-        # For DTensor params, _set_module_param creates a NEW DTensor-wrapped
-        # Parameter on the module. Update _unsharded_param to point to that actual
-        # module parameter so autograd gradients are visible via _unsharded_param.grad.
-        if self.is_dtensor:
-            self._unsharded_param = getattr(self.module, self.param_name)
+        """Attach persistent _unsharded_param to the module.
+
+        Group's unshard path has already alloc'd the packed buffer and
+        written broadcast data. Our view (Parameter) shares that storage,
+        so setattr makes the new data visible to forward.
+        """
+        unsafe_setattr_param(self.module, self.param_name, self._unsharded_param)
+        self._is_unsharded = True
 
     # ---- reshard ----
 
     def reshard(self):
-        """Reshard: all ranks free unsharded buffer and restore placeholder.
+        """Detach _unsharded_param from the module, restore placeholder.
 
-        Note: no owner copy-back is needed. ``_owned_data`` is the
-        authoritative fp32 copy and is written only by the optimizer step.
-        ``_unsharded_param`` is the bf16 broadcast buffer that forward reads
-        but never writes (backward writes only ``.grad``), so copying its
-        contents back would just re-quantize fp32 owned data down to bf16
-        precision and waste HBM bandwidth on every forward.
+        The Parameter object stays alive; its storage will be freed when
+        the group calls ``free_storage`` on the packed buffer.
         """
-        if self._unsharded_param is None:
+        if not self._is_unsharded:
             return
-        self._unsharded_param = None
-        self._set_module_param(self._placeholder)
+        unsafe_setattr_param(self.module, self.param_name, self._placeholder)
+        self._is_unsharded = False
 
     # ---- gradient reduction ----
 
     def reduce_grad(self, async_op: bool = False) -> Optional[dist.Work]:
         """Reduce gradient to owner rank."""
-        if self._unsharded_param is None or self._unsharded_param.grad is None:
+        if not self._is_unsharded or self._unsharded_param.grad is None:
             return None
         grad = self._unsharded_param.grad.data
         if self.is_dtensor and DTensor is not None and isinstance(grad, DTensor):
@@ -219,16 +220,15 @@ class DedicatedParam:
 
     def save_grad_on_owner(self):
         """Owner saves the reduced gradient; all ranks clear grad."""
-        if self.is_owner and self._unsharded_param is not None:
+        if not self._is_unsharded:
+            return
+        if self.is_owner:
             grad = self._unsharded_param.grad
             if grad is not None:
                 if self.is_dtensor and DTensor is not None and isinstance(grad, DTensor):
                     grad = grad._local_tensor
-                elif isinstance(grad, torch.Tensor):
-                    pass
                 self._reduced_grad = grad.data.clone()
-        if self._unsharded_param is not None:
-            self._unsharded_param.grad = None
+        self._unsharded_param.grad = None
 
     def clear_reduced_grad(self):
         """Clear saved gradient (after optimizer step)."""

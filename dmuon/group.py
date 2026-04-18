@@ -32,12 +32,12 @@ class DedicatedParamGroup:
         self.comm_ctx = comm_ctx
         self.device = params[0].device if params else torch.device("cuda")
 
-        # Pre-group by owner to avoid recomputing each time
+        # Pre-group by owner so packed broadcasts / reduces can coalesce
+        # all of an owner's params into a single NCCL call.
         self._by_owner: dict[int, list[DedicatedParam]] = defaultdict(list)
         for p in params:
             self._by_owner[p.owner_rank].append(p)
 
-        self._packed_bufs: list[torch.Tensor] = []  # keep packed buffers alive until finish
         self.reduce_grads_enabled: bool = True
 
         # Event-based synchronization (replaces work.wait())
@@ -59,42 +59,68 @@ class DedicatedParamGroup:
         # groups that already ran.
         self._post_backward_fired: bool = False
 
-        # Saved forward-time unsharded params. Autograd writes .grad to the
-        # tensor instances that were in the graph at forward time; after reshard
-        # + re-unshard in pre_backward, dp._unsharded_param points to a NEW
-        # tensor. post_backward transfers .grad from forward-time refs (saved
-        # here) to the current _unsharded_param. Populated in _pre_forward,
-        # cleared in _run_post_backward.
-        self._forward_time_params: Optional[list[tuple]] = None
+        # NOTE: Phase 2 removed _forward_time_params. It used to snapshot the
+        # forward-time _unsharded_param references because reshard + re-unshard
+        # in pre_backward created a NEW Parameter and autograd's .grad went to
+        # the old one. With Parameter reuse (persistent _unsharded_param whose
+        # storage resizes 0↔full), the SAME Parameter object is live across
+        # the forward/backward cycle, so autograd writes .grad directly onto
+        # it. No snapshot, no grad-transfer step needed.
 
-        # Cached per-owner metadata (FSDP2 alignment phase 1 — previously
-        # recomputed in every _packed_broadcast / _packed_reduce call).
+        # Cached per-group metadata (FSDP2 alignment phase 1 — previously
+        # recomputed in every unshard / reduce_grads call).
         self._dp_group: Optional[dist.ProcessGroup] = (
             params[0].dp_group if params else None
         )
         self._comm_dtype: Optional[torch.dtype] = (
             (params[0]._compute_dtype or params[0]._orig_dtype) if params else None
         )
+        # Map {owner_rank → global rank} for all owners represented in params.
+        # Phase 2 iterates params directly (no _by_owner grouping) but still
+        # needs the global-rank lookup for dist.reduce(dst=...).
         self._total_numel_by_owner: dict[int, int] = {
             owner: sum(p.numel for p in owner_params)
             for owner, owner_params in self._by_owner.items()
         }
-        self._global_owner_ranks: dict[int, int] = (
-            {
+        if self._dp_group is not None:
+            self._global_owner_ranks: dict[int, int] = {
                 owner: dist.get_global_rank(self._dp_group, owner)
                 for owner in self._by_owner
             }
-            if self._dp_group is not None
-            else {}
-        )
+        else:
+            self._global_owner_ranks = {}
+
+        # Phase 2: Persistent per-owner packed broadcast buffer.
+        # One buffer per owner, shared as storage across all params that owner
+        # holds. Each DedicatedParam's _unsharded_param is installed as an
+        # as_strided view into its owner's buffer (see bind_to_packed_buffer).
+        # Storage is resized 0↔full via alloc_storage/free_storage on the
+        # packed buffer itself — individual Parameter views automatically see
+        # the resize since they share the underlying Storage object.
+        from ._internal_utils import free_storage
+        self._packed_buf_by_owner: dict[int, torch.Tensor] = {}
+        if self._comm_dtype is not None:
+            for owner, total_numel in self._total_numel_by_owner.items():
+                packed = torch.empty(total_numel, dtype=self._comm_dtype, device=self.device)
+                self._packed_buf_by_owner[owner] = packed
+                # Bind each param to a view of its owner's packed buf
+                offset = 0
+                for p in self._by_owner[owner]:
+                    p.bind_to_packed_buffer(packed, offset)
+                    offset += p.numel
+                # Start in resharded state (storage freed)
+                free_storage(packed)
 
     # ---- unshard (broadcast) — dispatch phase ----
 
     def unshard(self):
         """Dispatch broadcasts on broadcast_stream. Does NOT wait.
 
-        Call wait_for_unshard() to synchronize before using the parameters.
-        No-op if already dispatched (pending wait) or already unsharded.
+        Phase 2: each owner has one persistent packed buffer; params are
+        as_strided views into it. We alloc the packed buf's storage, owner
+        fills from its ``_owned_data``, one NCCL broadcast per owner (all
+        coalesced into a single NCCL kernel) distributes the data. No
+        scatter — views automatically see the storage.
         """
         if self._is_unsharded:
             return  # still unsharded from forward (reshard_after_forward=False)
@@ -102,19 +128,35 @@ class DedicatedParamGroup:
             return  # already dispatched, pending wait_for_unshard
 
         broadcast_stream = self.comm_ctx.broadcast_stream
-        # Ensure any prior compute (e.g., owner's data writes) is visible to broadcast_stream
         broadcast_stream.wait_stream(torch.cuda.current_stream())
 
-        self._packed_bufs = []
+        from ._internal_utils import alloc_storage
         dp_group = self._dp_group
         with torch.cuda.stream(broadcast_stream):
-            # Coalesce all broadcasts into a single fused NCCL kernel
+            # Alloc + owner copy-in BEFORE coalescing: these ops execute
+            # immediately on broadcast_stream. Wrapped in no_grad +
+            # preserve_version_counter so autograd doesn't see the resize /
+            # copy_ as an inplace modification of tensors in the compute graph.
+            for owner_rank, packed_buf in self._packed_buf_by_owner.items():
+                with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
+                    packed_buf
+                ):
+                    alloc_storage(packed_buf)
+                    if dp_group.rank() == owner_rank:
+                        offset = 0
+                        for p in self._by_owner[owner_rank]:
+                            packed_buf[offset : offset + p.numel].copy_(
+                                p._owned_data.view(-1)
+                            )
+                            offset += p.numel
+
             with dist._coalescing_manager(group=dp_group, device=self.device):
-                for owner_rank, owner_params in self._by_owner.items():
-                    if len(owner_params) == 1:
-                        owner_params[0].alloc_and_broadcast(async_op=False)
-                    else:
-                        self._packed_broadcast(owner_rank, owner_params)
+                for owner_rank, packed_buf in self._packed_buf_by_owner.items():
+                    dist.broadcast(
+                        packed_buf,
+                        src=self._global_owner_ranks[owner_rank],
+                        group=dp_group,
+                    )
 
         self._broadcast_event = broadcast_stream.record_event()
 
@@ -134,41 +176,25 @@ class DedicatedParamGroup:
             p.finish_unshard()
 
         self._broadcast_event = None
-        self._packed_bufs = []
         self._is_unsharded = True
-
-    def _packed_broadcast(self, owner_rank: int, params: list[DedicatedParam]) -> None:
-        """Pack multiple params from the same owner into one broadcast.
-
-        Caller must be on broadcast_stream.
-        """
-        total_numel = self._total_numel_by_owner[owner_rank]
-        comm_dtype = self._comm_dtype
-        buf = torch.empty(total_numel, dtype=comm_dtype, device=self.device)
-
-        # Owner: copy data into packed buffer (copy_ handles dtype conversion inline)
-        dp_group = self._dp_group
-        if dp_group.rank() == owner_rank:
-            offset = 0
-            for p in params:
-                buf[offset : offset + p.numel].copy_(p._owned_data.view(-1))
-                offset += p.numel
-
-        dist.broadcast(buf, src=self._global_owner_ranks[owner_rank], group=dp_group)
-
-        # Store buffer ref and assign slices for finish_unshard
-        self._packed_bufs.append(buf)
-        offset = 0
-        for p in params:
-            p._broadcast_buf = buf[offset : offset + p.numel].view(p._orig_size)
-            offset += p.numel
 
     # ---- reshard ----
 
     def reshard(self):
-        """Reshard all params (free unsharded buffers, restore placeholders)."""
+        """Reshard all params: detach from modules, then free packed buffers.
+
+        Detaching happens first (restores placeholders) so any forward after
+        reshard sees a clear no-op tensor rather than a view into 0-sized
+        storage.
+        """
         for p in self.params:
             p.reshard()
+        from ._internal_utils import free_storage
+        for packed_buf in self._packed_buf_by_owner.values():
+            with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
+                packed_buf
+            ):
+                free_storage(packed_buf)
         self._is_unsharded = False
 
     # ---- gradient reduction — dispatch phase ----
@@ -185,7 +211,7 @@ class DedicatedParamGroup:
         if not self.reduce_grads_enabled:
             # no_sync: accumulate full gradients locally (no communication)
             for p in self.params:
-                if p._unsharded_param is None or p._unsharded_param.grad is None:
+                if not p._is_unsharded or p._unsharded_param.grad is None:
                     continue
                 grad = p._unsharded_param.grad.data
                 if _DTensor is not None and isinstance(grad, _DTensor):
@@ -205,7 +231,7 @@ class DedicatedParamGroup:
 
         # Merge any accumulated gradients from prior no_sync steps
         for p in self.params:
-            if p._accumulated_grad is not None and p._unsharded_param is not None:
+            if p._accumulated_grad is not None and p._is_unsharded:
                 if p._unsharded_param.grad is not None:
                     grad = p._unsharded_param.grad.data
                     if _DTensor is not None and isinstance(grad, _DTensor):
@@ -222,103 +248,56 @@ class DedicatedParamGroup:
         self._pending_reduce = []
         dp_group = self._dp_group
         with torch.cuda.stream(reduce_stream):
-            # Coalesce all reduces into a single fused NCCL kernel
+            # Coalesce all reduces into a single fused NCCL kernel.
+            # Phase 2 removed _packed_reduce — each param reduces its own grad
+            # in-place, coalescing_manager fuses them into one NCCL call.
+            # We save the grad tensor ref here because reshard() will free
+            # _unsharded_param's storage before wait_for_reduce() can unpack.
             with dist._coalescing_manager(group=dp_group, device=self.device):
-                for owner_rank, owner_params in self._by_owner.items():
-                    params_with_grad = [
-                        p
-                        for p in owner_params
-                        if p._unsharded_param is not None and p._unsharded_param.grad is not None
-                    ]
-                    if not params_with_grad:
+                for p in self.params:
+                    if not p._is_unsharded or p._unsharded_param.grad is None:
                         continue
-
-                    if len(params_with_grad) == 1:
-                        # Single param: reduce in-place and save grad tensor reference.
-                        # Must save ref here because reshard() will set _unsharded_param=None
-                        # before wait_for_reduce() can read it.
-                        p = params_with_grad[0]
-                        grad = p._unsharded_param.grad.data
-                        if _DTensor is not None and isinstance(grad, _DTensor):
-                            grad = grad._local_tensor
-                        grad = grad.contiguous()
-                        dist.reduce(grad, dst=self._global_owner_ranks[owner_rank],
-                                    op=dist.ReduceOp.AVG, group=dp_group)
-                        p._unsharded_param.grad = None
-                        self._pending_reduce.append((grad.view(-1), params_with_grad))
-                    else:
-                        packed_buf = self._packed_reduce(owner_rank, params_with_grad)
-                        self._pending_reduce.append((packed_buf, params_with_grad))
+                    grad = p._unsharded_param.grad.data
+                    if _DTensor is not None and isinstance(grad, _DTensor):
+                        grad = grad._local_tensor
+                    grad = grad.contiguous()
+                    dist.reduce(
+                        grad, dst=self._global_owner_ranks[p.owner_rank],
+                        op=dist.ReduceOp.AVG, group=dp_group,
+                    )
+                    p._unsharded_param.grad = None
+                    self._pending_reduce.append((grad.view(-1), [p]))
 
         self._reduce_event = reduce_stream.record_event()
 
     def wait_for_reduce(self):
-        """GPU-side wait for reduces to complete, then unpack gradients on owner.
+        """GPU-side wait for reduces to complete, then save owner grad.
 
-        This fixes the data race in the old _packed_reduce which read the packed
-        buffer before the NCCL reduce had completed.
+        Each ``_pending_reduce`` entry is ``(grad_tensor_ref, [param])``. The
+        reduce was in-place on grad_tensor_ref, which was saved during
+        ``reduce_grads`` before ``reshard()`` freed the storage. On owner
+        rank, the grad_tensor_ref now holds the averaged grad — copy it
+        into ``_reduced_grad`` for the optimizer step.
         """
         if self._reduce_event is None:
             return
 
         torch.cuda.current_stream().wait_event(self._reduce_event)
 
-        # Now safe to unpack — reduce is complete.
-        # All paths (single-param and packed) store a buffer in _pending_reduce,
-        # so _unpack_reduced_grads handles both uniformly.
-        for buf, params in self._pending_reduce:
-            if buf is not None:
-                self._unpack_reduced_grads(buf, params)
+        for grad_buf, plist in self._pending_reduce:
+            if grad_buf is None:
+                continue
+            p = plist[0]
+            if self._dp_group.rank() != p.owner_rank:
+                continue
+            new_grad = grad_buf.view(p._orig_size)
+            if p._reduced_grad is not None:
+                p._reduced_grad.add_(new_grad)
+            else:
+                p._reduced_grad = new_grad.clone()
 
         self._reduce_event = None
         self._pending_reduce = []
-
-    def _packed_reduce(self, owner_rank: int, params: list[DedicatedParam]) -> Optional[torch.Tensor]:
-        """Pack multiple grads to the same owner into one reduce.
-
-        Caller must be on reduce_stream.
-        Returns packed buffer for deferred unpacking in wait_for_reduce().
-        """
-        grad_list = []
-        for p in params:
-            if p._unsharded_param is None or p._unsharded_param.grad is None:
-                continue
-            g = p._unsharded_param.grad.data
-            if _DTensor is not None and isinstance(g, _DTensor):
-                g = g._local_tensor
-            grad_list.append(g.contiguous().view(-1))
-
-        if not grad_list:
-            return None
-
-        packed = torch.cat(grad_list)
-        dist.reduce(packed, dst=self._global_owner_ranks[owner_rank],
-                    op=dist.ReduceOp.AVG, group=self._dp_group)
-
-        # Clear grads immediately (data is in packed buffer on reduce_stream)
-        for p in params:
-            if p._unsharded_param is not None:
-                p._unsharded_param.grad = None
-
-        return packed  # deferred unpack in wait_for_reduce
-
-    def _unpack_reduced_grads(self, packed: torch.Tensor, params: list[DedicatedParam]) -> None:
-        """Unpack reduced gradients from packed buffer to owner's _reduced_grad.
-
-        Must be called after reduce is complete (after wait_for_reduce event sync).
-        Accumulates onto existing _reduced_grad if present (gradient accumulation).
-        """
-        owner_rank = params[0].owner_rank
-        if self._dp_group.rank() == owner_rank:
-            offset = 0
-            for p in params:
-                n = p.numel
-                new_grad = packed[offset : offset + n].view(p._orig_size)
-                if p._reduced_grad is not None:
-                    p._reduced_grad.add_(new_grad)
-                else:
-                    p._reduced_grad = new_grad.clone()
-                offset += n
 
     # ---- backward prefetch ----
 
