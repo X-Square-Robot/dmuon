@@ -97,17 +97,28 @@ class DedicatedParamGroup:
         # Storage is resized 0↔full via alloc_storage/free_storage on the
         # packed buffer itself — individual Parameter views automatically see
         # the resize since they share the underlying Storage object.
+        #
+        # Phase 3: precompute per-owner copy-in dst views into packed buf.
+        # Each unshard's owner copy-in uses ``torch._foreach_copy_`` (one
+        # Python dispatch + one fused kernel) instead of N separate ``.copy_``
+        # calls. dst views survive ``free_storage`` → ``alloc_storage`` because
+        # they share the packed buf's Storage object (resize is in-place).
         from ._internal_utils import free_storage
         self._packed_buf_by_owner: dict[int, torch.Tensor] = {}
+        self._copy_in_dsts_by_owner: dict[int, list[torch.Tensor]] = {}
         if self._comm_dtype is not None:
             for owner, total_numel in self._total_numel_by_owner.items():
                 packed = torch.empty(total_numel, dtype=self._comm_dtype, device=self.device)
                 self._packed_buf_by_owner[owner] = packed
-                # Bind each param to a view of its owner's packed buf
+                # Bind each param to a view of its owner's packed buf and
+                # cache a 1-D dst slice for foreach copy-in.
                 offset = 0
+                dsts: list[torch.Tensor] = []
                 for p in self._by_owner[owner]:
                     p.bind_to_packed_buffer(packed, offset)
+                    dsts.append(packed[offset : offset + p.numel])
                     offset += p.numel
+                self._copy_in_dsts_by_owner[owner] = dsts
                 # Start in resharded state (storage freed)
                 free_storage(packed)
 
@@ -132,6 +143,7 @@ class DedicatedParamGroup:
 
         from ._internal_utils import alloc_storage
         dp_group = self._dp_group
+        local_rank = dp_group.rank()
         with torch.cuda.stream(broadcast_stream):
             # Alloc + owner copy-in BEFORE coalescing: these ops execute
             # immediately on broadcast_stream. Wrapped in no_grad +
@@ -142,13 +154,19 @@ class DedicatedParamGroup:
                     packed_buf
                 ):
                     alloc_storage(packed_buf)
-                    if dp_group.rank() == owner_rank:
-                        offset = 0
-                        for p in self._by_owner[owner_rank]:
-                            packed_buf[offset : offset + p.numel].copy_(
-                                p._owned_data.view(-1)
-                            )
-                            offset += p.numel
+
+            # Phase 3: batch owner copy-in with torch._foreach_copy_.
+            # Only the owner rank for a given owner_rank has non-empty
+            # _owned_data; other ranks skip.
+            if local_rank in self._copy_in_dsts_by_owner:
+                dsts = self._copy_in_dsts_by_owner[local_rank]
+                srcs = [
+                    p._owned_data.view(-1) for p in self._by_owner[local_rank]
+                ]
+                with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
+                    self._packed_buf_by_owner[local_rank]
+                ):
+                    torch._foreach_copy_(dsts, srcs)
 
             with dist._coalescing_manager(group=dp_group, device=self.device):
                 for owner_rank, packed_buf in self._packed_buf_by_owner.items():
