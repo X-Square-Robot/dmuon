@@ -4,6 +4,9 @@ site_url: https://starrickliu.github.io/dmuon/
 repo_url: https://github.com/StarrickLiu/dmuon
 repo_name: StarrickLiu/dmuon
 
+exclude_docs: |
+  internal/
+
 theme:
   name: material
   palette:
