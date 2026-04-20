@@ -5,7 +5,13 @@ Registers forward pre/post hooks and backward hooks on a layer module:
                register post-backward hook (reduce + reshard) on inputs
 - post_forward: reshard, record post-forward order, register pre-backward hook
 - pre_backward: unshard (dispatch + wait), prefetch next layer, queue root callback
-- post_backward: transfer grads from forward-time params, reduce grads, reshard
+- post_backward: reduce grads, reshard
+
+Note (Phase 2): the old forward-time-params snapshot + grad-transfer step is
+gone. With persistent ``_unsharded_param`` (only storage is resized across
+unshard/reshard), autograd writes ``.grad`` directly onto the same Parameter
+object across both forward and the subsequent re-unshard, so nothing has to
+be transferred.
 """
 
 from typing import Optional
@@ -122,15 +128,7 @@ class DedicatedState:
         # Reset fast-path flag for this forward — backward (fast path or root
         # callback fallback) will set it True.
         self.group._post_backward_fired = False
-        # Snapshot forward-time unsharded params. Autograd writes .grad to
-        # these instances; we transfer those grads to the re-unsharded params
-        # in post_backward. Accessible from both fast path and root fallback.
         if torch.is_grad_enabled():
-            self.group._forward_time_params = [
-                (dp, dp._unsharded_param)
-                for dp in self.group.params
-                if dp._unsharded_param is not None and dp._requires_grad
-            ]
             # Register post-backward hook on inputs (reduce + reshard after backward)
             args, kwargs = self._register_post_backward(args, kwargs)
         return args, kwargs
@@ -152,28 +150,18 @@ class DedicatedState:
     # ---- post-backward fast path + fallback ------------------------------
 
     def _run_post_backward(self) -> None:
-        """Execute grad transfer + reduce + reshard. Idempotent per forward.
+        """Execute reduce + reshard. Idempotent per forward.
 
         Called either from _DedicatedPostBackward.backward (fast path) or from
         the autograd-engine root callback (fallback, when no input required
         gradient or was reachable through backward).
+
+        Phase 2: autograd writes .grad directly onto the persistent
+        ``_unsharded_param`` object, so no forward-time snapshot / transfer
+        step is needed — ``reduce_grads`` reads ``.grad`` in place.
         """
         if self.group._post_backward_fired:
             return
-        # Transfer grads from forward-time params to current _unsharded_param.
-        # Needed because reshard + re-unshard (pre-backward) creates a NEW
-        # _unsharded_param, but autograd computed grad on the OLD one (from forward).
-        # Note: preserve grad as-is (DTensor stays DTensor) — .grad must match
-        # the DTensor-ness of the receiving tensor, so do NOT unwrap to local.
-        forward_params = self.group._forward_time_params or []
-        for dp, fwd_param in forward_params:
-            if fwd_param.grad is not None:
-                if dp._unsharded_param is not None:
-                    dp._unsharded_param.grad = fwd_param.grad.data
-                fwd_param.grad = None
-        # Release forward-time refs now that grads are transferred.
-        self.group._forward_time_params = None
-
         self.group.reduce_grads()
         self.group.reshard()
         self.group._post_backward_fired = True

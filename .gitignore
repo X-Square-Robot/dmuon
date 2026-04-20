@@ -35,9 +35,15 @@ benchmarks/profiles/
 # CuteDSL kernel cache
 dmuon_kernel_cache/
 
-# Research docs (private, not for public repo)
-docs/research_*.md
-docs/paper_strategy*.md
+# Internal docs — never in public repo
+# Only llm_benchmark.md and syrk_benchmark.md are tracked from within docs/internal/.
+docs/internal/*.md
+docs/internal/research/
+docs/internal/fsdp2/
+docs/internal/weekly/
+docs/internal/benchmarks/*
+!docs/internal/benchmarks/llm_benchmark.md
+!docs/internal/benchmarks/syrk_benchmark.md
 
 # OS
 .DS_Store
