@@ -5,11 +5,14 @@
 # Only launches lower-triangle tiles + mirror write for symmetric output.
 # Reference: fused-muon/csrc/syrk_common.cuh
 
+import logging
 from typing import Optional
 
 from torch import Tensor
 
 import cutlass
+
+logger = logging.getLogger(__name__)
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
@@ -499,10 +502,24 @@ def syrk_sm80(
     if B is None:
         B = A
 
-    # Ensure K-contiguous
+    # Ensure K-contiguous. These copies are a correctness fallback — calling
+    # code should hand us row-major tensors to avoid ~M*K*dtype bytes of
+    # implicit copy on every call. Warn once per call-site via stacklevel.
     if A.stride(-1) != 1:
+        logger.warning(
+            "syrk_sm80: A is not K-contiguous (shape=%s, stride=%s); "
+            "falling back to an implicit .contiguous() copy. "
+            "Call .contiguous() on the input to avoid this.",
+            tuple(A.shape), tuple(A.stride()),
+        )
         A = A.contiguous()
-    if B.stride(-1) != 1:
+    if B.stride(-1) != 1 and B.data_ptr() != A.data_ptr():
+        logger.warning(
+            "syrk_sm80: B is not K-contiguous (shape=%s, stride=%s); "
+            "falling back to an implicit .contiguous() copy. "
+            "Call .contiguous() on the input to avoid this.",
+            tuple(B.shape), tuple(B.stride()),
+        )
         B = B.contiguous()
     assert D.is_contiguous(), "Output D must be contiguous"
 

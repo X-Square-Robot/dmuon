@@ -10,6 +10,7 @@ from torch.optim import Optimizer
 
 from typing import Union
 
+from .. import _balance_profile
 from ..utils import get_owned_params, wait_all_reduces
 from .newton_schulz import NewtonSchulz
 
@@ -151,6 +152,9 @@ class Muon(Optimizer):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
         super().__init__(param_groups, defaults)
 
+        self._profile_step_idx = 0
+        self._profile_param_timer: _balance_profile.ParamTimer = _balance_profile.ParamTimer()
+
     @torch.no_grad()
     def step(self, closure=None):
         """Perform a single optimization step.
@@ -164,6 +168,31 @@ class Muon(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        if _balance_profile.enabled():
+            timer = _balance_profile.StepTimer()
+            with timer.phase("wait_reduces"):
+                wait_all_reduces(self.model)
+            with timer.phase("muon"):
+                self._step_muon()
+            with timer.phase("adamw"):
+                self._step_adamw()
+
+            owned_numel = sum(
+                dp._owned_data.numel() for dp in self._dedicated_params
+            )
+            timer.report(
+                self._profile_step_idx,
+                extra={
+                    "n_owned": len(self._dedicated_params),
+                    "owned_numel": owned_numel,
+                },
+            )
+            if _balance_profile.per_param_enabled():
+                self._profile_param_timer.report(self._profile_step_idx)
+                self._profile_param_timer = _balance_profile.ParamTimer()
+            self._profile_step_idx += 1
+            return loss
 
         # 1. Wait for all pending async reduces from backward
         wait_all_reduces(self.model)
@@ -183,9 +212,18 @@ class Muon(Optimizer):
         mu = group["momentum"]
         wd = group["weight_decay"]
 
+        pt = self._profile_param_timer
+        per_param = _balance_profile.per_param_enabled()
+
         for dp in self._dedicated_params:
             if dp._reduced_grad is None:
                 continue
+
+            if per_param:
+                pt.start(
+                    getattr(dp, "param_name", "<unknown>"),
+                    tuple(dp._owned_data.shape),
+                )
 
             grad = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1)
 
@@ -249,6 +287,9 @@ class Muon(Optimizer):
 
             # Clear gradient
             dp._reduced_grad = None
+
+            if per_param:
+                pt.end()
 
     def _step_adamw(self):
         """AdamW update on FSDP2-managed symmetric params."""

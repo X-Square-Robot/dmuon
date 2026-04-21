@@ -6,6 +6,8 @@ from typing import Callable, Optional
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 
+from . import _balance_profile
+
 try:
     from torch.distributed.tensor import DTensor
 except ImportError:
@@ -18,15 +20,20 @@ SMALL_PARAM_THRESHOLD = 5_000_000
 def _extract_layer_id(param_name: str) -> Optional[str]:
     """Extract layer identifier from parameter name.
 
+    Matches both ``layers.N`` (transformer decoder) and ``blocks.N`` (ViT).
+    The parent prefix is included so ``visual.blocks.3`` and ``model.layers.3``
+    do not collide into the same LPT bucket.
+
     Examples:
-        "model.layers.3.mlp.gate_proj.weight" → "layers.3"
-        "model.layers.12.self_attn.q_proj.weight" → "layers.12"
-        "model.embed_tokens.weight" → None
+        "model.layers.3.mlp.gate_proj.weight" → "model.layers.3"
+        "visual.blocks.5.attn.qkv.weight"     → "visual.blocks.5"
+        "model.embed_tokens.weight"            → None
     """
     parts = param_name.split(".")
     for i, part in enumerate(parts):
-        if part == "layers" and i + 1 < len(parts):
-            return f"{part}.{parts[i + 1]}"
+        if part in ("layers", "blocks") and i + 1 < len(parts):
+            prefix = ".".join(parts[:i]) or "_root"
+            return f"{prefix}.{part}.{parts[i + 1]}"
     return None
 
 
@@ -101,5 +108,12 @@ def compute_balanced_assignment(
             assignment[p] = best_rank
         rank_loads[best_rank] += total_numel
         layer_usage[layer_id].add(best_rank)
+
+    _balance_profile.dump_assignment(
+        alloc_units=alloc_units,
+        assignment=assignment,
+        rank_loads=rank_loads,
+        world_size=world_size,
+    )
 
     return assignment

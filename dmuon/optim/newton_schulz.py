@@ -334,6 +334,10 @@ def gram_newton_schulz(
         X = X.T
     X = X / (X.norm() + eps)
     X = X.half()
+    # SYRK kernel requires K-contiguous input; transpose above makes X a
+    # stride-swapped view, so force a row-major copy here once instead of
+    # paying for an implicit .contiguous() inside every SYRK call.
+    X = X.contiguous()
 
     # --- Initial SYRK: R = X @ X^T ---
     m = X.shape[0]
@@ -447,6 +451,9 @@ def gram_newton_schulz_local(
         X = X.T
     X = X / (X.norm() + eps)
     X = X.half()
+    # See gram_newton_schulz: force row-major once so SYRK doesn't have to
+    # silently re-copy a stride-swapped view on every call.
+    X = X.contiguous()
 
     # Initial SYRK: R = X @ X^T
     m = X.shape[0]
