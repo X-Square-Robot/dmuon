@@ -30,7 +30,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from .param import DedicatedParam
-from .utils import get_dedicated_params
+from .utils import get_dedicated_params, wait_all_replicate_broadcasts
 
 try:
     from torch.distributed.tensor import DTensor as _DTensor
@@ -60,9 +60,17 @@ def _compute_dedicated_fqns(model: nn.Module) -> dict[DedicatedParam, str]:
 
 
 def _broadcast_from_owner(dp: DedicatedParam, *, cpu_offload: bool) -> torch.Tensor:
-    """Broadcast ``_owned_data`` from owner to all ranks in dp_group."""
+    """Broadcast ``_owned_data`` to every rank for a full-param reconstruction.
+
+    Phase B: every rank in the owner's shard column already holds a populated
+    ``_owned_data`` (see ``DedicatedParam.__init__`` allocation rule).  So a
+    single broadcast within each row's shard group suffices — each row's
+    shard-owner has the up-to-date value because either (a) it IS the global
+    owner, or (b) the most recent ``broadcast_all_updates`` fanned the
+    updated value into it along the replicate axis.
+    """
     buf = torch.empty(dp._orig_size, dtype=dp._orig_dtype, device=dp.device)
-    if dp.is_owner:
+    if dp._owned_data is not None:
         buf.copy_(dp._owned_data.to(dp._orig_dtype))
     dist.broadcast(buf, src=dp._owner_global_rank, group=dp.dp_group)
     return buf.cpu() if cpu_offload else buf
@@ -71,12 +79,21 @@ def _broadcast_from_owner(dp: DedicatedParam, *, cpu_offload: bool) -> torch.Ten
 def _broadcast_state_tensor(
     tensor, dp: DedicatedParam, *, cpu_offload: bool
 ) -> torch.Tensor:
-    """Broadcast a momentum buffer from owner to all ranks.
+    """Broadcast a momentum buffer from the global owner to every rank.
 
-    The momentum buffer shape is derived from ``dp._orig_size``: it is always
-    ``(orig_size[0], prod(orig_size[1:]))``, matching the 2D view used in
-    ``_step_muon``.  All ranks know ``_orig_size``, so no shape metadata
-    broadcast is needed — just one broadcast for the data.
+    Unlike ``_owned_data`` (held on every shard-peer of the owner), the
+    momentum buffer lives ONLY on the global owner.  In HSDP we therefore
+    need a two-stage fan-out:
+
+    1. **Replicate axis** — inside the owner's shard column, broadcast from
+       the global owner to its replicate-dim peers.  Only ranks on that
+       column participate (skipping elsewhere is safe because each rank's
+       replicate_group is unique to its shard column).
+    2. **Shard axis** — within each row's shard group, broadcast from the
+       row's shard-owner rank to its row peers.
+
+    In 1D shard-only mode (``replicate_group is None``), Stage 1 is a no-op
+    and the behaviour collapses to the original single-broadcast path.
     """
     m = dp._orig_size[0]
     n = dp._orig_size.numel() // m
@@ -88,6 +105,22 @@ def _broadcast_state_tensor(
             f"If _step_muon's view convention changed, update _broadcast_state_tensor."
         )
         buf.copy_(tensor.float())
+    # Stage 1 — replicate axis (HSDP only).  Fires only on ranks in the
+    # owner's shard column; on other ranks the replicate_group is a
+    # different process group (belonging to their own shard column) and
+    # this param's data is distributed to them via Stage 2 instead.
+    if (
+        dp.replicate_group is not None
+        and dp.dp_group.rank() == dp.owner_shard
+    ):
+        dist.broadcast(
+            buf,
+            src=dp._owner_replicate_global_rank,
+            group=dp.replicate_group,
+        )
+    # Stage 2 — shard axis (always runs).  After Stage 1, every row's
+    # shard-owner rank has the full buffer; now each row fans it to the
+    # remaining shard peers.
     dist.broadcast(buf, src=dp._owner_global_rank, group=dp.dp_group)
     return buf.cpu() if cpu_offload else buf
 
@@ -100,16 +133,33 @@ def _all_gather_fsdp_tensor(
     Handles uneven shards (e.g., a [1, 64] tensor split across 4 ranks gives
     [1, 64] on rank 0 and [0, 64] on ranks 1-3).
 
+    Phase B: ``dp_mesh`` may be 2D (HSDP).  Along replicate dims the param
+    is fully replicated, so we only need the Shard-dim subgroup to
+    reconstruct the full tensor.  The selection uses the dim whose
+    placement is Shard(0) — FSDP2's convention for its sharded params.
+
     Args:
         local_tensor: Local shard (FSDP2 uses Shard(0) by default).
-        dp_mesh: The DP device mesh.
+        dp_mesh: The DP device mesh.  May be 1D (shard-only) or 2D (HSDP).
         cpu_offload: Move result to CPU.
 
     Returns:
         Full (unsharded) tensor.
     """
-    world_size = dp_mesh.size()
-    dp_group = dp_mesh.get_group()
+    if dp_mesh.ndim == 1:
+        world_size = dp_mesh.size()
+        dp_group = dp_mesh.get_group()
+    else:
+        # HSDP: ``dp_mesh`` has names (typically ``replicate``, ``shard``).
+        # Prefer the named lookup; fall back to the last dim (FSDP2's
+        # convention) if names are missing.
+        names = getattr(dp_mesh, "mesh_dim_names", None)
+        if names is not None and "shard" in names:
+            shard_dim = names.index("shard")
+        else:
+            shard_dim = dp_mesh.ndim - 1
+        dp_group = dp_mesh.get_group(mesh_dim=shard_dim)
+        world_size = dp_mesh.size(shard_dim)
 
     # Exchange shard sizes (handles uneven splits)
     local_size = torch.tensor([local_tensor.shape[0]], dtype=torch.int64,
@@ -176,6 +226,10 @@ def get_model_state_dict(
     Returns:
         Complete state dict with full (unsharded) tensors for all parameters.
     """
+    # Phase C.3: drain any pending async replicate broadcast so every
+    # owner's ``_owned_data`` reflects the latest optimizer update.
+    wait_all_replicate_broadcasts(model)
+
     dp_fqns = _compute_dedicated_fqns(model)
     dedicated_fqn_set = set(dp_fqns.values())
     dp_mesh = _get_dp_mesh(model)
@@ -222,11 +276,15 @@ def set_model_state_dict(
     fqn_to_dp = {fqn: dp for dp, fqn in dp_fqns.items()}
     dedicated_fqn_set = set(fqn_to_dp.keys())
 
-    # 2. Load dedicated params: owner copies from state_dict to _owned_data.
+    # 2. Load dedicated params: copy from state_dict into every rank that
+    # actually holds an ``_owned_data`` buffer — that is, every shard-peer
+    # of the owner across replicate rows.  Without this, non-global-owner
+    # shard-peers keep their pre-load value and the next shard-dim broadcast
+    # sends stale data for the other row's shard column.
     for fqn, dp in fqn_to_dp.items():
         if fqn not in state_dict:
             continue
-        if dp.is_owner:
+        if dp._owned_data is not None:
             dp._owned_data.copy_(state_dict[fqn].to(dp._orig_dtype).to(dp.device))
 
     # 3. Load symmetric params: manually shard full tensors into FSDP2 DTensors.
@@ -237,11 +295,23 @@ def set_model_state_dict(
         if _DTensor is not None and isinstance(param, _DTensor):
             local = param._local_tensor
             mesh = param._spec.mesh
-            rank = mesh.get_local_rank()
-            world_size = mesh.size()
+            # HSDP: shard only along the Shard-dim axis; replicate axes take
+            # the same slice on every peer.  1D mesh falls through unchanged.
+            if mesh.ndim == 1:
+                shard_rank = mesh.get_local_rank()
+                shard_world = mesh.size()
+            else:
+                names = getattr(mesh, "mesh_dim_names", None)
+                shard_dim = (
+                    names.index("shard")
+                    if names is not None and "shard" in names
+                    else mesh.ndim - 1
+                )
+                shard_rank = mesh.get_local_rank(mesh_dim=shard_dim)
+                shard_world = mesh.size(shard_dim)
             full_on_device = full_tensor.to(local.dtype).to(local.device)
-            chunks = full_on_device.tensor_split(world_size, dim=0)
-            local.copy_(chunks[rank])
+            chunks = full_on_device.tensor_split(shard_world, dim=0)
+            local.copy_(chunks[shard_rank])
         else:
             param.data.copy_(full_tensor.to(param.dtype).to(param.device))
 
@@ -267,6 +337,11 @@ def get_optimizer_state_dict(
     Returns:
         Optimizer state dict in DMuon format.
     """
+    # Phase C.3: the momentum buffer is only on the global owner, which
+    # is the same rank that writes ``_owned_data`` at step end; draining
+    # pending async broadcast makes both consistent with the snapshot.
+    wait_all_replicate_broadcasts(model)
+
     dp_fqns = _compute_dedicated_fqns(model)
     dedicated_fqn_set = set(dp_fqns.values())
 
@@ -379,12 +454,22 @@ def set_optimizer_state_dict(
             opt_state: dict[str, Any] = {}
             for key, val in saved_state.items():
                 if isinstance(val, torch.Tensor) and dp_mesh is not None:
-                    rank = dp_mesh.get_local_rank()
-                    world_size = dp_mesh.size()
+                    if dp_mesh.ndim == 1:
+                        shard_rank = dp_mesh.get_local_rank()
+                        shard_world = dp_mesh.size()
+                    else:
+                        names = getattr(dp_mesh, "mesh_dim_names", None)
+                        shard_dim = (
+                            names.index("shard")
+                            if names is not None and "shard" in names
+                            else dp_mesh.ndim - 1
+                        )
+                        shard_rank = dp_mesh.get_local_rank(mesh_dim=shard_dim)
+                        shard_world = dp_mesh.size(shard_dim)
                     local_ref = p._local_tensor if hasattr(p, "_local_tensor") else p.data
                     full_on_device = val.to(local_ref.dtype).to(local_ref.device)
-                    chunks = full_on_device.tensor_split(world_size, dim=0)
-                    opt_state[key] = chunks[rank].contiguous()
+                    chunks = full_on_device.tensor_split(shard_world, dim=0)
+                    opt_state[key] = chunks[shard_rank].contiguous()
                 else:
                     opt_state[key] = val
             optimizer.state[p] = opt_state

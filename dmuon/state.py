@@ -120,6 +120,11 @@ class DedicatedState:
         Also wraps an input tensor through _DedicatedPostBackward so that
         gradient reduce + reshard fires after this module's backward.
         """
+        # Phase C.3: consume any pending async replicate broadcast from
+        # the previous step BEFORE ``unshard`` reads ``_owned_data``.
+        # ``_pre_forward_wait`` is a no-op when the group is in IDLE
+        # state (1D mode, sync fallback, or already-consumed event).
+        self.group._pre_forward_wait()
         self.group.unshard()            # no-op if already unsharded or prefetched
         self.group.wait_for_unshard()   # no-op if already unsharded
         # Forward prefetch: dispatch next layer's unshard (no wait)

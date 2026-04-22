@@ -11,7 +11,13 @@ from torch.optim import Optimizer
 from typing import Union
 
 from .. import _balance_profile
-from ..utils import get_owned_params, wait_all_reduces
+from ..utils import (
+    broadcast_all_updates,
+    broadcast_all_updates_async,
+    get_owned_params,
+    update_replicate_fallback,
+    wait_all_reduces,
+)
 from .newton_schulz import NewtonSchulz
 
 
@@ -94,6 +100,7 @@ class Muon(Optimizer):
         nesterov: bool = True,
         per_head_ns: bool = True,
         block_diagonal_ns: bool = False,
+        replicate_async: bool = True,
     ):
         if isinstance(ns_backend, str):
             ns_backend = NewtonSchulz(backend=ns_backend)
@@ -108,6 +115,12 @@ class Muon(Optimizer):
         self._nesterov = nesterov
         self._per_head_ns = per_head_ns
         self._block_diagonal_ns = block_diagonal_ns
+        # Phase C: toggle between async (default, hides broadcast inside
+        # the next forward) and Phase B sync (simpler, always-correct).
+        # When True, each group's pending event is consumed by its own
+        # ``_pre_forward_wait`` hook; when False, the full fan-out is
+        # waited synchronously at the end of step().
+        self._replicate_async = replicate_async
 
         # Discover dedicated params owned by this rank
         comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
@@ -160,14 +173,23 @@ class Muon(Optimizer):
         """Perform a single optimization step.
 
         Internally:
-        1. Waits for all async gradient reduces to complete.
+        1. Waits for all async gradient reduces to complete (shard + replicate
+           in HSDP mode).
         2. Runs Muon (momentum + NS + update) on owned dedicated params.
         3. Runs AdamW on FSDP2 symmetric params.
+        4. In HSDP mode, broadcasts the updated ``_owned_data`` from the
+           global owner to the replicate peers; no-op in 1D shard-only mode.
         """
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        broadcast_fn = (
+            broadcast_all_updates_async
+            if self._replicate_async
+            else broadcast_all_updates
+        )
 
         if _balance_profile.enabled():
             timer = _balance_profile.StepTimer()
@@ -177,6 +199,11 @@ class Muon(Optimizer):
                 self._step_muon()
             with timer.phase("adamw"):
                 self._step_adamw()
+            # Phase C.4: flip any slow group to sync BEFORE dispatching the
+            # next broadcast so the new decision takes effect immediately.
+            update_replicate_fallback(self.model)
+            with timer.phase("replicate_broadcast"):
+                broadcast_fn(self.model)
 
             owned_numel = sum(
                 dp._owned_data.numel() for dp in self._dedicated_params
@@ -202,6 +229,20 @@ class Muon(Optimizer):
 
         # 3. AdamW update on FSDP2 params
         self._step_adamw()
+
+        # 4. Advance the per-group async→sync fallback state machine
+        # (Phase C.4).  Reads ``_last_replicate_wait_us`` populated during
+        # the previous forward's ``_pre_forward_wait`` (only when
+        # ``DMUON_REPLICATE_PROFILE`` is set).  Must run BEFORE dispatch so
+        # a just-tripped flag affects this iteration.
+        update_replicate_fallback(self.model)
+
+        # 5. Fan updated _owned_data from global owner to replicate peers.
+        # Phase C: by default dispatch async and let ``_pre_forward_wait``
+        # consume the event at the start of the next forward; set
+        # ``replicate_async=False`` on Muon construction to fall back to the
+        # Phase B sync path.  No-op in 1D shard-only mode either way.
+        broadcast_fn(self.model)
 
         return loss
 
