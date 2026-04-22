@@ -9,10 +9,21 @@
 
 <p align="center">
   <a href="https://pytorch.org/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-FSDP2-EE4C2C?logo=pytorch&logoColor=white"></a>
+  <a href="#hsdp-multi-node"><img alt="HSDP" src="https://img.shields.io/badge/HSDP-native-6f42c1"></a>
   <a href="#tp-compatibility"><img alt="TP Compatible" src="https://img.shields.io/badge/Tensor_Parallel-compatible-blue"></a>
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-enabled-76B900?logo=nvidia&logoColor=white">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-black"></a>
   <img alt="status" src="https://img.shields.io/badge/status-research--preview-orange">
+</p>
+
+<p align="center">
+  📖 <a href="https://starrickliu.github.io/dmuon/"><strong>Documentation</strong></a>
+  &nbsp;·&nbsp;
+  🚀 <a href="https://starrickliu.github.io/dmuon/getting-started/quickstart/"><strong>Quick Start</strong></a>
+  &nbsp;·&nbsp;
+  🌐 <a href="https://starrickliu.github.io/dmuon/guides/hsdp/"><strong>HSDP Guide</strong></a>
+  &nbsp;·&nbsp;
+  🇨🇳 <a href="https://starrickliu.github.io/dmuon/zh/"><strong>中文文档</strong></a>
 </p>
 
 DMuon makes [Muon](https://arxiv.org/abs/2502.16982) work efficiently with PyTorch FSDP2 by assigning each matrix parameter to a single **owner rank**.
@@ -40,6 +51,7 @@ DMuon eliminates both. The owner already has the complete gradient after `reduce
 |---|---|---|
 | Optimizer comm | all-gather full gradient | **zero** |
 | NS compute | R times (every rank) | **1 time** (owner only) |
+| HSDP (multi-node) | replicate all-reduce + replicated state + redundant NS across replicas | single-owner across entire mesh + async forward-hidden broadcast |
 
 ## Getting Started
 
@@ -94,6 +106,45 @@ for batch in dataloader:
     loss.backward()
     optimizer.step()
 ```
+
+### HSDP (Multi-Node) <a id="hsdp-multi-node"></a>
+
+Scale beyond one node with a 2D `(replicate, shard)` mesh — DMuon handles the two-stage gradient reduce (shard → replicate) and hides the post-step replicate broadcast inside the **next** iteration's forward pass.
+
+```python
+from torch.distributed.device_mesh import init_device_mesh
+import dmuon
+
+# 2D HSDP mesh: e.g. 2 nodes × 8 GPUs/node
+hsdp = init_device_mesh(
+    "cuda", (replicate_size, shard_size),
+    mesh_dim_names=("replicate", "shard"),
+)
+
+dmuon.dedicate_params(
+    model, hsdp["shard"],
+    predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    replicate_mesh=hsdp["replicate"],          # ← the HSDP knob
+)
+for layer in model.layers:
+    fully_shard(layer, mesh=hsdp)              # ← FSDP2 uses the 2D mesh
+fully_shard(model, mesh=hsdp)
+
+optimizer = dmuon.Muon(
+    model, lr=0.02,
+    replicate_async=True,                      # default: hide broadcast in forward
+)
+```
+
+What you get out of the box:
+
+- **Two-stage grad reduce** — `AVG` over shard, then `AVG` over replicate; total divisor = `G·R`, matching a single all-reduce over the world
+- **Async post-step broadcast** — updated `_owned_data` fans out to replicate peers on a dedicated stream; the wait is consumed per-layer in the next forward
+- **Auto-fallback** — a single-direction protocol degrades a group to sync if blocked-waits sustain > 100 μs (tunable); reset via `dmuon.reset_replicate_fallback(model)`
+- **Bit-identical** to sync baseline (validated on 4 GPU G=2 R=2) — safe to turn on by default
+- **Checkpoint-safe** — `get_model_state_dict` drains pending async state before reading
+
+Full API, profiling, and troubleshooting in the [HSDP guide](https://starrickliu.github.io/dmuon/guides/hsdp/).
 
 ### Checkpoint Save / Load
 
@@ -189,34 +240,78 @@ DMuon adds **4-13% total overhead** vs FSDP2+AdamW — the cost of using a matri
 
 All benchmarks verified: every rank produces identical loss values. See [docs/llm_benchmark.md](docs/llm_benchmark.md) for detailed phase breakdown.
 
+## 📖 Documentation
+
+Full documentation is hosted on GitHub Pages: **[starrickliu.github.io/dmuon](https://starrickliu.github.io/dmuon/)**
+
+<table>
+<tr>
+<td width="25%" align="center">
+<a href="https://starrickliu.github.io/dmuon/"><b>Home</b></a><br>
+<sub>Project overview</sub>
+</td>
+<td width="25%" align="center">
+<a href="https://starrickliu.github.io/dmuon/getting-started/quickstart/"><b>Quick Start</b></a><br>
+<sub>5-minute setup</sub>
+</td>
+<td width="25%" align="center">
+<a href="https://starrickliu.github.io/dmuon/guides/training/"><b>Training Guide</b></a><br>
+<sub>Full 1D workflow</sub>
+</td>
+<td width="25%" align="center">
+<a href="https://starrickliu.github.io/dmuon/guides/hsdp/"><b>HSDP Guide</b></a><br>
+<sub>Multi-node 2D mesh</sub>
+</td>
+</tr>
+<tr>
+<td width="25%" align="center">
+<a href="https://starrickliu.github.io/dmuon/getting-started/concepts/"><b>Core Concepts</b></a><br>
+<sub>How ownership works</sub>
+</td>
+<td width="25%" align="center">
+<a href="https://starrickliu.github.io/dmuon/reference/api/"><b>API Reference</b></a><br>
+<sub>Function signatures</sub>
+</td>
+<td width="25%" align="center">
+<a href="https://starrickliu.github.io/dmuon/guides/tp-support/"><b>TP Support</b></a><br>
+<sub>Tensor Parallel + DMuon</sub>
+</td>
+<td width="25%" align="center">
+<a href="https://starrickliu.github.io/dmuon/zh/"><b>🇨🇳 中文文档</b></a><br>
+<sub>Full Chinese translation</sub>
+</td>
+</tr>
+</table>
+
 ## Roadmap
 
 ### Done
 
 - [x] Core ownership model (broadcast/reduce/owner-only NS)
-- [x] Balanced partition with concurrency constraints
+- [x] Balanced partition with concurrency constraints (2D-aware LPT over G·R slots)
 - [x] FSDP2 composition (zero modification to FSDP2 internals)
+- [x] **HSDP native support** — 2D mesh, two-stage reduce (shard + replicate), async forward-hidden broadcast, fallback protocol, checkpoint restart
 - [x] TP compatibility
 - [x] LLM step time benchmarks (Qwen2.5, Llama-3, 8xA800)
 - [x] Gram NS with TP SYRK decomposition (O(m^2) TP comm instead of O(mn))
 - [x] CuteDSL SYRK kernel (5/7 Gram NS ops, 1.4-1.5x E2E speedup)
 - [x] Prefetch pipeline (forward + backward)
 - [x] Gradient accumulation (default + `no_sync` context manager)
-- [x] State dict save/load (compatible with single-GPU and HuggingFace)
+- [x] State dict save/load (compatible with single-GPU, HuggingFace, and HSDP restart)
 
 ### In Progress
 
 - [ ] Convergence validation (loss curves vs AdamW vs Muon)
-- [ ] HSDP support (multi-node training)
-- [ ] Training examples (`examples/`)
+- [ ] Naive Muon baselines (DDP / FSDP-ZeRO2 / FSDP-ZeRO3) for per-byte A/B traces
+- [ ] Multi-node scaling benchmarks (16-256 GPUs, Qwen2.5-7B/14B)
+- [ ] Training examples (`examples/train_hsdp.py`, `examples/train_llm.py`)
 
 ### Planned
 
-- [ ] Multi-node scaling (16-256 GPUs)
-- [ ] Larger model benchmarks (14B+)
+- [ ] Larger model benchmarks (14B+, 32B)
+- [ ] Shampoo / SOAP under the same ownership primitive
 - [ ] DeepSpeed ZeRO integration
-- [ ] Optimizer generalization (L-only Shampoo, SOAP-Muon hybrid)
-- [ ] Communication & memory profiling
+- [ ] Communication & memory profiling reports
 - [ ] CI/CD (GitHub Actions)
 - [ ] torch.compile support
 

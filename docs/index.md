@@ -60,6 +60,7 @@ That's it. Forward broadcast, backward reduce, and owner-only Newton-Schulz are 
 - **Zero optimizer communication** — owner already has the full gradient after reduce
 - **1/R NS compute** — only the owner runs Newton-Schulz, not every rank
 - **FSDP2 native** — works alongside `fully_shard()` with no modifications to FSDP2 internals
+- **HSDP native** — 2D `(replicate, shard)` mesh with two-stage reduce and **async forward-hidden broadcast** out of the box. See [HSDP guide](guides/hsdp.md)
 - **TP compatible** — Gram Newton-Schulz with TP SYRK decomposition, O(d_model^2) TP comm
 - **Checkpoint compatible** — standard state dicts, works with HuggingFace and single-GPU loading
 - **Gradient accumulation** — `no_sync()` context manager, same pattern as FSDP2
@@ -98,6 +99,12 @@ Optimizer step is **12-15x faster** than naive FSDP2+Muon.
     Understand how dedicated ownership works and composes with FSDP2.
 
     [:octicons-arrow-right-24: Core Concepts](getting-started/concepts.md)
+
+-   :material-server-network:{ .lg .middle } **HSDP (Multi-Node)**
+
+    2D mesh training with async forward-hidden broadcast.
+
+    [:octicons-arrow-right-24: HSDP Guide](guides/hsdp.md)
 
 -   :material-book-open-variant:{ .lg .middle } **API Reference**
 

@@ -60,6 +60,7 @@ optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95)
 - **零优化器通信** — 所有者在 reduce 后已持有完整梯度
 - **1/R NS 计算** — 仅所有者运行 Newton-Schulz，不是每个 rank
 - **FSDP2 原生** — 与 `fully_shard()` 并行工作，无需修改 FSDP2 内部
+- **HSDP 原生** — 2D `(replicate, shard)` mesh、两阶段 reduce、**异步 forward-hidden broadcast** 开箱即用。详见 [HSDP 指南](guides/hsdp.md)
 - **TP 兼容** — Gram Newton-Schulz 配合 TP SYRK 分解，O(d_model^2) TP 通信
 - **检查点兼容** — 标准 state dict，兼容 HuggingFace 和单卡加载
 - **梯度累积** — `no_sync()` 上下文管理器，与 FSDP2 相同模式
@@ -98,6 +99,12 @@ optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95)
     理解专属所有权的工作原理及其与 FSDP2 的组合。
 
     [:octicons-arrow-right-24: 核心概念](getting-started/concepts.md)
+
+-   :material-server-network:{ .lg .middle } **HSDP（多机训练）**
+
+    2D mesh 训练 + 异步 forward-hidden broadcast。
+
+    [:octicons-arrow-right-24: HSDP 指南](guides/hsdp.md)
 
 -   :material-book-open-variant:{ .lg .middle } **API 文档**
 

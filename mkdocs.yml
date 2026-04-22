@@ -65,6 +65,7 @@ plugins:
               - 核心概念: getting-started/concepts.md
             - 使用指南:
               - 训练流程: guides/training.md
+              - HSDP 训练（多机）: guides/hsdp.md
               - 张量并行: guides/tp-support.md
               - 检查点: guides/checkpoint.md
               - 梯度累积: guides/grad-accumulation.md
@@ -110,6 +111,7 @@ nav:
     - Core Concepts: getting-started/concepts.md
   - Guides:
     - Training: guides/training.md
+    - HSDP (Multi-Node): guides/hsdp.md
     - Tensor Parallelism: guides/tp-support.md
     - Checkpointing: guides/checkpoint.md
     - Gradient Accumulation: guides/grad-accumulation.md

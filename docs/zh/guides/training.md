@@ -216,8 +216,30 @@ print(f"专属参数: 共 {len(all_dp)} 个，当前 rank 拥有 {len(owned_dp)}
 print(f"对称参数（FSDP2）: {fsdp_count} 个")
 ```
 
+## 扩展到多机
+
+从单机多卡走到**多机训练**时，把 1D `init_device_mesh("cuda", (world_size,))` 换成 2D HSDP mesh，并把 replicate 维度传给 `dedicate_params`。DMuon 自动处理两阶段 grad reduce（shard → replicate）+ 异步 post-step broadcast；训练循环其他部分无改动。
+
+```python
+hsdp = init_device_mesh(
+    "cuda", (replicate_size, shard_size),
+    mesh_dim_names=("replicate", "shard"),
+)
+dmuon.dedicate_params(
+    model, hsdp["shard"],
+    predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    replicate_mesh=hsdp["replicate"],   # ← HSDP 开关
+)
+for layer in model.layers:
+    fully_shard(layer, mesh=hsdp)
+fully_shard(model, mesh=hsdp)
+```
+
+完整 API、同步/异步模式、fallback 协议、profile 说明见 [HSDP 训练指南](hsdp.md)。
+
 ## 下一步
 
+- [HSDP 训练（多机）](hsdp.md) — 2D mesh + 异步 broadcast
 - [张量并行](tp-support.md) — 使用 DMuon + TP
 - [检查点](checkpoint.md) — 保存和加载训练状态
 - [梯度累积](grad-accumulation.md) — 等效批量大小扩展
