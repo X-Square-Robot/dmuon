@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Favicon: punchy version tuned for dark indigo navbar.
+       Near-white D for high contrast, saturated cyan cell for brand accent. -->
+
+  <!-- D letter: solid near-white ring, square top-left/bottom-left corners to match main logo -->
+  <path fill-rule="evenodd" fill="#f5f7fa" d="
+    M 12 10
+    L 34 10
+    A 22 22 0 0 1 34 54
+    L 12 54
+    Z
+    M 20 18
+    L 33 18
+    A 14 14 0 0 1 33 46
+    L 20 46
+    Z
+  "/>
+
+  <!-- Cyan highlight cell: brighter, punchier cyan for small-size visibility -->
+  <rect x="22" y="30" width="14" height="14" rx="2.5" fill="#00D4E6"/>
+</svg>

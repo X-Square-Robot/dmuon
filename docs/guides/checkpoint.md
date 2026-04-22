@@ -1,6 +1,7 @@
 # Checkpointing
 
-DMuon provides checkpoint functions that handle both dedicated parameters (DMuon-managed) and symmetric parameters (FSDP2-managed) in a single unified state dict.
+!!! tip "TL;DR"
+    Use `dmuon.get_model_state_dict(model)` / `dmuon.set_model_state_dict(model, sd)` instead of `model.state_dict()` / `model.load_state_dict()`. These collective calls gather dedicated parameters from owner ranks and produce a standard flat state dict compatible with single-GPU loading and HuggingFace. Pending async HSDP broadcasts are drained automatically before reading.
 
 ---
 
@@ -27,6 +28,12 @@ dist.barrier()
 
 !!! info "All ranks must call"
     `get_model_state_dict()` and `get_optimizer_state_dict()` are collective operations — all ranks must call them, even though only rank 0 saves the result.
+
+!!! tip "HSDP async drain is automatic"
+    `get_model_state_dict` and `get_optimizer_state_dict` automatically call
+    `wait_all_replicate_broadcasts(model)` before reading, so pending async
+    post-step broadcasts never leak stale `_owned_data` into the checkpoint.
+    You do **not** need to manually drain.
 
 ## Load (Resume Training)
 
@@ -140,3 +147,23 @@ The optimizer state dict has DMuon-specific structure with separate sections:
     }
 }
 ```
+
+## Cross-Topology Restore
+
+The current DMuon checkpoint format assumes you resume with the same `(shard_size, replicate_size)`. Changing topology on resume is not supported in v1; it is a roadmap item.
+
+For topology migration, use the following offline workflow:
+
+1. Save with `get_model_state_dict(model, cpu_offload=True)` on the old topology.
+2. Load in a single-process script with `torch.load`.
+3. Re-initialize the model + DMuon at the new topology.
+4. Restore weights with `dmuon.set_model_state_dict(new_model, sd)`.
+
+Optimizer state cannot be migrated across topologies; restart from step 0 optimizer state if you change the mesh shape.
+
+## See also
+
+- [HSDP (Multi-Node)](hsdp.md) — HSDP checkpoint semantics and async drain details
+- [Training Guide](training.md) — full training workflow
+- [Integration Recipes](integration-recipes.md) — HuggingFace Trainer and torchtitan checkpoint hooks
+- [API Reference](../reference/api.md) — `get_model_state_dict`, `set_model_state_dict` signatures

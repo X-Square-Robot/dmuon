@@ -7,6 +7,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ._internal_utils import unsafe_setattr_param
+from ._owner_rank import OwnerCoord, OwnerRankLike, normalize_owner_rank
 
 try:
     from torch.distributed.tensor import DTensor
@@ -49,20 +50,49 @@ class DedicatedParam:
         param: nn.Parameter,
         module: nn.Module,
         param_name: str,
-        owner_rank: int,
+        owner_rank: OwnerRankLike,
         dp_group: dist.ProcessGroup,
         device: torch.device,
         compute_dtype: torch.dtype = None,
+        replicate_group: Optional[dist.ProcessGroup] = None,
     ):
         self.module = module
         self.param_name = param_name
-        self.owner_rank = owner_rank  # rank within dp_group (local)
-        self.is_owner = dp_group.rank() == owner_rank
-        self.dp_group = dp_group
+        # Phase A (HSDP-native refactor): ``owner_rank`` is a 2D coordinate
+        # ``(owner_shard, owner_replicate)``.  Plain ``int`` is still accepted
+        # for the 1D shard-only path and is promoted to ``(int, 0)``.
+        coord: OwnerCoord = normalize_owner_rank(owner_rank)
+        self.owner_rank: OwnerCoord = coord
+        self.owner_shard: int = coord[0]
+        self.owner_replicate: int = coord[1]
+        self.dp_group = dp_group          # shard group (1D in Phase A)
+        self.replicate_group = replicate_group  # None until Phase B wires HSDP
         self.device = device
 
-        # Convert dp-local owner_rank to global rank for NCCL collectives
-        self._owner_global_rank = dist.get_global_rank(dp_group, owner_rank)
+        # ``is_owner`` decides whether this rank holds ``_owned_data`` and runs
+        # the optimizer step.  Phase A keeps ``replicate_group=None`` so this
+        # reduces to the previous shard-only check; Phase B will enable the
+        # second-dim check once ``replicate_group`` is wired through.
+        shard_hit = dp_group.rank() == self.owner_shard
+        replicate_hit = (
+            replicate_group is None or replicate_group.rank() == self.owner_replicate
+        )
+        self.is_owner = shard_hit and replicate_hit
+
+        # Convert dp-local owner_rank to global rank for NCCL collectives.
+        # The shard coordinate is always the intra-``dp_group`` rank, so using
+        # ``owner_shard`` keeps behaviour identical in both 1D and 2D cases.
+        self._owner_global_rank = dist.get_global_rank(dp_group, self.owner_shard)
+        # Phase B: Stage-2 ``dist.reduce(dst=...)`` along the replicate axis
+        # also needs a global rank.  ``replicate_group`` is a process group
+        # spanning the replicate peers of the current shard column, so the
+        # translation goes through that group (not ``dp_group``).
+        if replicate_group is not None:
+            self._owner_replicate_global_rank = dist.get_global_rank(
+                replicate_group, self.owner_replicate
+            )
+        else:
+            self._owner_replicate_global_rank = None
 
         # DTensor awareness (for TP compatibility)
         self.is_dtensor = DTensor is not None and isinstance(param, DTensor)
@@ -85,8 +115,25 @@ class DedicatedParam:
         self.full_shape: torch.Size = self._compute_full_shape()
         self.tp_group: Optional[dist.ProcessGroup] = self._compute_tp_group()
 
-        # Storage: owner keeps full data, others release
-        if self.is_owner:
+        # Storage: every rank in the owner's shard column keeps a populated
+        # ``_owned_data``.
+        #
+        # Why not just the global owner?  In HSDP mode each replicate row is
+        # a full model instance with its own shard_group; the shard-dim
+        # broadcast that reconstitutes ``_unsharded_param`` during forward
+        # fires inside each row independently.  So every row's shard-owner
+        # rank must be a valid *sender* of that broadcast, which means it
+        # needs its own populated ``_owned_data``.  At construction time the
+        # model's state_dict has just been loaded on every rank, so the
+        # local Parameter already holds the correct value — we simply clone
+        # it here.  The global owner (one rank in the shard column) also
+        # owns the replicate-dim broadcast and the optimizer-state update;
+        # its ``_owned_data`` is what the Phase B.2 post-step broadcast
+        # fans out to the other rows' shard-owner ranks.
+        #
+        # Ranks outside the owner's shard column never need this buffer.
+        is_in_owner_shard_column = dp_group.rank() == self.owner_shard
+        if is_in_owner_shard_column:
             self._owned_data = local_data.detach().clone()
         else:
             self._owned_data = None
@@ -96,8 +143,10 @@ class DedicatedParam:
             torch.empty(0, dtype=self._orig_dtype, device=device),
             requires_grad=self._requires_grad,
         )
-        # Mark placeholder so the FSDP2 patch also ignores it
-        self._placeholder._dedicated_owner_rank = owner_rank
+        # Mark placeholder so the FSDP2 patch also ignores it.  ``patch.py``
+        # only checks for the attribute's presence, so storing the 2D coord
+        # here is safe and keeps bookkeeping consistent with ``self.owner_rank``.
+        self._placeholder._dedicated_owner_rank = coord
 
         # Phase 2: _unsharded_param is created LATER by DedicatedParamGroup
         # (see ``bind_to_packed_buffer``) as an ``as_strided`` view into the

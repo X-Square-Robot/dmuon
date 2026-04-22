@@ -1,395 +1,258 @@
 # API Reference
 
-Complete reference for DMuon's public API.
+!!! tip "TL;DR"
+    DMuon exposes four surface areas: **setup** (`dedicate_params`, `install_patch`),
+    **optimizer** (`Muon`, `NewtonSchulz`, NS functions and constants), **state
+    management** (`no_sync`, `wait_all_reduces`, replicate-broadcast helpers,
+    `DedicatedCommContext`), and **checkpointing** (`get/set_model/optimizer_state_dict`).
+    Start with `dedicate_params` + `Muon`; reach for the rest when you need fine-grained
+    control.
 
 ---
 
-## Core API
+## Module constants
 
-### `dmuon.dedicate_params`
+Two module-level knobs in `dmuon.group` let you tune the async→sync fallback
+protocol without touching the optimizer constructor.  Import and mutate before
+training starts:
 
 ```python
-dmuon.dedicate_params(
-    model: nn.Module,
-    mesh: DeviceMesh,
-    predicate: Callable[[str, nn.Parameter], bool],
-    compute_dtype: torch.dtype = None,
-    reshard_after_forward: bool = True,
-) -> dict[nn.Parameter, int]
+import dmuon.group as g
+
+g.REPLICATE_WAIT_THRESHOLD_US = 250   # default: 100 μs; raise on fast IB networks
+g.REPLICATE_FALLBACK_CONSECUTIVE_STEPS = 5  # default: 3; steps before flipping to sync
 ```
 
-Mark parameters for dedicated ownership and register communication hooks.
+| Name | Default | Description |
+|---|---|---|
+| `REPLICATE_WAIT_THRESHOLD_US` | `100.0` | Per-layer replicate-broadcast wait above which a step is counted as "slow". |
+| `REPLICATE_FALLBACK_CONSECUTIVE_STEPS` | `3` | Consecutive slow steps required before a group permanently switches to sync broadcast. |
 
-Parameters satisfying `predicate` are assigned to owner ranks via a balanced partition algorithm. Each marked parameter will be automatically ignored by subsequent `fully_shard()` calls.
-
-**Parameters:**
-
-| Name | Type | Default | Description |
-|------|------|---------|-------------|
-| `model` | `nn.Module` | *required* | The model whose parameters to partition. |
-| `mesh` | `DeviceMesh` | *required* | 1D DeviceMesh for the data-parallel dimension. |
-| `predicate` | `Callable` | *required* | `(param_name, param) -> bool`. Parameters returning True use dedicated ownership. |
-| `compute_dtype` | `torch.dtype` | `None` | Optional dtype for communication (e.g., `torch.bfloat16`). |
-| `reshard_after_forward` | `bool` | `True` | If True, reshard after forward (like `FULL_SHARD`). If False, keep unsharded through forward+backward (like `SHARD_GRAD_OP`). |
-
-**Returns:** Dict mapping each dedicated parameter to its owner rank (int).
+Reset a group that has fallen back: `dmuon.reset_replicate_fallback(model)`.
 
 ---
 
-### `dmuon.wait_all_reduces`
+## Setup
 
-```python
-dmuon.wait_all_reduces(model: nn.Module) -> None
-```
+### dedicate_params
 
-Wait for all pending gradient reduces to complete.
+Called once before `fully_shard()`.  Assigns each Muon-target parameter to
+a single owner rank and registers the per-layer forward/backward hooks.  See
+[Custom Hook Boundaries](../guides/custom-hook-boundaries.md) and
+[Z2 vs Z3 Modes](../guides/z2-z3-modes.md) for the two most common
+customization points.
 
-Called automatically by `optimizer.step()`. Only needed if you want to manually access `_reduced_grad` before stepping.
+::: dmuon.dedicate_params
 
 ---
 
-### `dmuon.no_sync`
+### install_patch
 
-```python
-@contextmanager
-dmuon.no_sync(model: nn.Module)
-```
+`import dmuon` calls this automatically.  You should never need to call it
+directly unless you are constructing a DMuon environment without the normal
+import path.
 
-Context manager to disable gradient reduction for gradient accumulation.
-
-Within this context, backward passes skip reduce communication and accumulate gradients locally. Also disables FSDP2's gradient sync for symmetric parameters.
-
-```python
-with dmuon.no_sync(model):
-    loss = model(batch).loss / accum_steps
-    loss.backward()
-```
+::: dmuon.install_patch
 
 ---
 
 ## Optimizer
 
-### `dmuon.Muon`
+### Muon
 
-```python
-dmuon.Muon(
-    model: nn.Module,
-    lr: float = 0.02,
-    momentum: float = 0.95,
-    weight_decay: float = 0.0,
-    ns_steps: int = 5,
-    adamw_lr: float = 1e-3,
-    adamw_betas: tuple[float, float] = (0.9, 0.999),
-    adamw_weight_decay: float = 0.01,
-    adamw_eps: float = 1e-8,
-    nesterov: bool = True,
-    per_head_ns: bool = True,
-    block_diagonal_ns: bool = False,
-)
-```
+The primary optimizer class.  Manages Muon (Newton-Schulz + momentum) on
+dedicated parameters and AdamW on FSDP2-managed symmetric parameters in a
+single object.  Compatible with `torch.optim.lr_scheduler`.
 
-Combined optimizer for DMuon distributed training.
-
-Manages two parameter groups:
-
-- **Group 0** (dedicated params): Muon — momentum + Newton-Schulz orthogonalization, run by owner only
-- **Group 1** (symmetric params): AdamW, run by all ranks on FSDP2 shards
-
-**Parameters:**
-
-| Name | Type | Default | Description |
-|------|------|---------|-------------|
-| `model` | `nn.Module` | *required* | Model with `dedicate_params` and `fully_shard` already applied. |
-| `lr` | `float` | `0.02` | Muon learning rate for dedicated params. Internally scaled by `0.2 * sqrt(max(m,n))`. |
-| `momentum` | `float` | `0.95` | Momentum coefficient for dedicated params. |
-| `weight_decay` | `float` | `0.0` | Weight decay for dedicated params (decoupled, like AdamW). |
-| `ns_steps` | `int` | `5` | Number of Newton-Schulz iterations. |
-| `ns_backend` | `str` or `NewtonSchulz` | `"gram"` | NS backend configuration. Pass a string shorthand (`"gram"` or `"direct"`) for default coefficients, or a `NewtonSchulz` object for full control (see below). |
-| `nesterov` | `bool` | `True` | Use Nesterov momentum: `ns_input = grad + mu * buf`. |
-| `per_head_ns` | `bool` | `True` | Use per-head local NS for narrow Shard(0) params (GQA k/v_proj). |
-| `block_diagonal_ns` | `bool` | `False` | Skip Gram all-reduce for all TP params (experimental). |
-| `adamw_lr` | `float` | `1e-3` | AdamW learning rate for symmetric params. |
-| `adamw_betas` | `tuple` | `(0.9, 0.999)` | AdamW beta coefficients. |
-| `adamw_weight_decay` | `float` | `0.01` | AdamW weight decay. |
-| `adamw_eps` | `float` | `1e-8` | AdamW epsilon. |
-
-**Methods:**
-
-- `step(closure=None)` — Perform one optimization step. Internally: (1) wait for reduces, (2) Muon on dedicated params, (3) AdamW on FSDP2 params.
-- `zero_grad(set_to_none=True)` — Clear gradients for both parameter types.
+::: dmuon.Muon
 
 ---
 
-### `dmuon.NewtonSchulz`
+### NewtonSchulz
 
-```python
-dmuon.NewtonSchulz(
-    backend: str = "gram",
-    coefficients: list[list[float]] = None,
-    restart_iterations: list[int] = None,
-)
-```
+Configurable NS backend object.  Pass to `Muon(ns_backend=...)` to select the
+algorithm variant, override coefficients, or enable deterministic mode.  See
+[Newton-Schulz Variants](newton-schulz.md) for a full comparison.
 
-Configurable Newton-Schulz backend object. Pass to `Muon(ns_backend=...)` for custom coefficients or algorithm selection.
-
-**Parameters:**
-
-| Name | Type | Default | Description |
-|------|------|---------|-------------|
-| `backend` | `str` | `"gram"` | `"gram"`: Gram-space NS (SYRK + restarts). `"direct"`: classic parameter-space NS. |
-| `coefficients` | `list` | `None` | Per-step `(a, b, c)` coefficients. `None` uses `POLAR_EXPRESS_COEFFICIENTS`. |
-| `restart_iterations` | `list[int]` | `None` | Restart positions for Gram-space NS. `None` uses `[2]`. Ignored for `"direct"`. |
-
-**Usage:**
-
-```python
-import dmuon
-
-# Default Gram-space NS
-optimizer = dmuon.Muon(model, lr=0.02, ns_backend="gram")
-
-# Classic Muon/Moonlight with You coefficients
-ns = dmuon.NewtonSchulz("direct", coefficients=dmuon.YOU_COEFFICIENTS)
-optimizer = dmuon.Muon(model, lr=0.02, ns_backend=ns)
-
-# Gram-space with You coefficients
-ns = dmuon.NewtonSchulz("gram", coefficients=dmuon.YOU_COEFFICIENTS)
-optimizer = dmuon.Muon(model, lr=0.02, ns_backend=ns)
-```
-
-!!! note
-    TP params that require Gram decomposition (exact or block-diagonal) always use `gram_newton_schulz` internally — the `backend` setting only affects local (non-TP) params and TP per-head params. Custom `coefficients` are applied to all paths.
+::: dmuon.NewtonSchulz
 
 ---
 
-## Newton-Schulz Functions
+### newton_schulz
 
-### `dmuon.newton_schulz`
+Standalone NS function (Gram-space by default).  Use directly for NS outside
+the optimizer loop.
 
-```python
-dmuon.newton_schulz(
-    G: Tensor,
-    steps: int = 5,
-    eps: float = 1e-7,
-    coefficients: list[list[float]] = None,
-    restart_iterations: list[int] = None,
-) -> Tensor
-```
-
-Newton-Schulz orthogonalization (Gram-space backend).
-
-Routes to `gram_newton_schulz_local()` for Gram-space iteration with per-step coefficients, restart mechanism, and SYRK acceleration.
-
-**Parameters:**
-
-| Name | Type | Default | Description |
-|------|------|---------|-------------|
-| `G` | `Tensor` | *required* | Gradient matrix (m, n), any dtype. |
-| `steps` | `int` | `5` | Ignored (determined by `len(coefficients)`). |
-| `eps` | `float` | `1e-7` | Normalization epsilon. |
-| `coefficients` | `list` | `POLAR_EXPRESS_COEFFICIENTS` | Per-step `(a, b, c)` coefficients. |
-| `restart_iterations` | `list[int]` | `[2]` | Restart positions for numerical stability. |
-
-**Returns:** Orthogonalized update, same shape as G.
+::: dmuon.newton_schulz
 
 ---
 
-### `dmuon.gram_newton_schulz`
+### gram_newton_schulz
 
-```python
-dmuon.gram_newton_schulz(
-    G_shard: Tensor,
-    tp_group: dist.ProcessGroup,
-    steps: int = 5,
-    eps: float = 1e-7,
-    coefficients: list[list[float]] = None,
-    restart_iterations: list[int] = None,
-    shard_dim: int = None,
-    block_diagonal: bool = False,
-) -> Tensor
-```
+TP-aware Gram NS with SYRK decomposition.  See
+[Tensor Parallelism](../guides/tp-support.md).
 
-Gram Newton-Schulz with TP SYRK decomposition.
-
-Iterates on the Gram matrix instead of the full gradient. The `shard_dim` controls which Gram is used:
-
-- **Shard(0)** (row-sharded): transpose to use R-side G^TG (decomposes as sum of local terms)
-- **Shard(1)** (col-sharded): use L-side GG^T (decomposes as sum of local terms)
-
-**Parameters:**
-
-| Name | Type | Default | Description |
-|------|------|---------|-------------|
-| `G_shard` | `Tensor` | *required* | TP-sharded gradient on this rank. |
-| `tp_group` | `ProcessGroup` | *required* | TP process group for all-reduce. |
-| `shard_dim` | `int` | `None` | TP shard dimension (0 or 1). If None, falls back to shape heuristic. |
-| `block_diagonal` | `bool` | `False` | If True, skip TP all-reduce (block-diagonal approximation). |
-
-**Returns:** Orthogonalized update shard, same shape as input.
+::: dmuon.gram_newton_schulz
 
 ---
 
-### `dmuon.direct_newton_schulz`
+### get_ns_backend
 
-```python
-dmuon.direct_newton_schulz(
-    G: Tensor,
-    steps: int = 5,
-    eps: float = 1e-7,
-    coefficients: list[list[float]] = None,
-) -> Tensor
-```
+Inspect which hardware backend is active (`"syrk_sm80"` or `"compiled"`).
 
-Standard Newton-Schulz in direct (parameter) space.
-
-Iterates on the full (m, n) matrix: $X_{k+1} = a_k X + b_k (XX^T)X + c_k (XX^T)^2 X$
-
-This is the classic formulation from Muon/Moonlight. Use for baseline comparison or small matrices where Gram-space overhead is not justified.
-
-**Returns:** Orthogonalized update, same shape as G.
+::: dmuon.get_ns_backend
 
 ---
 
-## Inspection Utilities
+### YOU_COEFFICIENTS
 
-### `dmuon.get_dedicated_params`
+5-step `(a, b, c)` coefficients from
+[@YouJiacheng](https://x.com/YouJiacheng/status/1905861218138804534).
 
-```python
-dmuon.get_dedicated_params(model: nn.Module) -> list[DedicatedParam]
-```
-
-Collect all `DedicatedParam` instances from a model (across all ranks).
+::: dmuon.YOU_COEFFICIENTS
 
 ---
 
-### `dmuon.get_owned_params`
+### POLAR_EXPRESS_COEFFICIENTS
 
-```python
-dmuon.get_owned_params(model: nn.Module, rank: int) -> list[DedicatedParam]
-```
+Default 5-step coefficients from Polar Express (arXiv:2505.16932, safety
+factor 1.05).  Used when no `coefficients` argument is provided.
 
-Collect `DedicatedParam` instances owned by a specific rank.
-
----
-
-### `dmuon.get_comm_ctx`
-
-```python
-dmuon.get_comm_ctx(model: nn.Module) -> Optional[DedicatedCommContext]
-```
-
-Get the `DedicatedCommContext` from a model, if it exists.
+::: dmuon.POLAR_EXPRESS_COEFFICIENTS
 
 ---
 
-### `dmuon.get_ns_backend`
+## Utilities — DMuon state management
 
-```python
-dmuon.get_ns_backend() -> str
-```
+### no_sync
 
-Returns the active Newton-Schulz backend: `"syrk_sm80"` or `"compiled"`.
+Context manager for gradient accumulation; suppresses DMuon reduce and
+FSDP2's reduce-scatter within the block.  See
+[Gradient Accumulation](../guides/grad-accumulation.md).
 
----
-
-## Checkpoint Functions
-
-### `dmuon.get_model_state_dict`
-
-```python
-dmuon.get_model_state_dict(
-    model: nn.Module,
-    *,
-    cpu_offload: bool = True,
-) -> dict[str, torch.Tensor]
-```
-
-Get full model state dict with both dedicated and FSDP2 parameters.
-
-Produces a state dict identical to what a single-GPU model would produce. **Collective operation** — all ranks must call.
-
-**Parameters:**
-
-| Name | Type | Default | Description |
-|------|------|---------|-------------|
-| `model` | `nn.Module` | *required* | Model with DMuon + FSDP2 applied. |
-| `cpu_offload` | `bool` | `True` | Move tensors to CPU (recommended for saving). |
+::: dmuon.no_sync
 
 ---
 
-### `dmuon.set_model_state_dict`
+### wait_all_reduces
 
-```python
-dmuon.set_model_state_dict(
-    model: nn.Module,
-    state_dict: dict[str, torch.Tensor],
-) -> None
-```
+Drain pending async gradient reduces.  Called automatically by `Muon.step()`.
 
-Load a full state dict into a DMuon model. Handles both dedicated and FSDP2 parameters.
-
-The state dict should contain full (unsharded) tensors.
+::: dmuon.wait_all_reduces
 
 ---
 
-### `dmuon.get_optimizer_state_dict`
+### broadcast_all_updates
 
-```python
-dmuon.get_optimizer_state_dict(
-    model: nn.Module,
-    optimizer: Muon,
-    *,
-    cpu_offload: bool = True,
-) -> dict
-```
+Synchronous post-step replicate broadcast (HSDP Phase B).  No-op in 1D mode.
+Prefer the async variant unless debugging.
 
-Get optimizer state dict for a DMuon Muon optimizer. **Collective operation** — all ranks must call.
-
-Returns a dict with sections: `"fsdp"` (AdamW state), `"dedicated"` (Muon momentum buffers), `"param_groups"` (hyperparameters).
+::: dmuon.broadcast_all_updates
 
 ---
 
-### `dmuon.set_optimizer_state_dict`
+### broadcast_all_updates_async
 
-```python
-dmuon.set_optimizer_state_dict(
-    model: nn.Module,
-    optimizer: Muon,
-    state_dict: dict,
-) -> None
-```
+Async post-step replicate broadcast (default in `Muon`).  Each layer's event
+is consumed at the start of the next forward pass.  See
+[Profiling & Fallback](../guides/profiling-and-fallback.md).
 
-Load optimizer state dict into a DMuon Muon optimizer.
+::: dmuon.broadcast_all_updates_async
 
 ---
 
-## DedicatedParam Properties
+### wait_all_replicate_broadcasts
 
-`DedicatedParam` instances (returned by `get_dedicated_params` / `get_owned_params`) expose these properties:
+Drain every group's pending async replicate broadcast.  Call before reading
+`_owned_data` outside the normal forward/step cycle.
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `is_owner` | `bool` | Whether this rank owns the parameter. |
-| `owner_rank` | `int` | The DP-local rank that owns this parameter. |
-| `numel` | `int` | Number of elements in the (local) parameter. |
-| `param_name` | `str` | Name of the parameter within its parent module (e.g., `"weight"`). |
-| `is_dtensor` | `bool` | Whether this is a TP-sharded DTensor parameter. |
-| `tp_group` | `ProcessGroup` | TP process group, or None if not a DTensor. |
-| `shard_dim` | `int` | TP shard dimension (0 or 1), or None if not a DTensor. |
-| `full_shape` | `torch.Size` | Full (unsharded) parameter shape. |
-| `_orig_size` | `torch.Size` | Local (sharded) parameter shape. |
-| `_owned_data` | `Tensor` | Full parameter data (only on owner rank). |
-| `_reduced_grad` | `Tensor` | Reduced gradient (only on owner, after backward + wait). |
+::: dmuon.wait_all_replicate_broadcasts
 
 ---
 
-## Constants
+### reset_replicate_fallback
 
-### Coefficient Sets
+Re-enable async broadcast on groups that permanently switched to sync.  Safe
+to call from the training loop after fixing a slow-IB condition.
 
-```python
-dmuon.YOU_COEFFICIENTS        # 5-step coefficients from @YouJiacheng
-dmuon.POLAR_EXPRESS_COEFFICIENTS  # 5-step coefficients from Polar Express paper (default)
-```
+::: dmuon.reset_replicate_fallback
 
-Both are lists of `(a, b, c)` tuples. Pass to `coefficients` parameter of NS functions.
+---
+
+### replicate_profile_report
+
+Print per-group wait-time summary to stdout (rank 0 only).  Requires
+`DMUON_REPLICATE_PROFILE=1`.  Call at the end of training.
+
+::: dmuon.replicate_profile_report
+
+---
+
+### get_dedicated_params
+
+Enumerate all `DedicatedParam` objects across the model.
+
+::: dmuon.get_dedicated_params
+
+---
+
+### get_owned_params
+
+Filter `DedicatedParam` objects owned by a rank.  Accepts `int` (1D) or
+`(shard, replicate)` tuple (HSDP).
+
+::: dmuon.get_owned_params
+
+---
+
+### get_comm_ctx
+
+::: dmuon.get_comm_ctx
+
+---
+
+### DedicatedCommContext
+
+Shared CUDA streams (broadcast, reduce, replicate-broadcast) and prefetch
+ordering state.  Analogous to FSDP2's `FSDPCommContext`.
+
+::: dmuon.DedicatedCommContext
+
+---
+
+## Checkpointing
+
+All four are **collective** — every rank must call.  Drains async state
+before reading/writing.  Standard format: compatible with single-GPU and
+HuggingFace checkpoints.  See [Checkpointing](../guides/checkpoint.md).
+
+### get_model_state_dict
+
+::: dmuon.get_model_state_dict
+
+---
+
+### set_model_state_dict
+
+::: dmuon.set_model_state_dict
+
+---
+
+### get_optimizer_state_dict
+
+::: dmuon.get_optimizer_state_dict
+
+---
+
+### set_optimizer_state_dict
+
+::: dmuon.set_optimizer_state_dict
+
+---
+
+## See also
+
+- [Getting Started — Core Concepts](../getting-started/concepts.md)
+- [Newton-Schulz Variants](newton-schulz.md)
+- [Communication Cost Analysis](communication-cost.md)
+- [Checkpointing guide](../guides/checkpoint.md)

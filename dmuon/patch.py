@@ -5,10 +5,20 @@ _original_fn = None
 
 
 def install_patch():
-    """Install monkey-patch on FSDP2's _get_managed_states.
+    """Install the FSDP2 monkey-patch that makes ``fully_shard`` skip
+    dedicated parameters.
 
-    After patching, fully_shard() automatically skips parameters that have
-    been marked with ``_dedicated_owner_rank`` by :func:`dedicate_params`.
+    Called automatically on ``import dmuon`` — users do not normally
+    invoke this directly. After patching, any subsequent call to
+    ``fully_shard()`` filters out parameters previously marked with
+    ``_dedicated_owner_rank`` by :func:`dedicate_params`, leaving them
+    under DMuon's ownership instead of FSDP2's uniform sharding.
+
+    Safe to call repeatedly (idempotent). The reverse operation is
+    :func:`uninstall_patch`.
+
+    Patched function: ``torch.distributed.fsdp._fully_shard._fsdp_init.
+    _get_managed_states``.
     """
     global _installed, _original_fn
     if _installed:

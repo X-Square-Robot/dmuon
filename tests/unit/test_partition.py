@@ -27,13 +27,34 @@ class FakeDeviceMesh:
 
 
 def test_extract_layer_id_standard():
-    assert _extract_layer_id("model.layers.3.mlp.gate_proj.weight") == "layers.3"
-    assert _extract_layer_id("model.layers.12.self_attn.q_proj.weight") == "layers.12"
+    assert _extract_layer_id("model.layers.3.mlp.gate_proj.weight") == "model.layers.3"
+    assert _extract_layer_id("model.layers.12.self_attn.q_proj.weight") == "model.layers.12"
 
 
 def test_extract_layer_id_no_layer():
     assert _extract_layer_id("model.embed_tokens.weight") is None
     assert _extract_layer_id("lm_head.weight") is None
+
+
+def test_extract_layer_id_vit_blocks():
+    """ViT uses `blocks.N` — extraction should distinguish from `layers.N`."""
+    assert _extract_layer_id("visual.blocks.5.attn.qkv.weight") == "visual.blocks.5"
+    assert _extract_layer_id("visual.blocks.0.mlp.fc1.weight") == "visual.blocks.0"
+
+
+def test_extract_layer_id_prefix_disambiguates():
+    """`blocks.3` and `layers.3` must not collide into the same bucket."""
+    a = _extract_layer_id("visual.blocks.3.attn.qkv.weight")
+    b = _extract_layer_id("model.layers.3.self_attn.q_proj.weight")
+    assert a != b, f"collision: {a} == {b}"
+    assert a == "visual.blocks.3"
+    assert b == "model.layers.3"
+
+
+def test_extract_layer_id_root_level():
+    """Bare `layers.N` / `blocks.N` with no parent should not crash."""
+    assert _extract_layer_id("layers.0.weight") == "_root.layers.0"
+    assert _extract_layer_id("blocks.2.weight") == "_root.blocks.2"
 
 
 # ---- Test balanced assignment ----

@@ -15,19 +15,52 @@
 
 ---
 
-## In Progress
+## Completed (2026-04-22 Phase A/B/C sweep)
+
+- [x] **Phase A** — 2D mesh infrastructure (`owner_rank: Tuple[int, int]`, `dedicate_params(replicate_mesh=...)`, LPT over G·R slots)
+- [x] **Phase B** — Two-stage reduce (shard AVG + replicate AVG) + sync replicate broadcast; bit-identical vs shard-only baseline on 4 GPU G=2 R=2
+- [x] **Phase C** — Async forward-hidden replicate broadcast + per-layer priority + fallback protocol + profile infra; bit-identical vs Phase B sync on 4 GPU
+- [x] **HSDP checkpoint** — save/load bit-identical restart on 4 GPU HSDP
+- [x] **Docs sweep** — `paper_outline_dmuon.md v2.1` + `paper_strategy_dmuon.md v3` + `canzona_overlap_audit.md` + `landscape_post_canzona.md v2`
+
+---
+
+## Pre-Paper Submission P0 (2026-05 engineering, ~10 days total)
+
+### Naive Baseline Scripts (for E1 per-byte traces + E2 speedup A/B)
+
+- [ ] **Naive Muon-on-DDP baseline** — DDP wrapper + per-rank NS on full grad, ~1d
+- [ ] **Naive Muon-on-FSDP-ZeRO2 baseline** — `fully_shard(reshard_after_forward=False)` + manual grad AG + per-rank NS, ~1-2d
+- [ ] **Naive Muon-on-FSDP-ZeRO3 baseline** — `fully_shard` default + manual grad AG + per-rank NS, ~1d
+
+### Matrix Optimizer Extension
+
+- [ ] **Shampoo/SOAP DMuon adaptation** — reuse `_owned_data` + owner-step pattern, ~5d. For A4 3×3 matrix (DP × optimizer)
+
+### Experiment Harness
+
+- [ ] **3×3 matrix harness** — 3 DP settings × 3 optimizers benchmark infrastructure, ~3d
+- [ ] **E1 per-byte NCCL trace script** — 16 GPU bytes-level validation of Theorems 1/2a/2b/3
+- [ ] **E2 speedup benchmark script** — multi-scale (16/32/64/128/256 GPU) × multi-model (Qwen2.5-1.5B/7B, Llama-3)
+
+---
+
+## Phase D (2026-07, cluster-dependent)
 
 ### Convergence Validation
 
 Training loss curves and downstream evaluation to verify DMuon preserves Muon's convergence quality:
 - From-scratch pretraining on Qwen2.5-1.5B and Llama-3.2-3B
 - Dataset: FineWeb-Edu, 10-15B tokens
-- Baselines: FSDP2+AdamW, DDP+Muon, FSDP2+Muon (naive), DMuon
+- Baselines: FSDP2+AdamW, naive DDP+Muon, naive FSDP-Z2+Muon, naive FSDP-Z3+Muon, **DMuon (all 4 DP settings)**
 - Metrics: loss vs steps, loss vs wall-clock, perplexity, downstream accuracy
 
-### HSDP Support
+### Multi-Domain Empirical (E3/E4/B4)
 
-Hybrid Sharded Data Parallel: `(Replicate, Shard)` mesh for multi-node training. DMuon needs to handle the replicate dimension — prerequisite for multi-node scaling experiments.
+- LLM (Qwen2.5, Llama-3)
+- VLM (Qwen-VL fine-tune)
+- Video diffusion (Wan pretrain)
+- VLA robotics (internal)
 
 ### Training Examples
 
@@ -35,33 +68,31 @@ Populate `examples/` directory:
 - `train_llm.py`: complete LLM training script (single-node multi-GPU)
 - `train_tp_dp.py`: TP + DP training example
 - `resume_training.py`: checkpoint save/load with resume
+- `train_hsdp.py`: 2D mesh HSDP training example
+
+### NSight Profile (E5)
+
+- 32 GPU Qwen2.5-7B HSDP async profile
+- Forward IB utilization curve; blocked-wait histogram
+- Validate async hiding ≥10% vs Phase B sync
 
 ---
 
-## Planned
-
-### Multi-Node Scaling
-
-Strong and weak scaling experiments on 16-64 GPUs across multiple nodes. Depends on HSDP support.
+## Planned (Paper Submission Window 2026-10/11)
 
 ### Larger Model Benchmarks
 
-Extend step time benchmarks to 14B+ models (e.g., Qwen2.5-14B).
-
-### Optimizer Generalization
-
-Extend DMuon's ownership model beyond Muon:
-- **L-only Shampoo**: left preconditioner with SYRK acceleration, fully reusing TP infrastructure
-- **SOAP-Muon hybrid**: left-side SOAP eigenbasis + right-side Muon NS
+Extend step time benchmarks to 14B+ and 32B models (Qwen2.5-14B, 32B, Llama-3.1-8B at 256 GPU).
 
 ### Communication & Memory Profiling
 
 - torch.profiler traces showing broadcast/reduce overlap with compute
-- Per-rank memory breakdown across model sizes
+- Per-rank memory breakdown across model sizes, all 4 DP settings
+- Bytes-level NCCL traces for Theorems 1/2a/2b/3 empirical validation
 
-### DeepSpeed ZeRO Integration
+### DeepSpeed ZeRO Integration (future work in paper §Discussion)
 
-Extend DMuon beyond FSDP2 to support DeepSpeed ZeRO. The core dedicated ownership algorithm (broadcast/reduce) is framework-portable — only needs two hooks: (1) tell ZeRO to skip dedicated params, (2) register forward/backward hooks. Validates DMuon's framework-portable design claim.
+Described in paper but not implemented for submission. The core dedicated ownership primitive + cross-step async scheduling is framework-portable — only needs two hooks: (1) tell ZeRO to skip dedicated params, (2) register forward/backward hooks. Validates runtime-portable engineering claim in future work.
 
 ### Ablation Studies
 

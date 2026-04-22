@@ -40,7 +40,23 @@ except ImportError:
 
 
 def get_ns_backend() -> str:
-    """Return a string describing the active NS backend."""
+    """Return a human-readable name of the active Newton-Schulz kernel backend.
+
+    Returns one of:
+      * ``"CuteDSL SYRK (SM80)"`` — CuteDSL SYRK kernel compiled for SM80
+        (A100 / A800). 1.4–1.5× end-to-end speedup on Gram NS ops vs fallback.
+      * ``"CuteDSL SYRK (SM90)"`` — CuteDSL SYRK kernel compiled for SM90+
+        (H100 / H200), when supported by the installed CuteDSL version.
+      * ``"torch.compile (fallback)"`` — generic ``@torch.compile``-compiled
+        reference path, used when no CuteDSL SYRK is available for the
+        current GPU (e.g. V100 / RTX 30xx / consumer Blackwell).
+
+    Call once at startup to confirm you are on the fast path:
+
+    >>> import dmuon
+    >>> print(dmuon.get_ns_backend())
+    CuteDSL SYRK (SM80)
+    """
     if HAS_SYRK:
         return f"CuteDSL SYRK (SM{_SM_VERSION})"
     return "torch.compile (fallback)"

@@ -43,7 +43,18 @@ from .optim import (
     newton_schulz,
 )
 from .patch import install_patch
-from .utils import get_comm_ctx, get_dedicated_params, get_owned_params, no_sync, wait_all_reduces
+from ._replicate_profile import replicate_profile_report
+from .utils import (
+    broadcast_all_updates,
+    broadcast_all_updates_async,
+    get_comm_ctx,
+    get_dedicated_params,
+    get_owned_params,
+    no_sync,
+    reset_replicate_fallback,
+    wait_all_reduces,
+    wait_all_replicate_broadcasts,
+)
 
 # Auto-install monkey-patch so fully_shard() skips dedicated params
 install_patch()
@@ -61,6 +72,11 @@ __all__ = [
     "DedicatedCommContext",
     "no_sync",
     "wait_all_reduces",
+    "wait_all_replicate_broadcasts",
+    "broadcast_all_updates",
+    "broadcast_all_updates_async",
+    "reset_replicate_fallback",
+    "replicate_profile_report",
     "get_model_state_dict",
     "set_model_state_dict",
     "get_optimizer_state_dict",

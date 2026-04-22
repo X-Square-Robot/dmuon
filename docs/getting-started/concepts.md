@@ -1,213 +1,211 @@
 # Core Concepts
 
-This page builds the mental model you need to understand DMuon. Read it once, and the rest of the documentation will make sense.
+!!! tip "TL;DR"
+    DMuon has three key concepts: **dedicated ownership** (one rank owns each
+    matrix parameter and runs Newton-Schulz alone), **DMuon-Z2/Z3 modes**
+    (packed-buffer lifetime, mirroring FSDP2's `reshard_after_forward`),
+    and **hook boundaries** (where hooks attach — independent of partition).
 
 ---
 
-## FSDP2 Recap
+## 1. Dedicated Ownership
 
-PyTorch FSDP2 (`fully_shard`) distributes a model across R ranks by **sharding** parameters:
+### The problem
 
-- Each rank stores **1/R** of every parameter
-- **Forward**: all-gather the full parameter, compute, then discard
-- **Backward**: all-gather again, compute gradients, then reduce-scatter so each rank gets 1/R of the gradient
-
-```mermaid
-sequenceDiagram
-    participant R0 as Rank 0
-    participant R1 as Rank 1
-    Note over R0,R1: Forward
-    R0->>R1: all-gather (param shards → full param)
-    R1->>R0: all-gather
-    Note over R0,R1: Compute forward
-    Note over R0,R1: Backward
-    R0->>R1: all-gather (param shards → full param)
-    R1->>R0: all-gather
-    Note over R0,R1: Compute gradients
-    R0->>R1: reduce-scatter (full grad → grad shards)
-    R1->>R0: reduce-scatter
-    Note over R0,R1: Optimizer (each rank updates its 1/R shard)
-```
-
-This works perfectly for elementwise optimizers like **AdamW** — each rank updates its shard independently using its shard of the gradient.
-
-## The Matrix Optimizer Problem
-
-Matrix optimizers don't work elementwise. [Muon](https://arxiv.org/abs/2502.16982) needs the **full gradient matrix** to compute the Newton-Schulz orthogonal projection:
+Matrix optimizers like [Muon](https://arxiv.org/abs/2502.16982) need the
+**full gradient matrix** for Newton-Schulz:
 
 $$
-X_{k+1} = a_k X_k + b_k (X_k X_k^T) X_k + c_k (X_k X_k^T)^2 X_k
+X_{k+1} = a_k X_k + b_k (X_k X_k^\top) X_k + c_k (X_k X_k^\top)^2 X_k
 $$
 
-After FSDP2's reduce-scatter, each rank has only **1/R of the gradient**. To run Newton-Schulz, you need to:
+FSDP2 leaves each rank with 1/R of the gradient after reduce-scatter. To run
+Newton-Schulz you must either all-gather (O(mn) extra comm) or run NS on every
+rank (R× redundant compute). On an 8B model with 8 GPUs this adds 3–4× AdamW overhead.
 
-1. **All-gather** the full gradient — O(mn) extra communication
-2. **Run NS on every rank** — R times the same computation, completely redundant
+### How dedicated ownership fixes it
 
-For an 8B model on 8 GPUs, this all-gather + redundant compute adds **3-4x** overhead to every step.
+Assign each Muon-target parameter to one **owner rank**. The owner stores the
+full parameter; others hold empty placeholders. Per step:
 
-## Dedicated Ownership
-
-DMuon's insight: **if one rank has the full gradient, only that rank needs to run NS**.
-
-Instead of FSDP2's symmetric sharding (every rank holds 1/R), DMuon assigns each matrix parameter to a single **owner rank**:
+1. **Forward broadcast** — owner sends full param to all shard peers
+2. **Forward reshard** — non-owners discard after the layer forward
+3. **Backward broadcast** — owner re-sends for gradient computation
+4. **Backward reduce** — gradients averaged and delivered to owner only
+5. **Owner NS update** — owner runs Newton-Schulz; zero additional communication
+6. **AdamW on FSDP2 shards** — all ranks update non-dedicated params
 
 ```
-           Standard FSDP2                  DMuon
-           ==============                  =====
-
-           Rank 0  Rank 1  Rank 2  Rank 3
-q_proj:    [1/4]   [1/4]   [1/4]   [1/4]     Rank 0 owns full q_proj
-k_proj:    [1/4]   [1/4]   [1/4]   [1/4]     Rank 0 owns full k_proj
-v_proj:    [1/4]   [1/4]   [1/4]   [1/4]     Rank 1 owns full v_proj
-o_proj:    [1/4]   [1/4]   [1/4]   [1/4]     Rank 1 owns full o_proj
-gate_proj: [1/4]   [1/4]   [1/4]   [1/4]     Rank 2 owns full gate_proj
-up_proj:   [1/4]   [1/4]   [1/4]   [1/4]     Rank 2 owns full up_proj
-down_proj: [1/4]   [1/4]   [1/4]   [1/4]     Rank 3 owns full down_proj
-ln:        [1/4]   [1/4]   [1/4]   [1/4]     [1/4]  [1/4]  [1/4]  [1/4]
+          Standard FSDP2                 DMuon
+          ==============                 =====
+          R0    R1    R2    R3
+q_proj:   [1/4] [1/4] [1/4] [1/4]  →   R0 owns full q_proj
+k_proj:   [1/4] [1/4] [1/4] [1/4]  →   R0 owns full k_proj
+v_proj:   [1/4] [1/4] [1/4] [1/4]  →   R1 owns full v_proj
+o_proj:   [1/4] [1/4] [1/4] [1/4]  →   R1 owns full o_proj
+gate:     [1/4] [1/4] [1/4] [1/4]  →   R2 owns full gate_proj
+down:     [1/4] [1/4] [1/4] [1/4]  →   R3 owns full down_proj
+ln:       [1/4] [1/4] [1/4] [1/4]      [1/4] [1/4] [1/4] [1/4]
 ```
 
-The owner stores the **complete** parameter. Other ranks hold nothing (empty placeholders). Non-matrix parameters (LayerNorm, embeddings) stay under FSDP2's normal sharding.
+### Lineage
 
-## Two Types of Parameters
+Dedicated ownership as a distributed training primitive traces to **ZeRO-1**
+(Rajbhandari et al., 2020), which partitioned optimizer state across ranks.
+**Distributed Shampoo** (Shi et al., 2023) applied single-owner assignment
+to Kronecker factors, demonstrating full-matrix computation without
+gradient all-gathers. DMuon extends this to Muon's Newton-Schulz and
+combines it natively with FSDP2 module-level sharding.
 
-DMuon splits model parameters into two disjoint groups:
+### Balanced partition
 
-### Dedicated Parameters
+`dedicate_params()` uses **LPT (Longest Processing Time)** with two constraints:
+global balance (~`total_params / R` per rank) and layer concurrency (same-layer
+params on different ranks for concurrent broadcasts). In HSDP mode, balance
+spans all `G × R` global owner slots.
 
-- Selected by the `predicate` you provide (typically 2D projection layers)
-- Assigned to an owner rank via balanced partition
-- Communication: **broadcast** (forward) + **reduce** (backward)
-- Optimizer: **Muon** (Newton-Schulz), run by owner only
+---
 
-### Symmetric Parameters
+## 2. HSDP and the 2D Mesh
 
-- Everything not selected by the predicate (LayerNorm, embeddings, bias, etc.)
-- Managed by FSDP2's standard sharding (1/R per rank)
-- Communication: **all-gather** + **reduce-scatter** (standard FSDP2)
-- Optimizer: **AdamW**, run by all ranks on their shards
-
-!!! info "Why 'symmetric' and 'dedicated'?"
-    "Symmetric" because every rank plays the same role — each holds an equal shard. "Dedicated" because one rank is *dedicated* to owning the full parameter — an asymmetric, specialized role.
-
-## Data Flow
-
-Here is the complete data flow for one training step:
+HSDP uses a 2D `(replicate, shard)` device mesh. Each Muon-target parameter
+has a single **global owner** at `(owner_shard, owner_replicate)`.
 
 ```mermaid
-flowchart TD
-    subgraph Forward
-        F1[Owner broadcasts full param to all ranks]
-        F2[All ranks compute forward with full param]
-        F3[Owner reshards — reclaims full param, others discard]
+graph TB
+    subgraph "replicate=0 (node 0)"
+        R0["rank 0 (rep=0, shard=0)"]
+        R1["rank 1 (rep=0, shard=1)"]
+        R2["rank 2 (rep=0, shard=2)"]
+        R3["rank 3 (rep=0, shard=3)"]
     end
-
-    subgraph Backward
-        B1[Owner broadcasts full param again]
-        B2[All ranks compute backward — each gets full gradient]
-        B3["Reduce gradient to owner (avg across ranks)"]
-        B4[Owner reshards]
+    subgraph "replicate=1 (node 1)"
+        R4["rank 4 (rep=1, shard=0)"]
+        R5["rank 5 (rep=1, shard=1)"]
+        R6["rank 6 (rep=1, shard=2)"]
+        R7["rank 7 (rep=1, shard=3)"]
     end
-
-    subgraph "Optimizer Step"
-        O1["Owner: momentum → Newton-Schulz → update"]
-        O2["All ranks: AdamW on FSDP2 shards"]
-    end
-
-    Forward --> Backward --> O1 & O2
+    R0 -.->|replicate group| R4
+    R1 -.->|replicate group| R5
+    R2 -.->|replicate group| R6
+    R3 -.->|replicate group| R7
 ```
 
-Step by step:
+Per iteration: shard-group broadcast → two-stage reduce (AVG shard, AVG
+replicate, net divisor G·R) → owner NS → post-step replicate broadcast.
+With `replicate_async=True` (default) the replicate broadcast hides behind
+the next forward's compute.
 
-1. **Forward broadcast**: The owner sends its full parameter to all ranks. Every rank computes forward with the same full matrix.
+---
 
-2. **Forward reshard**: After the layer's forward pass, the parameter is discarded on non-owner ranks (like FSDP2's `FULL_SHARD`).
+## 3. DMuon-Z2 vs DMuon-Z3
 
-3. **Backward broadcast**: The full parameter is needed again for gradient computation, so the owner broadcasts it once more.
+| Mode | `reshard_after_forward` | Packed-buffer | Bytes/step | Memory |
+|------|------------------------|---------------|------------|--------|
+| **DMuon-Z3** | `True` (default) | Freed after forward; re-broadcast in backward | `3(N-1)/N · P_M` | Transient per layer |
+| **DMuon-Z2** | `False` | Resident through forward + backward | `2(N-1)/N · P_M` | `P_M` resident per shard rank |
 
-4. **Backward reduce**: Each rank has computed a gradient. These are **reduced** (averaged) and sent to the owner. The owner now has the complete, averaged gradient.
-
-5. **Owner NS update**: The owner runs momentum accumulation and Newton-Schulz orthogonalization on the full gradient. No other rank needs to participate.
-
-6. **AdamW on FSDP2 params**: Meanwhile, all ranks update their FSDP2 shards of non-matrix parameters using standard AdamW.
-
-!!! tip "Communication cost"
-    The reduce in step 4 is O(mn/R) — each rank sends its gradient to the owner, and NCCL's reduce tree means each rank transmits ~1/R of the data. This is **cheaper** than the all-gather in naive FSDP2+Muon (O(mn)).
-
-## Balanced Partition
-
-`dedicate_params()` doesn't randomly assign owners. It uses the **Longest Processing Time (LPT)** algorithm with constraints:
-
-- **Global balance**: Each rank owns approximately `total_params / R` elements
-- **Layer concurrency**: Parameters in the same layer go to different ranks, enabling concurrent broadcasts
-- **Small param packing**: k_proj + v_proj in the same layer can share an owner for packed broadcast
+Match DMuon's flag to FSDP2's flag for a consistent memory model:
 
 ```python
-# Example: 4 layers, 7 params each, 4 ranks
-# LPT distributes by numel, largest-first:
-#   Layer 0: gate_proj→R0, up_proj→R1, down_proj→R2, q_proj→R3, ...
-#   Layer 1: gate_proj→R1, up_proj→R2, down_proj→R3, q_proj→R0, ...
-# Result: each rank owns roughly the same total numel
-```
-
-You can inspect the assignment:
-
-```python
-assignment = dmuon.dedicate_params(model, mesh, predicate=...)
-# assignment: {param: owner_rank, ...}
-
-# Check what this rank owns:
-owned = dmuon.get_owned_params(model, rank=dist.get_rank())
-for dp in owned:
-    print(f"  {dp.param_name}: {dp._orig_size}")
-```
-
-## Composing with FSDP2
-
-DMuon runs **alongside** FSDP2 on the same model. The setup order matters:
-
-```python
-# Step 1: Dedicate params (BEFORE fully_shard)
-dmuon.dedicate_params(model, mesh, predicate=...)
-
-# Step 2: Apply FSDP2 (dedicated params are auto-skipped)
+# ZeRO-3 (large models, default)
+dmuon.dedicate_params(model, mesh, predicate=..., reshard_after_forward=True)
 for layer in model.layers:
     fully_shard(layer, mesh=mesh)
-fully_shard(model, mesh=mesh)
+
+# ZeRO-2 (comm-optimal, small/medium models)
+dmuon.dedicate_params(model, mesh, predicate=..., reshard_after_forward=False)
+for layer in model.layers:
+    fully_shard(layer, mesh=mesh, reshard_after_forward=False)
 ```
 
+See [Z2 vs Z3 Modes](../guides/z2-z3-modes.md) for the decision tree.
+
+---
+
+## 4. Hook Boundary vs Partition
+
+Hook boundaries and parameter partition are **independent concerns**.
+
+- **Partition** — global LPT; decides *which rank* owns each parameter
+- **Hook boundary** — module where forward/backward hooks attach; decides
+  *when* broadcast/reduce fire. Should match `fully_shard()` granularity.
+
+```mermaid
+graph TD
+    P["model.layers.3.self_attn.q_proj.weight"]
+    Part["Partition → owner_rank = 2"]
+    Hook["Hook boundary → model.layers.3"]
+    P --> Part
+    P --> Hook
+    Part --> NS["NS runs on rank 2 only"]
+    Hook --> FWD["pre-forward hook on layers.3"]
+```
+
+**Default heuristic**: when `hook_boundary_predicate=None`, DMuon scans the
+parameter's FQN for `layers.N` or `blocks.N` patterns — covers standard
+Llama/GPT/BERT naming without configuration.
+
+**Custom hook boundaries**: for ViT, MoE, or custom blocks, set
+`hook_boundary_predicate` to select the hook module explicitly. DMuon
+registers on the **lowest ancestor** where the predicate returns `True`.
+
+```python
+# ViT with "blocks.N" naming
+dmuon.dedicate_params(
+    model, mesh,
+    predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    hook_boundary_predicate=lambda m: hasattr(m, "attn") and hasattr(m, "mlp"),
+)
+```
+
+`hook_boundary_strict=True` (default) raises if any dedicated param has no
+matching ancestor — prevents silent per-submodule hook degradation.
+
+See [Custom Hook Boundaries](../guides/custom-hook-boundaries.md).
+
+---
+
+## 5. Composition with FSDP2 and TP
+
+**FSDP2**: DMuon and FSDP2 manage disjoint parameter sets. A monkey-patch
+installed at `import dmuon` makes `fully_shard()` skip `_dedicated_owner_rank`
+params. Setup order must be: `import dmuon` → `dedicate_params` → `fully_shard`.
+
 !!! warning "Order matters"
-    `dedicate_params()` must be called **before** `fully_shard()`. On `import dmuon`, a monkey-patch makes `fully_shard()` auto-skip any parameter marked with `_dedicated_owner_rank`. If you shard first, FSDP2 will take ownership before DMuon can.
+    Calling `fully_shard()` before `dedicate_params()` causes FSDP2 to shard
+    Muon-target params before DMuon can claim them.
 
-How the composition works internally:
+**Tensor Parallelism**: DMuon uses **Gram Newton-Schulz** — iterating on the
+(d, d) Gram matrix instead of the full (m, n) parameter. Gram reconstruction
+from TP shards costs O(d²) via a single all-reduce. Apply TP first, DMuon
+second, FSDP2 third:
 
-1. `dedicate_params()` marks parameters with `_dedicated_owner_rank` and registers forward/backward hooks on each layer module
-2. The monkey-patch makes `fully_shard()` ignore marked parameters — they won't participate in FSDP2's all-gather/reduce-scatter
-3. During training, DMuon's hooks handle broadcast/reduce for dedicated params, while FSDP2's hooks handle all-gather/reduce-scatter for symmetric params — both on the same module, both triggered by the same forward/backward calls
+```python
+parallelize_module(layer.mlp, tp_mesh, {...})    # TP first
+dmuon.dedicate_params(model, dp_mesh, ...)       # DMuon second
+fully_shard(layer, mesh=dp_mesh)                 # FSDP2 third
+```
 
-## TP Compatibility (Overview)
-
-When using Tensor Parallelism, the owner rank holds a **TP shard**, not the full parameter. The gradient is also sharded. Standard Newton-Schulz requires the full matrix — so what do we do?
-
-DMuon uses **Gram Newton-Schulz**: instead of iterating on the full (m, n) matrix, it iterates on the (d, d) Gram matrix. The Gram matrix can be reconstructed from TP shards via a single **all-reduce** — O(d^2) communication instead of O(mn).
-
-For details, see the [Tensor Parallelism guide](../guides/tp-support.md).
+---
 
 ## Glossary
 
 | Term | Definition |
 |------|-----------|
-| **Dedicated param** | A parameter assigned to a single owner rank. Uses broadcast/reduce communication and Muon optimizer. |
-| **Symmetric param** | A parameter managed by FSDP2's standard sharding. Uses all-gather/reduce-scatter and AdamW. |
-| **Owner rank** | The rank that stores the full (or TP-shard of) dedicated parameter and runs NS. |
-| **Placeholder** | An empty tensor stored on non-owner ranks in place of the dedicated parameter. |
-| **Newton-Schulz (NS)** | Iterative algorithm for computing the orthogonal polar factor of a matrix. Used by Muon for weight updates. |
-| **Gram NS** | Newton-Schulz on the Gram matrix (d, d) instead of the full parameter (m, n). Enables TP compatibility. |
-| **SYRK** | Symmetric rank-k update: efficient kernel for computing A @ A^T when the result is symmetric. |
-| **Balanced partition** | LPT algorithm that assigns dedicated params to ranks with balanced total numel. |
-| **Predicate** | User-provided function `(name, param) -> bool` that selects which parameters become dedicated. |
+| **Dedicated ownership** | One rank stores and updates the full parameter; others hold placeholders |
+| **Muon-target parameters** | Parameters selected by `predicate` for dedicated ownership and Newton-Schulz |
+| **Owner rank** | Rank that holds `_owned_data`, accumulates gradients, and runs Newton-Schulz |
+| **Hook boundary** | Module where DMuon's pre/post-forward hooks are registered |
+| **DMuon-Z2 / DMuon-Z3** | Packed-buffer lifecycle modes (`reshard_after_forward=False/True`) |
+| **Newton-Schulz** | Iterative orthogonal polar factor algorithm used by Muon |
+| **Replicate broadcast** | Post-step fan-out of `_owned_data` to replicate peers (HSDP only) |
 
-## Next
+---
 
-- [Training Guide](../guides/training.md) — Full training workflow with all options
-- [API Reference](../reference/api.md) — Complete function signatures and parameter docs
+## See Also
+
+- [HSDP Guide](../guides/hsdp.md) — full 2D mesh walkthrough, async mode, fallback
+- [Custom Hook Boundaries](../guides/custom-hook-boundaries.md) — ViT, MoE, non-standard architectures
+- [Z2 vs Z3 Modes](../guides/z2-z3-modes.md) — memory/communication tradeoff
+- [API Reference](../reference/api.md) — complete `dedicate_params` and `Muon` signatures

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 
+from ._owner_rank import normalize_owner_rank
 from .comm import DedicatedCommContext
 from .group import DedicatedParamGroup
 from .param import DedicatedParam
@@ -68,12 +69,72 @@ def _find_layer_module(
     return layer_module, parent_module, param_name
 
 
+def _find_hook_module(
+    model: nn.Module,
+    target_param: nn.Parameter,
+    hook_boundary_predicate: Optional[Callable[[nn.Module], bool]],
+    strict: bool = True,
+) -> Optional[nn.Module]:
+    """Return the lowest ancestor of ``target_param`` where the predicate is True.
+
+    When ``hook_boundary_predicate`` is None, returns None — caller should fall
+    back to the ``_find_layer_module`` path. This split keeps the two semantics
+    (partition layer key vs. hook attachment module) decoupled.
+
+    Args:
+        model: Root module to search within.
+        target_param: Parameter whose ancestor we want.
+        hook_boundary_predicate: Callable ``(module) -> bool``. None means the
+            caller opted out of explicit hook boundaries.
+        strict: When True (default), raise if no ancestor matches the predicate.
+            When False, fall back to the parameter's direct parent module.
+
+    Returns:
+        The chosen hook module, or None when predicate is None.
+    """
+    if hook_boundary_predicate is None:
+        return None
+
+    parent_module, _ = _find_parent_module(model, target_param)
+
+    # Find parent's FQN (relative to `model`)
+    parent_fqn: Optional[str] = None
+    for name, mod in model.named_modules():
+        if mod is parent_module:
+            parent_fqn = name
+            break
+
+    # Walk from longest prefix down to root, checking the submodule at each
+    # prefix against the predicate.
+    parts = parent_fqn.split(".") if parent_fqn else []
+    for depth in range(len(parts), -1, -1):
+        path = ".".join(parts[:depth])
+        try:
+            mod = model.get_submodule(path) if path else model
+        except AttributeError:
+            continue
+        if hook_boundary_predicate(mod):
+            return mod
+
+    if strict:
+        raise ValueError(
+            f"param of shape {tuple(target_param.shape)} "
+            f"(parent_fqn={parent_fqn!r}): no ancestor matched "
+            f"hook_boundary_predicate. Either extend the predicate to cover this "
+            f"module, or exclude the param via the dedicate_params `predicate` arg."
+        )
+    return parent_module
+
+
 def dedicate_params(
     model: nn.Module,
     mesh: DeviceMesh,
     predicate: Callable[[str, nn.Parameter], bool],
     compute_dtype: torch.dtype = None,
     reshard_after_forward: bool = True,
+    replicate_mesh: Optional[DeviceMesh] = None,
+    hook_boundary_predicate: Optional[Callable[[nn.Module], bool]] = None,
+    hook_boundary_strict: bool = True,
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -88,7 +149,9 @@ def dedicate_params(
 
     Args:
         model: The model whose parameters to partition.
-        mesh: 1D DeviceMesh for the data-parallel dimension.
+        mesh: 1D DeviceMesh over the *shard* dimension (a.k.a. ``dp_group``).
+            When ``replicate_mesh`` is provided, this becomes the shard axis
+            of the HSDP 2D mesh.
         predicate: Callable ``(param_name, param) -> bool``. Parameters
             returning True will use dedicated ownership.
         compute_dtype: Optional dtype for communication (e.g., torch.bfloat16).
@@ -96,53 +159,106 @@ def dedicate_params(
             forward and re-broadcast in backward. If False (SHARD_GRAD_OP mode),
             keep params unsharded through forward+backward, eliminating backward
             broadcasts at the cost of higher memory.
+        replicate_mesh: Optional 1D DeviceMesh over the *replicate* dimension.
+            When provided, dedicate_params accepts a HSDP-style 2D layout; the
+            LPT partition then balances globally over ``G·R`` owner slots
+            (G = shard size, R = replicate size).  **Phase A** only plumbs the
+            2D owner coord — all actual collectives still run on the shard
+            group only; the replicate-dim reduce/broadcast lands in Phase B/C.
+        hook_boundary_predicate: Optional ``(module) -> bool`` selector for the
+            hook attachment module. When set, DMuon registers its pre/post
+            forward hooks on the **lowest ancestor** of each dedicated param
+            where the predicate is True. Use this to align hook boundaries
+            with your FSDP2 ``fully_shard`` boundaries — e.g. treat the whole
+            ViT as one hook site even though its parameters are distributed
+            across ranks. Leave as None to use the built-in ``layers.N`` /
+            ``blocks.N`` heuristic (:func:`_find_layer_module`).
+        hook_boundary_strict: When True (default) and ``hook_boundary_predicate``
+            is given, raise if a dedicated param has no ancestor matching the
+            predicate. When False, fall back to the param's direct parent
+            module. Strict is recommended to avoid silent per-sub-module hooks.
 
     Returns:
-        Assignment dict mapping each dedicated parameter to its owner rank.
+        Assignment dict mapping each dedicated parameter to its owner rank
+        (``int`` in 1D shard-only mode, ``Tuple[int, int]`` in HSDP mode).
     """
-    # 1. Compute balanced assignment
-    assignment = compute_balanced_assignment(model, mesh, predicate)
+    # 1. Compute balanced assignment (passes ``replicate_mesh`` through so
+    #    Phase A.3 can switch to 2D LPT; in Phase A partition.py still returns
+    #    plain shard ints, which are normalized below).
+    assignment = compute_balanced_assignment(
+        model, mesh, predicate, replicate_mesh=replicate_mesh
+    )
     if not assignment:
         logger.warning("dedicate_params: no parameters matched the predicate")
         return assignment
 
+    # Normalize every assignment value to a 2D ``(shard, replicate)`` coord.
+    # In shard-only mode (``replicate_mesh is None``) partition.py returns
+    # ints, which get promoted to ``(int, 0)`` — identical behaviour to
+    # pre-Phase-A code paths.
+    normalized: dict[nn.Parameter, tuple[int, int]] = {
+        param: normalize_owner_rank(owner) for param, owner in assignment.items()
+    }
+
     # Log assignment summary
-    world_size = mesh.size()
-    rank_loads = defaultdict(int)
-    for param, rank in assignment.items():
-        rank_loads[rank] += param.numel()
-    max_load = max(rank_loads.values())
-    min_load = min(rank_loads.values()) if len(rank_loads) == world_size else 0
+    shard_size = mesh.size()
+    replicate_size = replicate_mesh.size() if replicate_mesh is not None else 1
+    total_slots = shard_size * replicate_size
+    rank_loads: dict[tuple[int, int], int] = defaultdict(int)
+    for param, coord in normalized.items():
+        rank_loads[coord] += param.numel()
+    loads_list = [
+        rank_loads.get((s, r), 0)
+        for s in range(shard_size)
+        for r in range(replicate_size)
+    ]
+    max_load = max(loads_list) if loads_list else 0
+    min_load = min(loads_list) if loads_list else 0
     imbalance = (max_load - min_load) / max(max_load, 1)
+    mode = "HSDP" if replicate_mesh is not None else "shard-only"
     logger.info(
-        f"dedicate_params: {len(assignment)} params assigned to {world_size} ranks, "
-        f"imbalance={imbalance:.1%}, "
-        f"loads={[rank_loads.get(r, 0) for r in range(world_size)]}"
+        f"dedicate_params[{mode}]: {len(normalized)} params over {total_slots} "
+        f"owner slots (shard={shard_size}, replicate={replicate_size}), "
+        f"imbalance={imbalance:.1%}, loads={loads_list}"
     )
 
     # 2. Mark parameters
-    for param, owner_rank in assignment.items():
-        param._dedicated_owner_rank = owner_rank
+    for param, coord in normalized.items():
+        param._dedicated_owner_rank = coord
 
     # 3. Create shared communication context
     dp_group = mesh.get_group()
+    replicate_group = replicate_mesh.get_group() if replicate_mesh is not None else None
     device_type = mesh.device_type
     device = torch.device(device_type, torch.cuda.current_device())
-    comm_ctx = DedicatedCommContext(device)
+    comm_ctx = DedicatedCommContext(device, replicate_group=replicate_group)
 
     # 4. Group by layer module and create DedicatedParam + DedicatedState
     layer_to_dparams: dict[nn.Module, list[DedicatedParam]] = defaultdict(list)
 
-    for param, owner_rank in assignment.items():
-        layer_module, parent_module, param_name = _find_layer_module(model, param)
+    for param, coord in normalized.items():
+        if hook_boundary_predicate is not None:
+            # User-explicit hook boundary: lowest ancestor where predicate holds.
+            # Mirrors FSDP2 `fully_shard(module, ...)` granularity — the user
+            # tells DMuon where the per-layer unit is, independent of DMuon's
+            # global LPT partition.
+            layer_module = _find_hook_module(
+                model, param, hook_boundary_predicate, strict=hook_boundary_strict
+            )
+            parent_module, param_name = _find_parent_module(model, param)
+        else:
+            # Default heuristic: infer layer module from `layers.N` / `blocks.N`
+            # in the FQN; fall back to parent module if neither matches.
+            layer_module, parent_module, param_name = _find_layer_module(model, param)
         d_param = DedicatedParam(
             param=param,
             module=parent_module,
             param_name=param_name,
-            owner_rank=owner_rank,
+            owner_rank=coord,
             dp_group=dp_group,
             device=device,
             compute_dtype=compute_dtype,
+            replicate_group=replicate_group,
         )
         layer_to_dparams[layer_module].append(d_param)
 

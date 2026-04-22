@@ -1,134 +1,246 @@
 # Quick Start
 
-This guide gets you from zero to a running distributed training with DMuon in 5 minutes.
+!!! tip "TL;DR"
+    Three setup lines: `dedicate_params` → `fully_shard` → `dmuon.Muon`.
+    Pick the tab below for your topology and paste into `train.py`.
+    Run in under 5 minutes.
 
-## Prerequisites
+---
 
-- DMuon installed ([Installation](installation.md))
-- 2+ GPUs available on a single node
+## Step 1 — Install
 
-## Minimal Training Script
+```bash
+git clone https://github.com/StarrickLiu/dmuon && cd dmuon
+pip install -e .
+```
 
-Create `train_minimal.py`:
+See [Installation](installation.md) for SYRK acceleration and requirements.
 
-```python
-"""Minimal DMuon training example."""
+---
+
+## Step 2 — Choose your topology
+
+All three variants use the same model definition:
+
+```python title="model.py (shared across tabs)"
 import torch
-import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import fully_shard
-
-import dmuon  # (1)!
 
 
-# Simple model
 class TinyMLP(nn.Module):
-    def __init__(self, d=512, ff=2048):
+    def __init__(self, d: int = 512, ff: int = 2048, n_layers: int = 4):
         super().__init__()
         self.layers = nn.ModuleList([
             nn.ModuleDict({
-                "gate_proj": nn.Linear(d, ff, bias=False),  # (2)!
-                "up_proj": nn.Linear(d, ff, bias=False),
+                "gate_proj": nn.Linear(d, ff, bias=False),
+                "up_proj":   nn.Linear(d, ff, bias=False),
                 "down_proj": nn.Linear(ff, d, bias=False),
-                "ln": nn.LayerNorm(d),
+                "ln":        nn.LayerNorm(d),
             })
-            for _ in range(4)
+            for _ in range(n_layers)
         ])
         self.head = nn.Linear(d, 1, bias=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
             h = layer["ln"](x)
             x = x + layer["down_proj"](layer["gate_proj"](h) * layer["up_proj"](h))
         return self.head(x).sum()
-
-
-def main():
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    torch.cuda.set_device(rank)
-
-    mesh = init_device_mesh("cuda", (world_size,))
-
-    torch.manual_seed(42)
-    model = TinyMLP().cuda()
-
-    # --- DMuon setup (3 lines) ---
-    dmuon.dedicate_params(  # (3)!
-        model, mesh,
-        predicate=lambda n, p: "proj" in n and p.ndim == 2,
-    )
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh)  # (4)!
-    fully_shard(model, mesh=mesh)
-
-    optimizer = dmuon.Muon(  # (5)!
-        model, lr=0.02, momentum=0.95, ns_steps=5,
-        adamw_lr=1e-3,
-    )
-
-    # --- Training loop ---
-    for step in range(20):
-        optimizer.zero_grad()
-        x = torch.randn(4, 512, device="cuda")
-        loss = model(x)
-        loss.backward()
-        optimizer.step()
-
-        if rank == 0 and step % 5 == 0:
-            print(f"step {step:3d}  loss={loss.item():.4f}")
-
-    dist.destroy_process_group()
-    if rank == 0:
-        print("Done!")
-
-
-if __name__ == "__main__":
-    main()
 ```
 
-1. `import dmuon` auto-patches FSDP2 so that `fully_shard()` skips dedicated params.
-2. The `proj` layers are 2D matrix parameters — these will use Muon with Newton-Schulz. LayerNorm is 1D — it will use AdamW.
-3. Mark which parameters get dedicated ownership. The `predicate` selects 2D projection layers.
-4. Apply FSDP2 as usual. Dedicated params are automatically skipped.
-5. `dmuon.Muon` manages both parameter types: Newton-Schulz for dedicated params, AdamW for the rest.
+=== "Single Node — DDP-style (1D mesh, no fully_shard)"
 
-## Run It
+    Simplest setup: 1D mesh, dedicated ownership only, no FSDP2 sharding.
+    Good for quick sanity checks or models that fit in single-GPU memory.
 
-```bash
-torchrun --nproc_per_node=4 train_minimal.py
+    ```python title="train_ddp.py"
+    import torch
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    import dmuon
+    from model import TinyMLP
+
+    def main() -> None:
+        dist.init_process_group("nccl")
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+        torch.cuda.set_device(rank)
+
+        mesh = init_device_mesh("cuda", (world_size,))
+        torch.manual_seed(42)
+        model = TinyMLP().cuda()
+
+        dmuon.dedicate_params(
+            model, mesh,
+            predicate=lambda n, p: "proj" in n and p.ndim == 2,
+        )
+        optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, ns_steps=5,
+                               adamw_lr=1e-3)
+
+        for step in range(20):
+            optimizer.zero_grad()
+            loss = model(torch.randn(4, 512, device="cuda"))
+            loss.backward()
+            optimizer.step()
+            if rank == 0 and step % 5 == 0:
+                print(f"step {step:3d}  loss={loss.item():.4f}")
+
+        dist.destroy_process_group()
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+=== "Single Node — FSDP2 (default Z3 mode)"
+
+    Adds `fully_shard` on top. Non-Muon params (LayerNorm) use FSDP2
+    ZeRO-3. Dedicated params are auto-skipped by the `import dmuon`
+    monkey-patch.
+
+    ```python title="train_fsdp2.py"
+    import torch
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+    import dmuon
+    from model import TinyMLP
+
+    def main() -> None:
+        dist.init_process_group("nccl")
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+        torch.cuda.set_device(rank)
+
+        mesh = init_device_mesh("cuda", (world_size,))
+        torch.manual_seed(42)
+        model = TinyMLP().cuda()
+
+        # dedicate_params BEFORE fully_shard — order matters
+        dmuon.dedicate_params(
+            model, mesh,
+            predicate=lambda n, p: "proj" in n and p.ndim == 2,
+        )
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+
+        optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, ns_steps=5,
+                               adamw_lr=1e-3)
+
+        for step in range(20):
+            optimizer.zero_grad()
+            loss = model(torch.randn(4, 512, device="cuda"))
+            loss.backward()
+            optimizer.step()
+            if rank == 0 and step % 5 == 0:
+                print(f"step {step:3d}  loss={loss.item():.4f}")
+
+        dist.destroy_process_group()
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+=== "Multi-Node — HSDP (2D mesh)"
+
+    Scale across nodes with a 2D `(replicate, shard)` mesh. Pass
+    `replicate_mesh` to enable two-stage reduce and async forward-hidden
+    broadcast. `replicate_async=True` is the default.
+
+    ```python title="train_hsdp.py"
+    import torch
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+    import dmuon
+    from model import TinyMLP
+
+    def main() -> None:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        local_rank = rank % torch.cuda.device_count()
+        torch.cuda.set_device(local_rank)
+
+        replicate_size = 2
+        shard_size = dist.get_world_size() // replicate_size
+        hsdp = init_device_mesh(
+            "cuda", (replicate_size, shard_size),
+            mesh_dim_names=("replicate", "shard"),
+        )
+        torch.manual_seed(42)
+        model = TinyMLP().cuda()
+
+        dmuon.dedicate_params(
+            model, hsdp["shard"],
+            predicate=lambda n, p: "proj" in n and p.ndim == 2,
+            replicate_mesh=hsdp["replicate"],
+        )
+        for layer in model.layers:
+            fully_shard(layer, mesh=hsdp)
+        fully_shard(model, mesh=hsdp)
+
+        optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, ns_steps=5,
+                               adamw_lr=1e-3, replicate_async=True)
+
+        for step in range(20):
+            optimizer.zero_grad()
+            loss = model(torch.randn(4, 512, device="cuda"))
+            loss.backward()
+            optimizer.step()
+            if rank == 0 and step % 5 == 0:
+                print(f"step {step:3d}  loss={loss.item():.4f}")
+
+        dist.destroy_process_group()
+
+    if __name__ == "__main__":
+        main()
+    ```
+
+---
+
+## Step 3 — Run it
+
+```bash title="Single node (8 GPUs)"
+torchrun --nproc_per_node=8 train_fsdp2.py
 ```
 
-Expected output:
+```bash title="Multi-node HSDP (2 nodes × 8 GPUs)"
+torchrun \
+  --nnodes=2 --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+  train_hsdp.py
+```
+
+Expected output (rank 0):
 
 ```
 step   0  loss=3.2145
 step   5  loss=1.0832
 step  10  loss=0.4217
 step  15  loss=0.1583
-Done!
 ```
 
-## What Just Happened?
+---
 
-In those 3 setup lines, DMuon did the following:
+## What just happened?
 
-1. **`dedicate_params()`** — Assigned each projection layer to an owner rank using balanced partition. The owner stores the full parameter; other ranks hold empty placeholders.
+1. **`dedicate_params()`** — Balanced LPT partition: each projection parameter
+   assigned to one owner rank. Owners store the full parameter; others hold
+   placeholders. Forward/backward hooks registered at layer level.
 
-2. **`fully_shard()`** — FSDP2 shards all *non-dedicated* parameters (LayerNorm) as usual. Dedicated params are skipped automatically.
+2. **`fully_shard()`** — FSDP2 sharded non-dedicated params (LayerNorm).
+   Dedicated params skipped automatically by the `import dmuon` monkey-patch.
 
-3. **`dmuon.Muon()`** — Created an optimizer that runs Newton-Schulz on each owner's dedicated params and AdamW on each rank's FSDP2 shards.
+3. **`dmuon.Muon()`** — Newton-Schulz on owned dedicated params; AdamW on
+   FSDP2-sharded params. No all-gather needed.
 
-During training, every forward/backward step:
+In HSDP mode, `replicate_mesh` enables two-stage reduce and async post-step
+broadcast. The training loop is otherwise unchanged.
 
-- **Forward**: Owner broadcasts full params to all ranks
-- **Backward**: Gradients are reduced back to the owner
-- **Step**: Owner runs Newton-Schulz on its params; all ranks run AdamW on their FSDP2 shards
+---
 
-No all-gather. No redundant NS compute.
+## See Also
 
-## Next
-
-To understand *why* this works and *how* it composes with FSDP2, read [Core Concepts](concepts.md).
+- [Core Concepts](concepts.md) — why dedicated ownership works
+- [HSDP Guide](../guides/hsdp.md) — 2D mesh, async mode, fallback
+- [Training Guide](../guides/training.md) — production workflow with all options
+- [API Reference](../reference/api.md) — complete signatures

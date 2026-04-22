@@ -1,0 +1,225 @@
+/* ============================================================
+   API Reference — Visual Improvements
+   ============================================================ */
+
+/* --- Class / Function headings --- */
+.doc-heading {
+  border-bottom: 2px solid var(--md-primary-fg-color);
+  padding-bottom: 0.3em;
+  margin-top: 2em !important;
+}
+
+/* --- Signature block: distinct background, auto-wrap --- */
+.doc-signature {
+  background: var(--md-code-bg-color);
+  border-left: 4px solid var(--md-primary-fg-color);
+  border-radius: 0 4px 4px 0;
+  padding: 0.6em 1em;
+  font-family: var(--md-code-font-family);
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: visible;
+  margin-bottom: 1em !important;
+}
+
+/* mkdocstrings renders signature inside a <code> block */
+.doc-signature code,
+.doc-signature pre {
+  white-space: pre-wrap !important;
+  word-break: break-all !important;
+  overflow-x: visible !important;
+}
+
+/* --- Labels (method / classmethod / property / attribute) --- */
+.doc-label {
+  display: inline-block;
+  padding: 0.15em 0.5em;
+  border-radius: 3px;
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  margin-right: 0.4em;
+  vertical-align: middle;
+}
+
+.doc-label-function    { background: #e3f2fd; color: #1565c0; }
+.doc-label-method      { background: #e8f5e9; color: #2e7d32; }
+.doc-label-classmethod { background: #fff3e0; color: #e65100; }
+.doc-label-staticmethod{ background: #f3e5f5; color: #6a1b9a; }
+.doc-label-property    { background: #fce4ec; color: #880e4f; }
+.doc-label-attribute   { background: #e8eaf6; color: #283593; }
+
+/* Dark mode label overrides */
+[data-md-color-scheme="slate"] .doc-label-function     { background: #1a3a5c; color: #90caf9; }
+[data-md-color-scheme="slate"] .doc-label-method       { background: #1b3a2a; color: #a5d6a7; }
+[data-md-color-scheme="slate"] .doc-label-classmethod  { background: #3e2000; color: #ffcc80; }
+[data-md-color-scheme="slate"] .doc-label-staticmethod { background: #2a0a3a; color: #ce93d8; }
+[data-md-color-scheme="slate"] .doc-label-property     { background: #3b0a1a; color: #f48fb1; }
+[data-md-color-scheme="slate"] .doc-label-attribute    { background: #1a1e4a; color: #9fa8da; }
+
+/* --- Parameters / Returns / Raises section titles --- */
+.doc-section-title {
+  font-size: 0.85em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--md-primary-fg-color);
+  border-bottom: 1px solid var(--md-primary-fg-color--light, #aaa);
+  margin-top: 1.2em;
+  margin-bottom: 0.4em;
+  padding-bottom: 0.2em;
+}
+
+/* --- Parameter name + type inline --- */
+.doc-contents dl > dt {
+  font-family: var(--md-code-font-family);
+  font-size: 0.85em;
+  background: var(--md-code-bg-color);
+  border-radius: 3px;
+  padding: 0.1em 0.4em;
+  display: inline-block;
+  margin-bottom: 0.2em;
+}
+
+.doc-contents dl > dd {
+  margin-left: 1.5em;
+  margin-bottom: 0.6em;
+  font-size: 0.9em;
+  color: var(--md-typeset-color);
+}
+
+/* --- Member separator --- */
+.doc-contents > .doc-object {
+  border-top: 1px dashed var(--md-default-fg-color--lightest, #ddd);
+  padding-top: 1em;
+  margin-top: 1em;
+}
+
+/* --- Source toggle button --- */
+.doc-contents details.doc-source > summary {
+  font-size: 0.78em;
+  color: var(--md-default-fg-color--light);
+  cursor: pointer;
+  list-style: none;
+  padding: 0.2em 0;
+  margin-top: 0.8em;
+}
+
+.doc-contents details.doc-source > summary::before {
+  content: "⟨ ";
+  font-family: var(--md-code-font-family);
+}
+
+.doc-contents details.doc-source > summary::after {
+  content: " ⟩";
+  font-family: var(--md-code-font-family);
+}
+
+/* --- Tighten spacing in API pages --- */
+.doc-contents p {
+  margin-bottom: 0.5em;
+}
+
+/* ============================================================
+   DMuon — Homepage hero block
+   ============================================================
+
+   Palette mirrors the logo:
+   - Deep slate (#1a2332) for background depth
+   - Silver-steel (#8892a6 → #b8c1cf) for the "D" ring analogue
+   - Cyan highlight (#00BCD4) for the "owner cell"
+*/
+
+.dmuon-hero {
+  background: linear-gradient(135deg, #1a2332 0%, #2d3b52 50%, #00838f 100%);
+  color: #ffffff;
+  padding: 2em;
+  border-radius: 8px;
+  margin-bottom: 1.5em;
+  border: 1px solid rgba(0, 188, 212, 0.25);
+}
+
+.dmuon-hero h1,
+.dmuon-hero h2,
+.dmuon-hero p {
+  color: #ffffff;
+}
+
+.dmuon-hero strong {
+  color: #4DD0E1;    /* cyan accent on highlighted words inside the hero */
+}
+
+/* Dark mode: deeper base, same cyan glow */
+[data-md-color-scheme="slate"] .dmuon-hero {
+  background: linear-gradient(135deg, #0d1520 0%, #1e2a3e 50%, #006064 100%);
+  border-color: rgba(0, 188, 212, 0.35);
+}
+
+/* ============================================================
+   DMuon — Inline badge tags ("HSDP native", "Z2/Z3", etc.)
+   ============================================================ */
+
+.dmuon-badge {
+  display: inline-block;
+  padding: 0.1em 0.55em;
+  border-radius: 4px;
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+  background: #e0f7fa;
+  color: #00838f;
+  border: 1px solid #80deea;
+  margin: 0 0.15em;
+}
+
+[data-md-color-scheme="slate"] .dmuon-badge {
+  background: #003b41;
+  color: #4DD0E1;
+  border-color: #00838f;
+}
+
+/* ============================================================
+   DMuon — Prose callout blocks
+   ============================================================ */
+
+/* Warning callout: amber-tinted left border */
+.dmuon-callout-warning {
+  border-left: 4px solid #FFB300;
+  background: #fff8e1;
+  border-radius: 0 4px 4px 0;
+  padding: 0.8em 1.2em;
+  margin: 1em 0;
+  font-size: 0.93em;
+}
+
+.dmuon-callout-warning p:last-child {
+  margin-bottom: 0;
+}
+
+[data-md-color-scheme="slate"] .dmuon-callout-warning {
+  background: #2a2000;
+  border-left-color: #FFB300;
+}
+
+/* Tip callout: cyan-tinted left border (matches logo highlight cell) */
+.dmuon-callout-tip {
+  border-left: 4px solid #00BCD4;
+  background: #e0f7fa;
+  border-radius: 0 4px 4px 0;
+  padding: 0.8em 1.2em;
+  margin: 1em 0;
+  font-size: 0.93em;
+}
+
+.dmuon-callout-tip p:last-child {
+  margin-bottom: 0;
+}
+
+[data-md-color-scheme="slate"] .dmuon-callout-tip {
+  background: #002226;
+  border-left-color: #4DD0E1;
+}

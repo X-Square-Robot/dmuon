@@ -1,6 +1,9 @@
 # Training Guide
 
-This guide walks through the complete DMuon training workflow: from model preparation to a running training loop.
+!!! tip "TL;DR"
+    1. Call `dmuon.dedicate_params(model, mesh, predicate=...)` **before** `fully_shard()` to assign matrix parameters to dedicated owners.
+    2. Wrap with standard FSDP2 `fully_shard()` — DMuon auto-skips dedicated params.
+    3. Use `dmuon.Muon(model, lr=0.02, adamw_lr=1e-3)` as the optimizer — it handles both Muon (dedicated) and AdamW (symmetric) params in one call.
 
 ---
 
@@ -216,8 +219,35 @@ print(f"Dedicated: {len(all_dp)} total, {len(owned_dp)} owned by this rank")
 print(f"Symmetric (FSDP2): {fsdp_count}")
 ```
 
-## Next
+## Scaling Out
 
+When you cross from single-node multi-GPU to **multi-node** training, switch from a 1D `init_device_mesh("cuda", (world_size,))` to a 2D HSDP mesh and pass the replicate dimension to `dedicate_params`. DMuon handles the two-stage grad reduce (shard → replicate) + async post-step broadcast automatically; everything else in the training loop is unchanged.
+
+```python
+hsdp = init_device_mesh(
+    "cuda", (replicate_size, shard_size),
+    mesh_dim_names=("replicate", "shard"),
+)
+dmuon.dedicate_params(
+    model, hsdp["shard"],
+    predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    replicate_mesh=hsdp["replicate"],   # ← the HSDP knob
+)
+for layer in model.layers:
+    fully_shard(layer, mesh=hsdp)
+fully_shard(model, mesh=hsdp)
+```
+
+See the dedicated [HSDP guide](hsdp.md) for the full API, sync vs async mode, the fallback protocol, and profiling.
+
+For the DMuon-Z2 vs DMuon-Z3 packed-buffer lifecycle choice applicable under both FSDP and HSDP, see [Z2 vs Z3 Modes](z2-z3-modes.md).
+
+## See also
+
+- [HSDP (Multi-Node)](hsdp.md) — 2D mesh training with async broadcast
+- [Custom Hook Boundaries](custom-hook-boundaries.md) — Control which module receives DMuon's forward/backward hooks
+- [Z2 vs Z3 Modes](z2-z3-modes.md) — Packed-buffer lifecycle and memory/comm tradeoff
+- [Profiling & Fallback](profiling-and-fallback.md) — Measure broadcast latency and tune the async fallback protocol
 - [Tensor Parallelism](tp-support.md) — Using DMuon with TP
 - [Checkpointing](checkpoint.md) — Save and load training state
 - [Gradient Accumulation](grad-accumulation.md) — Effective batch size scaling

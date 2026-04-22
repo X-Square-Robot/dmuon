@@ -1,6 +1,16 @@
 # Tensor Parallelism
 
-This guide covers how DMuon works with Tensor Parallelism (TP) and the different Newton-Schulz modes available for TP-sharded parameters.
+!!! tip "TL;DR"
+    Apply TP first (`parallelize_module`), then DMuon (`dedicate_params` on the DP mesh), then FSDP2 (`fully_shard` on the DP mesh). DMuon uses Gram Newton-Schulz to operate on TP-local shards with a single small all-reduce instead of gathering the full gradient matrix.
+
+---
+
+!!! warning "TP + HSDP combination status"
+    DMuon's TP support (Gram Newton-Schulz with TP SYRK decomposition) is
+    validated on **1D DP meshes** (pure FSDP, no HSDP replicate dim). 2D
+    HSDP x TP composition is not yet validated in our test matrix. If you
+    need both, start with FSDP+TP (single replicate row) and open an
+    issue.
 
 ---
 
@@ -190,3 +200,10 @@ gate_proj: local=(3584, 8192), full=(28672, 8192), shard_dim=0, tp_group=yes
 up_proj:   local=(3584, 8192), full=(28672, 8192), shard_dim=0, tp_group=yes
 down_proj: local=(8192, 3584), full=(8192, 28672), shard_dim=1, tp_group=yes
 ```
+
+## See also
+
+- [HSDP (Multi-Node)](hsdp.md) — 2D mesh setup; note HSDP x TP is not yet validated (see warning above)
+- [Custom Hook Boundaries](custom-hook-boundaries.md) — the `hook_boundary_predicate` can use `isinstance(m, TPWrappedModule)` to align hooks with TP-wrapped modules
+- [Training Guide](training.md) — full 1D training workflow (apply TP on top)
+- [API Reference](../reference/api.md) — `dedicate_params` signature including `hook_boundary_predicate`

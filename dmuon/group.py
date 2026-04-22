@@ -5,12 +5,14 @@ all_gather_stream / reduce_scatter_stream) and CUDA events for GPU-side
 synchronization instead of CPU-blocking work.wait().
 """
 
+import os
 from collections import defaultdict
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
 
+from ._owner_rank import OwnerCoord
 from .comm import DedicatedCommContext
 from .param import DedicatedParam
 
@@ -18,6 +20,47 @@ try:
     from torch.distributed.tensor import DTensor as _DTensor
 except ImportError:
     _DTensor = None
+
+
+class ReplicateReduceState(NamedTuple):
+    """State kept alive across the Stage-2 replicate reduce.
+
+    Mirrors FSDP2's ``AllReduceState`` (``_fsdp_param_group.py:115-117``): we
+    need to hold a reference to the input tensor + event until the end of
+    backward so the reduce stream's allocation is not freed while the NCCL
+    kernel is in flight.  ``wait_for_reduce`` consumes the event and
+    releases the tuple.
+    """
+
+    replicate_input: torch.Tensor
+    event: Optional[torch.cuda.Event]
+
+
+# Phase C.4 fallback tuning — see ``hsdp_native_phaseC_plan.md §8``.
+# Exposed at module scope so tests + users can tweak the thresholds without
+# monkey-patching inside the group object.
+REPLICATE_WAIT_THRESHOLD_US: float = 100.0
+REPLICATE_FALLBACK_CONSECUTIVE_STEPS: int = 3
+
+
+class ReplicateBroadcastState(NamedTuple):
+    """State kept alive across the async post-step replicate broadcast.
+
+    Phase C analogue of FSDP2's ``AllGatherState`` (``_fsdp_param_group.py:
+    105-107``): when the broadcast is dispatched on the default-priority
+    replicate stream and the caller returns, the input tensor allocation
+    could be freed before the NCCL kernel observes it.  Holding an owning
+    reference here prevents that, and the event gets consumed by the next
+    iteration's ``_pre_forward_wait`` hook — same cross-call event-chain
+    pattern FSDP2 uses (``_fsdp_param_group.py:358-362``).
+
+    The tuple carries just one ``_owned_data`` ref per group; all params in
+    the group participate in the same ``dist._coalescing_manager`` batch,
+    so a single ref suffices to pin the allocator arena the kernel reads.
+    """
+
+    replicate_input: torch.Tensor
+    event: torch.cuda.Event
 
 
 class DedicatedParamGroup:
@@ -33,16 +76,66 @@ class DedicatedParamGroup:
         self.device = params[0].device if params else torch.device("cuda")
 
         # Pre-group by owner so packed broadcasts / reduces can coalesce
-        # all of an owner's params into a single NCCL call.
-        self._by_owner: dict[int, list[DedicatedParam]] = defaultdict(list)
+        # all of an owner's params into a single NCCL call.  Phase A extends
+        # the key from a 1D shard rank to a 2D ``(shard, replicate)`` coord;
+        # in shard-only mode every entry has replicate=0 so the grouping
+        # collapses back to the previous 1D buckets.
+        self._by_owner: dict[OwnerCoord, list[DedicatedParam]] = defaultdict(list)
         for p in params:
             self._by_owner[p.owner_rank].append(p)
 
+        # Two independent gradient-reduce gates (mirrors FSDP2's
+        # ``reduce_grads`` + ``all_reduce_grads`` pair, see
+        # ``_fsdp_param_group.py:185-189``).  ``reduce_grads_enabled`` skips
+        # the entire pipeline (used by DMuon's ``no_sync`` ctx manager);
+        # ``replicate_grads_enabled`` only skips the Stage-2 replicate reduce
+        # while still performing the Stage-1 shard reduce — enabling HSDP
+        # grad-accumulation semantics where a partial accumulator is held
+        # across micro-batches.
         self.reduce_grads_enabled: bool = True
+        self.replicate_grads_enabled: bool = True
 
-        # Event-based synchronization (replaces work.wait())
+        # Event-based synchronization (replaces work.wait()).  ``_post_reduce_event``
+        # marks the end of the reduce pipeline — shard-only in Phase A, shard+replicate
+        # in Phase B (mirrors FSDP2's ``_post_reduce_event``; see
+        # ``_fsdp_param_group.py:213``).  ``_replicate_reduce_state`` keeps the
+        # Stage-2 input + event alive until ``wait_for_reduce`` runs, mirroring
+        # ``AllReduceState`` in ``_fsdp_param_group.py:115-117``.
         self._broadcast_event: Optional[torch.cuda.Event] = None
-        self._reduce_event: Optional[torch.cuda.Event] = None
+        self._post_reduce_event: Optional[torch.cuda.Event] = None
+        self._replicate_reduce_state: Optional[ReplicateReduceState] = None
+        # Phase B.2 / C.1: replicate-dim post-step broadcast state.
+        #
+        # Two event/state fields coexist — they correspond to two code paths:
+        #   * ``_replicate_broadcast_event`` (bare event): used by the
+        #     Phase B sync variant ``replicate_broadcast_sync`` /
+        #     ``wait_for_replicate_broadcast``.  Caller dispatches and
+        #     immediately waits, so a single event suffices.
+        #   * ``_replicate_broadcast_state`` (NamedTuple): used by the
+        #     Phase C async variant.  The event lives until the next
+        #     iteration's ``_pre_forward_wait`` consumes it, and the
+        #     tuple also pins the ``_owned_data`` ref — mirrors FSDP2's
+        #     ``AllGatherState`` (``_fsdp_param_group.py:105-107``).
+        self._replicate_broadcast_event: Optional[torch.cuda.Event] = None
+        self._replicate_broadcast_state: Optional[ReplicateBroadcastState] = None
+        # Per-group sync fallback flag.  Flipped by the Phase C.4 fallback
+        # monitor after N consecutive slow waits; once set, all subsequent
+        # async dispatches short-circuit to the Phase B sync path.  Reset
+        # only by user code via ``reset_replicate_fallback()``.
+        self._replicate_sync_fallback: bool = False
+        # Last observed wait blocked-time on the default stream, set by
+        # the Phase C.4/C.7 profile path.  0.0 means "no timing in the
+        # last iteration" (profiler disabled or not yet consumed).
+        self._last_replicate_wait_us: float = 0.0
+        # Fallback state machine — count of consecutive slow waits.
+        self._replicate_slow_wait_count: int = 0
+
+        # Partial accumulator across ``no_sync`` micro-batches (per-param, on
+        # the shard-owner rank).  Set during grad-accum when
+        # ``replicate_grads_enabled`` is False; flushed into the next Stage-2
+        # reduce when the gate flips back.  Mirrors FSDP2's
+        # ``_partial_reduce_output`` (``_fsdp_param_group.py:220``).
+        self._partial_reduce_by_param: dict[int, torch.Tensor] = {}
 
         # Deferred reduce unpack (fixes data race in old _packed_reduce)
         self._pending_reduce: list[tuple[Optional[torch.Tensor], list[DedicatedParam]]] = []
@@ -75,16 +168,17 @@ class DedicatedParamGroup:
         self._comm_dtype: Optional[torch.dtype] = (
             (params[0]._compute_dtype or params[0]._orig_dtype) if params else None
         )
-        # Map {owner_rank → global rank} for all owners represented in params.
-        # Phase 2 iterates params directly (no _by_owner grouping) but still
-        # needs the global-rank lookup for dist.reduce(dst=...).
-        self._total_numel_by_owner: dict[int, int] = {
+        # Map {owner_coord → global rank} for all owners represented in params.
+        # ``dist.get_global_rank`` is always called with the shard coordinate:
+        # ``dp_group`` is the shard group (in Phase B the replicate coord is
+        # handled separately via ``replicate_group``).
+        self._total_numel_by_owner: dict[OwnerCoord, int] = {
             owner: sum(p.numel for p in owner_params)
             for owner, owner_params in self._by_owner.items()
         }
         if self._dp_group is not None:
-            self._global_owner_ranks: dict[int, int] = {
-                owner: dist.get_global_rank(self._dp_group, owner)
+            self._global_owner_ranks: dict[OwnerCoord, int] = {
+                owner: dist.get_global_rank(self._dp_group, owner[0])
                 for owner in self._by_owner
             }
         else:
@@ -104,8 +198,8 @@ class DedicatedParamGroup:
         # calls. dst views survive ``free_storage`` → ``alloc_storage`` because
         # they share the packed buf's Storage object (resize is in-place).
         from ._internal_utils import free_storage
-        self._packed_buf_by_owner: dict[int, torch.Tensor] = {}
-        self._copy_in_dsts_by_owner: dict[int, list[torch.Tensor]] = {}
+        self._packed_buf_by_owner: dict[OwnerCoord, torch.Tensor] = {}
+        self._copy_in_dsts_by_owner: dict[OwnerCoord, list[torch.Tensor]] = {}
         if self._comm_dtype is not None:
             for owner, total_numel in self._total_numel_by_owner.items():
                 packed = torch.empty(total_numel, dtype=self._comm_dtype, device=self.device)
@@ -132,7 +226,15 @@ class DedicatedParamGroup:
         fills from its ``_owned_data``, one NCCL broadcast per owner (all
         coalesced into a single NCCL kernel) distributes the data. No
         scatter — views automatically see the storage.
+
+        Phase C: even though ``_pre_forward`` already called
+        ``_pre_forward_wait``, this method can also be entered through
+        backward prefetch (``_backward_prefetch``), pre-backward, or
+        forward-prefetch from an outer layer.  We therefore defensively
+        consume any still-pending async replicate broadcast here too so
+        the copy-in below always reads fresh ``_owned_data``.
         """
+        self._pre_forward_wait()
         if self._is_unsharded:
             return  # still unsharded from forward (reshard_after_forward=False)
         if self._broadcast_event is not None:
@@ -143,36 +245,43 @@ class DedicatedParamGroup:
 
         from ._internal_utils import alloc_storage
         dp_group = self._dp_group
-        local_rank = dp_group.rank()
+        local_shard_rank = dp_group.rank()
         with torch.cuda.stream(broadcast_stream):
             # Alloc + owner copy-in BEFORE coalescing: these ops execute
             # immediately on broadcast_stream. Wrapped in no_grad +
             # preserve_version_counter so autograd doesn't see the resize /
             # copy_ as an inplace modification of tensors in the compute graph.
-            for owner_rank, packed_buf in self._packed_buf_by_owner.items():
+            for owner_coord, packed_buf in self._packed_buf_by_owner.items():
                 with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
                     packed_buf
                 ):
                     alloc_storage(packed_buf)
 
-            # Phase 3: batch owner copy-in with torch._foreach_copy_.
-            # Only the owner rank for a given owner_rank has non-empty
-            # _owned_data; other ranks skip.
-            if local_rank in self._copy_in_dsts_by_owner:
-                dsts = self._copy_in_dsts_by_owner[local_rank]
+            # Phase 3 / B: batch owner copy-in with torch._foreach_copy_.
+            # The shard-dim broadcast runs independently inside each replicate
+            # row's shard_group, so the sender for a given owner_coord is
+            # whichever rank in this row matches ``owner_shard`` — regardless
+            # of ``owner_replicate``.  We therefore copy-in every packed
+            # buffer whose ``owner_shard`` matches this rank's shard index;
+            # that includes the global owner (``owner_coord == my coord``) and
+            # every replicate-row peer that shares the same shard column.
+            for owner_coord, dsts in self._copy_in_dsts_by_owner.items():
+                if owner_coord[0] != local_shard_rank:
+                    continue
                 srcs = [
-                    p._owned_data.view(-1) for p in self._by_owner[local_rank]
+                    p._owned_data.view(-1)
+                    for p in self._by_owner[owner_coord]
                 ]
                 with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
-                    self._packed_buf_by_owner[local_rank]
+                    self._packed_buf_by_owner[owner_coord]
                 ):
                     torch._foreach_copy_(dsts, srcs)
 
             with dist._coalescing_manager(group=dp_group, device=self.device):
-                for owner_rank, packed_buf in self._packed_buf_by_owner.items():
+                for owner_coord, packed_buf in self._packed_buf_by_owner.items():
                     dist.broadcast(
                         packed_buf,
-                        src=self._global_owner_ranks[owner_rank],
+                        src=self._global_owner_ranks[owner_coord],
                         group=dp_group,
                     )
 
@@ -204,7 +313,18 @@ class DedicatedParamGroup:
         Detaching happens first (restores placeholders) so any forward after
         reshard sees a clear no-op tensor rather than a view into 0-sized
         storage.
+
+        If a broadcast was dispatched (e.g. via forward prefetch) but never
+        consumed by a ``wait_for_unshard``, we must drain that event *before*
+        freeing the packed buffer storage — otherwise (1) freeing mid-broadcast
+        is UB, and (2) the stale event persists to the next step, causing
+        ``unshard()`` to short-circuit on the ``_broadcast_event is not None``
+        guard and leaving ``_unsharded_param`` views pointing at freed storage.
         """
+        if self._broadcast_event is not None:
+            # Drain and discard — the prefetched unshard was not consumed.
+            torch.cuda.current_stream().wait_event(self._broadcast_event)
+            self._broadcast_event = None
         for p in self.params:
             p.reshard()
         from ._internal_utils import free_storage
@@ -218,13 +338,30 @@ class DedicatedParamGroup:
     # ---- gradient reduction — dispatch phase ----
 
     def reduce_grads(self):
-        """Dispatch gradient reduces on reduce_stream. Does NOT wait.
+        """Dispatch gradient reduces. Stage-1 on the shard (``dp_group``) dim,
+        and — when HSDP is enabled and ``replicate_grads_enabled`` — Stage-2
+        on the replicate dim.  Does NOT wait; call :meth:`wait_for_reduce`
+        to synchronize.
 
-        Call wait_for_reduce() to synchronize and unpack gradients on owner.
+        Stream scheduling follows FSDP2's ``foreach_reduce`` pattern
+        (``_fsdp_collectives.py:555-588``):
 
-        When ``reduce_grads_enabled`` is False (no_sync mode), gradients are
-        accumulated locally on every rank without communication. The accumulated
-        gradients are merged into the next sync reduce automatically.
+        1. Stage-1 reduce runs on ``reduce_stream``;
+        2. When Stage-2 applies, ``replicate_broadcast_stream`` waits on
+           ``reduce_stream`` via ``wait_stream``, then dispatches the
+           replicate reduce on itself;
+        3. ``_post_reduce_event`` is recorded on whichever stream is the
+           pipeline's tail, so a single event wait covers both stages.
+
+        Gate semantics (mirrors FSDP2's two bool gates at
+        ``_fsdp_param_group.py:185-189``):
+
+        * ``reduce_grads_enabled=False``: full ``no_sync`` — accumulate grads
+          locally on every rank without any collective.
+        * ``reduce_grads_enabled=True, replicate_grads_enabled=False``:
+          Stage-1 runs to average across the shard peers and produce a
+          per-shard-owner partial; this partial is stored in
+          ``_partial_reduce_by_param[id(p)]`` until the gate flips back.
         """
         if not self.reduce_grads_enabled:
             # no_sync: accumulate full gradients locally (no communication)
@@ -243,8 +380,9 @@ class DedicatedParamGroup:
 
         # Flush any pending reduce from a previous backward (gradient accumulation
         # without optimizer.step). This ensures _reduced_grad is accumulated before
-        # we dispatch a new reduce that would overwrite _pending_reduce/_reduce_event.
-        if self._reduce_event is not None:
+        # we dispatch a new reduce that would overwrite _pending_reduce/
+        # _post_reduce_event.
+        if self._post_reduce_event is not None or self._replicate_reduce_state is not None:
             self.wait_for_reduce()
 
         # Merge any accumulated gradients from prior no_sync steps
@@ -260,17 +398,25 @@ class DedicatedParamGroup:
                 p._accumulated_grad = None
 
         reduce_stream = self.comm_ctx.reduce_stream
+        replicate_stream = self.comm_ctx.replicate_broadcast_stream
+        replicate_group = self.comm_ctx.replicate_group
+        has_replicate = replicate_group is not None and self.replicate_grads_enabled
+
         # Ensure gradients are computed before reduce_stream reads them
         reduce_stream.wait_stream(torch.cuda.current_stream())
 
         self._pending_reduce = []
+        # ``_stage2_pending``: per-(grad_buf, param) records; only shard-owner
+        # ranks populate this list.  Consumed on the replicate stream below.
+        stage2_pending: list[tuple[torch.Tensor, DedicatedParam]] = []
         dp_group = self._dp_group
+        my_shard_rank = dp_group.rank()
+
+        # Stage 1 — shard reduce.  Coalesce all reduces into a single fused
+        # NCCL kernel.  Grad tensor refs are saved on ``_pending_reduce`` so
+        # that ``reshard()`` freeing ``_unsharded_param``'s storage does not
+        # dangle the post-reduce view.
         with torch.cuda.stream(reduce_stream):
-            # Coalesce all reduces into a single fused NCCL kernel.
-            # Phase 2 removed _packed_reduce — each param reduces its own grad
-            # in-place, coalescing_manager fuses them into one NCCL call.
-            # We save the grad tensor ref here because reshard() will free
-            # _unsharded_param's storage before wait_for_reduce() can unpack.
             with dist._coalescing_manager(group=dp_group, device=self.device):
                 for p in self.params:
                     if not p._is_unsharded or p._unsharded_param.grad is None:
@@ -285,28 +431,93 @@ class DedicatedParamGroup:
                     )
                     p._unsharded_param.grad = None
                     self._pending_reduce.append((grad.view(-1), [p]))
+                    # Only the shard-owner rank holds the post-Stage-1 grad
+                    # and therefore participates in Stage-2.
+                    if has_replicate and my_shard_rank == p.owner_shard:
+                        stage2_pending.append((grad, p))
 
-        self._reduce_event = reduce_stream.record_event()
+        stage1_event = reduce_stream.record_event()
+
+        # Stage 2 — replicate reduce.  Only shard-owner ranks dispatch; the
+        # non-shard-owner grads are already "garbage" after Stage 1 (undefined
+        # per NCCL spec).  The pipeline's tail event is recorded on whichever
+        # stream ran last.
+        if has_replicate and stage2_pending:
+            replicate_stream.wait_stream(reduce_stream)
+            with torch.cuda.stream(replicate_stream):
+                # Accumulator flush: if a prior micro-batch ran with
+                # ``replicate_grads_enabled=False``, this param's shard-only
+                # partial is living in ``_partial_reduce_by_param``.  Fold it
+                # into the Stage-1 output before the Stage-2 reduce.
+                for grad, p in stage2_pending:
+                    partial = self._partial_reduce_by_param.pop(id(p), None)
+                    if partial is not None:
+                        grad.add_(partial)
+                with dist._coalescing_manager(
+                    group=replicate_group, device=self.device
+                ):
+                    for grad, p in stage2_pending:
+                        dist.reduce(
+                            grad,
+                            dst=p._owner_replicate_global_rank,
+                            op=dist.ReduceOp.AVG,
+                            group=replicate_group,
+                        )
+            stage2_event = replicate_stream.record_event()
+            # Keep the Stage-1 tensor + Stage-2 event alive until
+            # ``wait_for_reduce`` runs — mirrors FSDP2 AllReduceState.
+            self._replicate_reduce_state = ReplicateReduceState(
+                replicate_input=stage2_pending[0][0],
+                event=stage2_event,
+            )
+            self._post_reduce_event = stage2_event
+        elif has_replicate and not self.replicate_grads_enabled:
+            # Replicate side is gated off: save Stage-1 output as partial
+            # accumulator (shard-owner only; others drop their undefined grad).
+            for grad, plist in self._pending_reduce:
+                p = plist[0]
+                if my_shard_rank != p.owner_shard:
+                    continue
+                existing = self._partial_reduce_by_param.get(id(p))
+                if existing is not None:
+                    existing.add_(grad.view(p._orig_size))
+                else:
+                    self._partial_reduce_by_param[id(p)] = grad.view(p._orig_size).clone()
+            self._post_reduce_event = stage1_event
+        else:
+            self._post_reduce_event = stage1_event
 
     def wait_for_reduce(self):
         """GPU-side wait for reduces to complete, then save owner grad.
 
-        Each ``_pending_reduce`` entry is ``(grad_tensor_ref, [param])``. The
-        reduce was in-place on grad_tensor_ref, which was saved during
-        ``reduce_grads`` before ``reshard()`` freed the storage. On owner
-        rank, the grad_tensor_ref now holds the averaged grad — copy it
-        into ``_reduced_grad`` for the optimizer step.
+        Mirrors FSDP2's ``_wait_for_post_backward`` (``_fsdp_param_group.py:
+        621-630``): first wait the tail event of the reduce pipeline, then
+        wait the Stage-2 ``ReplicateReduceState`` event if present (both are
+        the same event in Phase B, but the dual-wait keeps the control flow
+        ready for the Phase C async-broadcast extension).
+
+        After the wait, only the **global owner** has a meaningful grad —
+        ``is_owner`` already encodes both shard and replicate dimensions.
         """
-        if self._reduce_event is None:
+        if self._post_reduce_event is None and self._replicate_reduce_state is None:
             return
 
-        torch.cuda.current_stream().wait_event(self._reduce_event)
+        current_stream = torch.cuda.current_stream()
+        if self._post_reduce_event is not None:
+            current_stream.wait_event(self._post_reduce_event)
+            self._post_reduce_event = None
+        if (
+            self._replicate_reduce_state is not None
+            and self._replicate_reduce_state.event is not None
+        ):
+            current_stream.wait_event(self._replicate_reduce_state.event)
+        self._replicate_reduce_state = None
 
         for grad_buf, plist in self._pending_reduce:
             if grad_buf is None:
                 continue
             p = plist[0]
-            if self._dp_group.rank() != p.owner_rank:
+            if not p.is_owner:
                 continue
             new_grad = grad_buf.view(p._orig_size)
             if p._reduced_grad is not None:
@@ -314,8 +525,213 @@ class DedicatedParamGroup:
             else:
                 p._reduced_grad = new_grad.clone()
 
-        self._reduce_event = None
         self._pending_reduce = []
+
+    # ---- replicate-dim post-step broadcast (Phase B.2) -------------------
+
+    def replicate_broadcast_sync(self):
+        """Dispatch the replicate-axis broadcast after ``optimizer.step()``.
+
+        In HSDP mode the global owner (the rank whose ``(shard, replicate)``
+        coord matches ``owner_rank``) has just written the updated parameter
+        into its ``_owned_data``.  This method fans that buffer out to the
+        other ranks in the same shard column via ``replicate_group``, so
+        every shard-owner rank ends the iteration with a consistent
+        ``_owned_data`` ready for the next shard-dim broadcast.
+
+        **Sync, not async.**  Phase B keeps the broadcast synchronous
+        (caller pairs each dispatch with ``wait_for_replicate_broadcast``
+        before the next training iteration); Phase C will introduce the
+        async variant that hides the IB transfer inside forward.
+
+        No-op when ``replicate_group`` is None (pure 1D shard-only).
+        """
+        replicate_group = self.comm_ctx.replicate_group
+        if replicate_group is None:
+            return
+
+        my_shard_rank = self._dp_group.rank()
+        # Only ranks in some owner's shard column actually participate.  If
+        # this rank is not in any owner's shard column for this group, skip
+        # entirely — avoids dispatching an empty coalescing manager.
+        if not any(my_shard_rank == p.owner_shard for p in self.params):
+            return
+
+        bcast_stream = self.comm_ctx.replicate_broadcast_stream
+        bcast_stream.wait_stream(torch.cuda.current_stream())
+
+        with torch.cuda.stream(bcast_stream):
+            with dist._coalescing_manager(
+                group=replicate_group, device=self.device
+            ):
+                for p in self.params:
+                    if my_shard_rank != p.owner_shard:
+                        continue
+                    # ``_owned_data`` is allocated on every shard-peer of
+                    # the owner (see ``DedicatedParam.__init__``); the
+                    # global owner sends, the R-1 replicate peers receive
+                    # into the same tensor.
+                    dist.broadcast(
+                        p._owned_data,
+                        src=p._owner_replicate_global_rank,
+                        group=replicate_group,
+                    )
+
+        self._replicate_broadcast_event = bcast_stream.record_event()
+
+    def wait_for_replicate_broadcast(self):
+        """Block current stream until the post-step replicate broadcast is
+        visible.  Must be called before the next shard-dim ``unshard()`` so
+        the updated ``_owned_data`` is safe to read.
+        """
+        if self._replicate_broadcast_event is None:
+            return
+        torch.cuda.current_stream().wait_event(self._replicate_broadcast_event)
+        self._replicate_broadcast_event = None
+
+    # ---- replicate-dim post-step broadcast (Phase C.1 async) -------------
+
+    def replicate_broadcast_async(self) -> None:
+        """Dispatch the replicate-axis broadcast asynchronously.
+
+        The event is stored on :attr:`_replicate_broadcast_state` and
+        consumed later by :meth:`_pre_forward_wait` (Phase C.3) in the next
+        iteration.  Hiding target: the forward compute of *prior* layers
+        that do not depend on this group's ``_owned_data``.
+
+        Gate semantics:
+            - ``replicate_group is None`` → no-op (1D shard-only mode).
+            - ``_replicate_sync_fallback=True`` → degrade to the Phase B
+              sync path; caller observes no pending state after return.
+            - Double dispatch (calling while a state is still PENDING) is
+              a programming error — detected by the
+              ``test_async_wait_semantics`` smoke (C.0).
+
+        The wait point MUST be before ``unshard()``'s copy-in reads
+        ``_owned_data``; checkpoint save paths must also drain pending
+        state via :func:`dmuon.utils.wait_all_replicate_broadcasts`.
+        """
+        replicate_group = self.comm_ctx.replicate_group
+        if replicate_group is None:
+            return
+
+        # Fallback path: sync dispatch + wait inline.  State stays IDLE.
+        if self._replicate_sync_fallback:
+            self.replicate_broadcast_sync()
+            self.wait_for_replicate_broadcast()
+            return
+
+        if self._replicate_broadcast_state is not None:
+            raise RuntimeError(
+                "replicate_broadcast_async: previous event still pending — "
+                "pre_forward_wait was not consumed before the next dispatch"
+            )
+
+        my_shard_rank = self._dp_group.rank()
+        if not any(my_shard_rank == p.owner_shard for p in self.params):
+            return
+
+        bcast_stream = self.comm_ctx.replicate_broadcast_stream
+        bcast_stream.wait_stream(torch.cuda.current_stream())
+
+        # Pick one ``_owned_data`` tensor to pin via the state tuple.  Any
+        # rank-participating param works; allocator arena is shared within
+        # the coalescing manager below.
+        pin_ref: Optional[torch.Tensor] = None
+        with torch.cuda.stream(bcast_stream):
+            with dist._coalescing_manager(
+                group=replicate_group, device=self.device
+            ):
+                for p in self.params:
+                    if my_shard_rank != p.owner_shard:
+                        continue
+                    if pin_ref is None:
+                        pin_ref = p._owned_data
+                    dist.broadcast(
+                        p._owned_data,
+                        src=p._owner_replicate_global_rank,
+                        group=replicate_group,
+                    )
+
+        event = bcast_stream.record_event()
+        assert pin_ref is not None  # guaranteed by the "any(...)" check above
+        self._replicate_broadcast_state = ReplicateBroadcastState(
+            replicate_input=pin_ref,
+            event=event,
+        )
+
+    def _pre_forward_wait(self) -> None:
+        """Phase C.3: consume any pending async replicate broadcast before
+        the shard-dim unshard's copy-in reads ``_owned_data``.
+
+        No-op when the state is IDLE (either 1D shard-only mode, or sync
+        fallback, or no prior async dispatch this iteration).
+
+        When :envvar:`DMUON_REPLICATE_PROFILE` is set (Phase C.4 / C.7),
+        the wait is bracketed by CUDA events with ``enable_timing=True``
+        and ``_last_replicate_wait_us`` is populated.  The timing path
+        forces a CPU sync on the current stream, so it costs one
+        round-trip per group per step and is NOT safe to leave on in
+        production; it is meant for fallback monitoring + profiling.
+        """
+        state = self._replicate_broadcast_state
+        if state is None:
+            return
+
+        profile_enabled = bool(int(os.environ.get("DMUON_REPLICATE_PROFILE", "0") or 0))
+        if profile_enabled:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            torch.cuda.current_stream().wait_event(state.event)
+            end.record()
+            # ``elapsed_time`` requires both events to be complete; the
+            # current-stream synchronize is the cheapest way to enforce it
+            # (only waits on the two timing events on the default stream).
+            end.synchronize()
+            self._last_replicate_wait_us = start.elapsed_time(end) * 1000.0  # ms→μs
+            from . import _replicate_profile
+            _replicate_profile.record_wait_from_group(
+                self, self._last_replicate_wait_us
+            )
+        else:
+            torch.cuda.current_stream().wait_event(state.event)
+
+        self._replicate_broadcast_state = None
+
+    # ---- Phase C.4 fallback monitor -------------------------------------
+
+    def _update_replicate_fallback(self) -> None:
+        """Read ``_last_replicate_wait_us`` (populated by the profile path
+        in :meth:`_pre_forward_wait`) and advance the fallback state
+        machine.
+
+        Trips ``_replicate_sync_fallback`` after
+        :data:`REPLICATE_FALLBACK_CONSECUTIVE_STEPS` consecutive waits
+        above :data:`REPLICATE_WAIT_THRESHOLD_US`.  Single-direction:
+        once tripped, stays tripped until
+        :meth:`reset_replicate_fallback` is called.
+        """
+        if self._replicate_sync_fallback:
+            return  # already degraded; nothing to do
+        if self._last_replicate_wait_us <= 0.0:
+            return  # no sample this step (profiler off or no dispatch)
+        if self._last_replicate_wait_us > REPLICATE_WAIT_THRESHOLD_US:
+            self._replicate_slow_wait_count += 1
+        else:
+            self._replicate_slow_wait_count = 0
+        if self._replicate_slow_wait_count >= REPLICATE_FALLBACK_CONSECUTIVE_STEPS:
+            self._replicate_sync_fallback = True
+        # Drain the sample so a step without fresh data does not re-use
+        # the last value.
+        self._last_replicate_wait_us = 0.0
+
+    def reset_replicate_fallback(self) -> None:
+        """Manually clear the fallback flag.  Intended for user code that
+        wants to re-enable async after fixing the slow-IB condition."""
+        self._replicate_sync_fallback = False
+        self._replicate_slow_wait_count = 0
+        self._last_replicate_wait_us = 0.0
 
     # ---- backward prefetch ----
 

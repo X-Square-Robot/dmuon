@@ -18,6 +18,9 @@ build/
 *.swp
 *.swo
 
+# Claude Code local config
+.claude/
+
 # Environment
 .env
 *.env

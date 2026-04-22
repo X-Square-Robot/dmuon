@@ -120,6 +120,11 @@ class DedicatedState:
         Also wraps an input tensor through _DedicatedPostBackward so that
         gradient reduce + reshard fires after this module's backward.
         """
+        # Phase C.3: consume any pending async replicate broadcast from
+        # the previous step BEFORE ``unshard`` reads ``_owned_data``.
+        # ``_pre_forward_wait`` is a no-op when the group is in IDLE
+        # state (1D mode, sync fallback, or already-consumed event).
+        self.group._pre_forward_wait()
         self.group.unshard()            # no-op if already unsharded or prefetched
         self.group.wait_for_unshard()   # no-op if already unsharded
         # Forward prefetch: dispatch next layer's unshard (no wait)
@@ -236,9 +241,12 @@ class DedicatedState:
             for k, obj in output.items():
                 if isinstance(obj, torch.Tensor) and obj.requires_grad:
                     wrapped = _DedicatedPreBackward.apply(self, obj)[0]
-                    new_out = dict(output)
-                    new_out[k] = wrapped
-                    return new_out
+                    # Mutate in place to preserve the concrete dict subclass
+                    # (e.g. HuggingFace ModelOutput, which provides attribute
+                    # access on top of dict). Building a new ``dict()`` loses
+                    # that — callers that do ``output.loss`` would break.
+                    output[k] = wrapped
+                    return output
         return output
 
 

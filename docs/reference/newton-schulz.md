@@ -1,80 +1,107 @@
 # Newton-Schulz Variants
 
-DMuon implements four Newton-Schulz variants, each optimized for different scenarios. This page explains the differences and when to use each.
+!!! tip "TL;DR"
+    DMuon ships two NS backends: **Gram-space** (`"gram"`, default) and
+    **direct-space** (`"direct"`).  Gram-space is faster (SYRK kernel, restart
+    mechanism, smaller intermediates) and is the right choice for all production
+    use.  Direct-space is the classic Muon/Moonlight formulation — useful for
+    baselines and small matrices.  Both accept custom `(a, b, c)` coefficient
+    sets (`POLAR_EXPRESS_COEFFICIENTS` default, `YOU_COEFFICIENTS` alternative).
 
 ---
 
 ## Overview
 
-| Function | Space | TP Support | SYRK Accel | Restarts | Use Case |
-|----------|-------|-----------|------------|----------|----------|
+| Function | Space | TP support | SYRK accel | Restarts | Use case |
+|---|---|---|---|---|---|
 | `newton_schulz()` | Gram | No (local) | Yes | Yes | **Default** — single-rank or DP-only |
 | `gram_newton_schulz()` | Gram | Yes | Yes | Yes | **TP params** — exact or block-diagonal |
-| `gram_newton_schulz_local()` | Gram | No (local) | Yes | Yes | Internal — same as `newton_schulz` |
-| `direct_newton_schulz()` | Direct | No | No | No | **Baseline** — classic Muon/Moonlight algorithm |
+| `NewtonSchulz("gram")` | Gram | Routing | Yes | Yes | Pass to `Muon(ns_backend=...)` |
+| `NewtonSchulz("direct")` | Direct | No | No | No | Baseline / ablation |
+| `direct_newton_schulz()` | Direct | No | No | No | Direct function call |
 
-## Gram-Space vs Direct-Space
+---
 
-### Direct-Space NS (Classic)
+## Direct-space NS (classic)
 
-The standard formulation from Muon/Moonlight. Iterates on the full (m, n) matrix:
+The standard formulation from Muon (Jordan et al., 2024) and Moonlight.
+Iterates on the full (m, n) matrix:
 
 $$
 X_{k+1} = a_k X_k + b_k (X_k X_k^T) X_k + c_k (X_k X_k^T)^2 X_k
 $$
 
+Properties:
+
 - Intermediate matrices are (m, n) — same size as the gradient
-- Simple, well-understood
-- Cannot exploit Gram matrix symmetry
+- No symmetry exploitation; general GEMM cost per step
+- No restart mechanism
+- Simple, well-understood, good for baseline comparison
 
-### Gram-Space NS (Dao-AILab)
+Use `NewtonSchulz("direct")` or call `direct_newton_schulz()` directly.
 
-Reformulated to iterate on the Gram matrix R = X @ X^T (size m x m when m < n):
+---
+
+## Gram-space NS (Dao-AILab)
+
+Reformulates NS to iterate on the Gram matrix $R = X X^T$ of size (m, m),
+adapted from [Dao-AILab/gram-newton-schulz](https://github.com/Dao-AILab/gram-newton-schulz):
 
 $$
 Z_k = b_k R_k + c_k R_k^2
 $$
 $$
-Q_{k+1} = Q_k Z_k + a_k Q_k \quad \text{(accumulate product)}
-$$
-$$
-R_{k+1} \text{ evolved from } R_k \text{ and } Z_k
+Q_{k+1} = Z_k Q_k + a_k Q_k \quad (\text{accumulated product})
 $$
 
-Final output: $X_{\text{out}} = Q \cdot X$
+$R$ is evolved from $R_k$ and $Z_k$ using the recurrence; at restart steps
+$Q$ is applied to $X$ and $R$ is recomputed from scratch.  Final output:
+$X_{\text{out}} = Q \cdot X$.
 
-**Advantages:**
+**Advantages over direct-space:**
 
-- Intermediate matrices are (m, m) when m < n — can be significantly smaller
-- R is symmetric → SYRK kernel saves 50% of tiles
-- Supports restarts for numerical stability
-- TP-compatible: R decomposes as sum of local Gram matrices
+- Intermediate matrices are (m, m); significantly smaller when m < n (typical
+  for wide projection layers)
+- $R$ is symmetric — the CuteDSL SYRK kernel saves ~50 % of tiles
+- Restart mechanism prevents numerical drift
+- $R$ decomposes as a sum of local Gram matrices — enables exact TP via all-reduce
 
-## Precision Pipeline
+---
 
-All variants use the same precision strategy:
+## Precision pipeline
 
-1. **fp32 normalization**: `X = G.float() / (G.norm() + eps)` — ensures accurate spectral norm
-2. **fp16 iteration**: `X = X.half()` — 10-bit mantissa for lower rounding error per step
+All variants use the same two-stage precision strategy:
+
+1. **fp32 normalization**: `X = G.float() / (G.norm() + eps)` — stabilizes the
+   spectral norm before iteration
+2. **fp16 iteration**: `X = X.half()` — 10-bit mantissa gives lower per-step
+   rounding error than bf16's 7-bit mantissa for values bounded near [0, 1]
 
 !!! info "Why fp16 over bf16?"
-    After normalization, values are bounded near [0, 1]. fp16's 10-bit mantissa gives better precision than bf16's 7-bit mantissa in this range. The reduced dynamic range of fp16 is not a concern since values are already normalized.
+    After normalization the values sit near [0, 1].  fp16's wider mantissa (10
+    bits) provides better precision in this range.  The reduced dynamic range of
+    fp16 is not a concern because the normalization step already bounds the
+    values.
 
-## Coefficient Sets
+---
 
-DMuon ships two coefficient sets, both providing 5 NS iterations:
+## Coefficient sets
 
-### POLAR_EXPRESS_COEFFICIENTS (Default)
+DMuon ships two coefficient sets, both providing 5 Newton-Schulz iterations.
 
-From the [Polar Express paper](https://arxiv.org/pdf/2505.16932), with a safety factor of 1.05:
+### POLAR_EXPRESS_COEFFICIENTS (default)
+
+From the Polar Express paper (arXiv:2505.16932), with a safety factor of 1.05
+applied to the raw coefficients:
 
 ```python
+# Approximate values after safety scaling
 POLAR_EXPRESS_COEFFICIENTS = [
-    (7.8926, -20.3805, 14.9388),
-    (3.9115, -2.5444, 0.4704),
-    (3.7607, -2.5120, 0.4762),
-    (3.1604, -2.1476, 0.4402),
-    (2.1911, -1.4409, 0.3614),
+    (7.893, -20.381, 14.939),
+    (3.912, -2.544,  0.470),
+    (3.761, -2.512,  0.476),
+    (3.160, -2.148,  0.440),
+    (2.191, -1.441,  0.361),
 ]
 ```
 
@@ -92,62 +119,134 @@ YOU_COEFFICIENTS = [
 ]
 ```
 
-To use a different coefficient set:
+### Using a custom coefficient set
 
 ```python
 import dmuon
 
-# Pass to individual NS calls
+# Override via NewtonSchulz object
+ns = dmuon.NewtonSchulz("gram", coefficients=dmuon.YOU_COEFFICIENTS)
+optimizer = dmuon.Muon(model, lr=0.02, ns_backend=ns)
+
+# Or pass directly to standalone NS functions
 update = dmuon.newton_schulz(G, coefficients=dmuon.YOU_COEFFICIENTS)
 ```
 
 !!! note
-    The Muon optimizer always uses `POLAR_EXPRESS_COEFFICIENTS` (default). Custom coefficients can be passed directly to NS functions for experimentation.
+    `Muon` uses `POLAR_EXPRESS_COEFFICIENTS` by default.  The You coefficients
+    are available for experiments where the original Muon formulation is desired.
 
-## Restart Mechanism
+---
 
-Gram-space NS includes a **restart** mechanism (from Dao-AILab): at specified iterations, the accumulated product Q is applied to X, and the Gram matrix R is recomputed from scratch.
+## Restart mechanism
 
-This prevents numerical drift from accumulating through the Gram evolution equations.
+Gram-space NS includes a **restart** mechanism adapted from
+Dao-AILab/gram-newton-schulz.  At specified iteration indices the accumulated
+product $Q$ is applied back to $X$ and the Gram matrix $R$ is recomputed from
+scratch, preventing numerical drift from the Gram evolution recurrence.
 
-Default restart position: iteration 2 (i.e., after steps 0 and 1, restart before step 2).
+Default restart position: `[2]` (restart after iterations 0 and 1, before
+iteration 2).
 
 ```python
-# Custom restarts
-update = dmuon.newton_schulz(G, restart_iterations=[2])  # default
-update = dmuon.newton_schulz(G, restart_iterations=[1, 3])  # more restarts
+import dmuon
+
+# Default restarts
+update = dmuon.newton_schulz(G, restart_iterations=[2])
+
+# More aggressive restarts
+ns = dmuon.NewtonSchulz("gram", restart_iterations=[1, 3])
 ```
 
-## SYRK Acceleration
+---
 
-The Gram matrix R = X @ X^T is symmetric. DMuon's CuteDSL SYRK kernel exploits this:
+## SYRK acceleration
 
-- Only computes the lower triangle of R
-- Mirrors the lower triangle to the upper triangle
-- Saves ~50% of tiles compared to a general GEMM
+The Gram matrix $R = X X^T$ is symmetric.  DMuon's CuteDSL SYRK kernel
+(adapted from [Dao-AILab/quack](https://github.com/Dao-AILab/quack)) exploits
+this:
 
-This applies to all Gram-space variants (`newton_schulz`, `gram_newton_schulz`, `gram_newton_schulz_local`). The direct-space variant does not benefit from SYRK.
+- Computes only the lower-triangular half of $R$
+- Mirrors the result to the upper triangle
+- Saves approximately 50 % of tiles vs. a general GEMM
+
+This applies to all Gram-space variants (`newton_schulz`, `gram_newton_schulz`).
+The direct-space variant does not use SYRK.
 
 Check the active backend:
 
 ```python
+import dmuon
+
 print(dmuon.get_ns_backend())
-# "syrk_sm80"  — CuteDSL SYRK kernel (SM80+)
-# "compiled"   — @torch.compile fallback (any GPU)
+# "syrk_sm80"  — CuteDSL SYRK kernel (SM80+, e.g. A100/H100)
+# "compiled"   — @torch.compile fallback (any CUDA GPU)
 ```
 
-## TP Routing Summary
+The SYRK kernel activates automatically on SM80+ GPUs when CuteDSL is
+available.  It falls back to `@torch.compile` PyTorch on other hardware.
 
-When the Muon optimizer encounters a TP-sharded parameter, it routes to the appropriate NS variant:
+### Deterministic mode
+
+The SYRK kernel may produce non-deterministic results across runs due to
+float accumulation order.  Force cuBLAS for exact reproducibility:
+
+```python
+ns = dmuon.NewtonSchulz(deterministic=True)
+optimizer = dmuon.Muon(model, ns_backend=ns)
+```
+
+!!! warning "SYRK B != A bug"
+    The CuteDSL SYRK kernel has a known non-determinism issue when `B != A`
+    (certain intermediate computations in the Gram recurrence).  The workaround
+    is `deterministic=True`, which routes all ops through cuBLAS at a ~1.5x
+    performance cost.  This is being tracked for a future kernel fix.
+
+---
+
+## TP routing summary
+
+When `Muon` encounters a TP-sharded parameter, it selects the NS path
+according to the following decision tree:
 
 ```
-TP param?
-├── No → newton_schulz() (local Gram NS)
+Is the param a DTensor with a TP group?
+├── No  → NewtonSchulz.local()  (standard Gram NS or direct, no comm)
 └── Yes
     ├── per_head_ns=True AND Shard(0) AND full_m < full_n
-    │   → newton_schulz() (per-head, zero TP comm)
+    │   → NewtonSchulz.local()   (per-head, zero TP comm)
     ├── block_diagonal_ns=True
-    │   → gram_newton_schulz(..., block_diagonal=True) (zero TP comm)
-    └── Otherwise
-        → gram_newton_schulz(..., shard_dim=dp.shard_dim) (exact, TP all-reduce)
+    │   → NewtonSchulz.tp(..., block_diagonal=True)   (zero TP comm)
+    └── Otherwise (default)
+        → NewtonSchulz.tp(..., shard_dim=dp.shard_dim)  (exact Gram, TP all-reduce)
 ```
+
+For **Shard(0)** (row-sharded): the iteration transposes to use $G^T G$, which
+decomposes exactly as $\sum_i G_i^T G_i$ — one all-reduce gives the exact Gram.
+For **Shard(1)** (col-sharded): uses $G G^T$, which decomposes as
+$\sum_i G_i G_i^T$.
+
+---
+
+## References and acknowledgments
+
+- **Gram Newton-Schulz** — Dao et al., 2026.  Blog post:
+  [dao-ailab.github.io/blog/2026/gram-newton-schulz/](https://dao-ailab.github.io/blog/2026/gram-newton-schulz/).
+  Source: [Dao-AILab/gram-newton-schulz](https://github.com/Dao-AILab/gram-newton-schulz).
+  DMuon's Gram NS logic, per-step coefficients, restart mechanism, and SYRK
+  symmetry optimization are adapted directly from this work.
+- **SYRK kernel** — adapted from [Dao-AILab/quack](https://github.com/Dao-AILab/quack)
+  by Tri Dao et al.
+- **Muon optimizer** — Jordan et al., arXiv:2502.16982, 2024.  Introduced the
+  momentum + Newton-Schulz orthogonalization formulation that DMuon extends.
+- **Polar Express coefficients** — arXiv:2505.16932.
+- **You coefficients** — [@YouJiacheng](https://x.com/YouJiacheng/status/1905861218138804534).
+
+---
+
+## See also
+
+- [API Reference](api.md)
+- [Communication Cost Analysis](communication-cost.md)
+- [Training guide](../guides/training.md)
+- [Tensor Parallelism](../guides/tp-support.md)
