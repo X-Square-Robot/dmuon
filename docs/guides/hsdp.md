@@ -59,6 +59,26 @@ In HSDP you have two axes:
 - **`shard`**: parameters are split across ranks along this axis within each replicate row (FSDP-ZeRO2/3 behaviour)
 - **`replicate`**: the shard layout is **replicated** across this axis — each replicate row is an independent full-model instance
 
+```mermaid
+graph LR
+  subgraph "Replicate row 0 (node 0)"
+    r0s0["rank 0<br/>shard=0"]
+    r0s1["rank 1<br/>shard=1"]
+    r0s2["rank 2<br/>shard=2"]
+    r0s3["rank 3<br/>shard=3"]
+  end
+  subgraph "Replicate row 1 (node 1)"
+    r1s0["rank 4<br/>shard=0"]
+    r1s1["rank 5<br/>shard=1"]
+    r1s2["rank 6<br/>shard=2"]
+    r1s3["rank 7<br/>shard=3"]
+  end
+  r0s0 -.->|replicate group<br/>inter-node IB| r1s0
+  r0s1 -.->|replicate group| r1s1
+  r0s2 -.->|replicate group| r1s2
+  r0s3 -.->|replicate group| r1s3
+```
+
 ```text
 Example: init_device_mesh("cuda", (2, 4), mesh_dim_names=("replicate", "shard"))
 
@@ -183,17 +203,48 @@ dmuon.set_optimizer_state_dict(model, optimizer, ckpt["optim"])
 
 ---
 
-## FSDP-ZeRO2 vs FSDP-ZeRO3 under HSDP
+## DMuon-Z2 vs DMuon-Z3 (packed-buffer lifecycle)
 
-HSDP can be layered on either FSDP-ZeRO2 (`reshard_after_forward=False`) or ZeRO-3 (`reshard_after_forward=True`, default). DMuon's primitive is invariant across these two modes — only the non-Muon parameters behave differently (param sharding vs full replication at fwd/bwd). Pick whichever FSDP2 mode your cluster's memory budget favours; DMuon composes with both.
+DMuon exposes the same memory-vs-comm tradeoff FSDP2 does, via its own `reshard_after_forward` kwarg on `dedicate_params()`. This controls whether the **Muon-target packed buffer** stays resident between forward and backward or is resharded (same idea as FSDP2's flag for non-Muon params, but applied to DMuon's own buffers).
+
+| Mode | `reshard_after_forward` | Behaviour | Muon-target bytes/step | Muon-target memory |
+|---|---|---|---|---|
+| **DMuon-Z2** | `False` | packed buf resident through fwd+bwd; backward reuses it | `2(N-1)/N · P_M` (comm-optimal) | P_M resident per shard rank |
+| **DMuon-Z3** | `True` (default) | packed buf freed after fwd; backward re-broadcasts from owner | `3(N-1)/N · P_M` | one layer's packed buf transient per rank |
 
 ```python
-# ZeRO-3 HSDP (default, tightest memory)
-fully_shard(layer, mesh=hsdp)
+# DMuon-Z3 (default) — recommended for large models (7B+), matches FSDP2 ZeRO-3 memory model
+dmuon.dedicate_params(
+    model, hsdp["shard"],
+    predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    replicate_mesh=hsdp["replicate"],
+)
 
-# ZeRO-2 HSDP (param replicated during fwd+bwd, grad sharded — saves two AGs per step)
-fully_shard(layer, mesh=hsdp, reshard_after_forward=False)
+# DMuon-Z2 — opt-in for small/medium models where comm dominates and packed bufs fit
+dmuon.dedicate_params(
+    model, hsdp["shard"],
+    predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    replicate_mesh=hsdp["replicate"],
+    reshard_after_forward=False,                # ← DMuon-Z2 mode
+)
 ```
+
+**Rule of thumb**: match DMuon's `reshard_after_forward` to FSDP2's `fully_shard(..., reshard_after_forward=...)` for consistent memory model across Muon and non-Muon params:
+
+```python
+# Fully ZeRO-3 (default, large models)
+dmuon.dedicate_params(model, hsdp["shard"], ..., replicate_mesh=hsdp["replicate"])
+for layer in model.layers:
+    fully_shard(layer, mesh=hsdp)                 # FSDP2 default = Z3
+
+# Fully ZeRO-2 (comm-optimal, small/medium models)
+dmuon.dedicate_params(model, hsdp["shard"], ..., replicate_mesh=hsdp["replicate"],
+                      reshard_after_forward=False)                             # DMuon-Z2
+for layer in model.layers:
+    fully_shard(layer, mesh=hsdp, reshard_after_forward=False)                 # FSDP2 Z2
+```
+
+Asymmetric combinations (DMuon-Z2 + FSDP2-Z3, or vice versa) are valid and occasionally optimal (e.g. Muon params are few but large → DMuon-Z2; non-Muon params are many and small → FSDP2-Z3), but add mental overhead. Start with the symmetric config.
 
 ---
 
@@ -213,9 +264,13 @@ fully_shard(layer, mesh=hsdp, reshard_after_forward=False)
 
 ---
 
-## See Also
+## See also
 
 - [Core Concepts](../getting-started/concepts.md) — how dedicated ownership composes with FSDP2
 - [Training Guide](training.md) — the full 1D-shard workflow (apply this first, then add the HSDP knobs above)
 - [Checkpointing](checkpoint.md) — state-dict semantics
+- [Custom Hook Boundaries](custom-hook-boundaries.md) — align DMuon hook boundaries with your model structure
+- [Z2 vs Z3 Modes](z2-z3-modes.md) — packed-buffer lifecycle and memory/comm tradeoff
+- [Profiling & Fallback](profiling-and-fallback.md) — detailed broadcast profiling and fallback tuning
+- [Integration Recipes](integration-recipes.md) — HuggingFace Trainer, torchtitan, and other framework hooks
 - [API Reference](../reference/api.md) — full `dedicate_params` and `Muon` signatures

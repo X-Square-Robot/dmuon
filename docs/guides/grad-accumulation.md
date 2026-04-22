@@ -1,6 +1,7 @@
 # Gradient Accumulation
 
-DMuon supports gradient accumulation via the `no_sync()` context manager, following the same pattern as FSDP2.
+!!! tip "TL;DR"
+    Wrap accumulation micro-batches with `dmuon.no_sync(model)` to suppress gradient communication on both dedicated and symmetric params. Call `optimizer.step()` + `optimizer.zero_grad()` only on the last micro-batch. Divide loss by `accum_steps` before `.backward()` so the accumulated gradient matches a single large-batch gradient.
 
 ---
 
@@ -84,3 +85,11 @@ for i, batch in enumerate(dataloader):
 
 !!! tip "Loss scaling"
     Divide the loss by `accum_steps` before `.backward()` so the accumulated gradient is equivalent to a single large-batch gradient.
+
+!!! note "DMuon-Z2 and gradient accumulation"
+    Note that `reshard_after_forward=False` (DMuon-Z2) interacts with gradient accumulation by keeping packed buffers resident across micro-batches — see [Z2 vs Z3 Modes](z2-z3-modes.md) for the memory implication.
+
+## See also
+
+- [Training Guide](training.md) — full DMuon training workflow
+- [Z2 vs Z3 Modes](z2-z3-modes.md) — packed-buffer lifecycle and its effect on memory during accumulation

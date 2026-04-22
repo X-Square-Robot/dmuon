@@ -23,6 +23,8 @@
   &nbsp;·&nbsp;
   🌐 <a href="https://starrickliu.github.io/dmuon/guides/hsdp/"><strong>HSDP Guide</strong></a>
   &nbsp;·&nbsp;
+  🏛️ <a href="https://starrickliu.github.io/dmuon/design/architecture/"><strong>Architecture</strong></a>
+  &nbsp;·&nbsp;
   🇨🇳 <a href="https://starrickliu.github.io/dmuon/zh/"><strong>中文文档</strong></a>
 </p>
 
@@ -140,6 +142,7 @@ What you get out of the box:
 
 - **Two-stage grad reduce** — `AVG` over shard, then `AVG` over replicate; total divisor = `G·R`, matching a single all-reduce over the world
 - **Async post-step broadcast** — updated `_owned_data` fans out to replicate peers on a dedicated stream; the wait is consumed per-layer in the next forward
+- **Z2 / Z3 packed-buffer lifecycle** — pass `reshard_after_forward=False` on `dedicate_params()` for **DMuon-Z2** (comm-optimal `2(N-1)/N · P_M` bytes/step, higher memory); default `True` gives **DMuon-Z3** (memory-efficient, matches FSDP2 ZeRO-3 convention). Mirrors `fully_shard(..., reshard_after_forward=...)` for non-Muon params — pick memory budget independently of the ownership primitive
 - **Auto-fallback** — a single-direction protocol degrades a group to sync if blocked-waits sustain > 100 μs (tunable); reset via `dmuon.reset_replicate_fallback(model)`
 - **Bit-identical** to sync baseline (validated on 4 GPU G=2 R=2) — safe to turn on by default
 - **Checkpoint-safe** — `get_model_state_dict` drains pending async state before reading
@@ -269,12 +272,12 @@ Full documentation is hosted on GitHub Pages: **[starrickliu.github.io/dmuon](ht
 <sub>How ownership works</sub>
 </td>
 <td width="25%" align="center">
-<a href="https://starrickliu.github.io/dmuon/reference/api/"><b>API Reference</b></a><br>
-<sub>Function signatures</sub>
+<a href="https://starrickliu.github.io/dmuon/design/architecture/"><b>Architecture</b></a><br>
+<sub>Three-way decoupling design</sub>
 </td>
 <td width="25%" align="center">
-<a href="https://starrickliu.github.io/dmuon/guides/tp-support/"><b>TP Support</b></a><br>
-<sub>Tensor Parallel + DMuon</sub>
+<a href="https://starrickliu.github.io/dmuon/reference/api/"><b>API Reference</b></a><br>
+<sub>Function signatures</sub>
 </td>
 <td width="25%" align="center">
 <a href="https://starrickliu.github.io/dmuon/zh/"><b>🇨🇳 中文文档</b></a><br>
@@ -298,13 +301,13 @@ Full documentation is hosted on GitHub Pages: **[starrickliu.github.io/dmuon](ht
 - [x] Prefetch pipeline (forward + backward)
 - [x] Gradient accumulation (default + `no_sync` context manager)
 - [x] State dict save/load (compatible with single-GPU, HuggingFace, and HSDP restart)
+- [x] **Full user documentation** — English + 中文; installation / quickstart / guides / design / API / FAQ / troubleshooting (v2 docs)
 
 ### In Progress
 
 - [ ] Convergence validation (loss curves vs AdamW vs Muon)
 - [ ] Naive Muon baselines (DDP / FSDP-ZeRO2 / FSDP-ZeRO3) for per-byte A/B traces
 - [ ] Multi-node scaling benchmarks (16-256 GPUs, Qwen2.5-7B/14B)
-- [ ] Training examples (`examples/train_hsdp.py`, `examples/train_llm.py`)
 
 ### Planned
 
@@ -319,12 +322,7 @@ See [TODO.md](TODO.md) for details.
 
 ## Acknowledgments
 
-The Gram Newton-Schulz iteration in DMuon is adapted from
-[Dao-AILab/gram-newton-schulz](https://github.com/Dao-AILab/gram-newton-schulz),
-including per-step coefficients, restart mechanism, and the SYRK symmetry optimization.
-
-The CuteDSL SYRK kernel is adapted from [quack](https://github.com/Dao-AILab/quack)
-by Tri Dao et al.
+DMuon's dedicated-ownership primitive builds on foundational work by [Rajbhandari et al., 2020 (ZeRO-1)](https://arxiv.org/abs/1910.02054) and [Shi et al., 2023 (Distributed Shampoo)](https://arxiv.org/abs/2309.06497). The Gram Newton-Schulz iteration is adapted from [Dao-AILab/gram-newton-schulz](https://github.com/Dao-AILab/gram-newton-schulz) and the [CuteDSL SYRK kernel from quack](https://github.com/Dao-AILab/quack) by Tri Dao et al. Concurrent work [Canzona (Wang et al., 2026)](https://arxiv.org/abs/2602.06079) explores a parallel extension of the same primitive within Megatron-LM's TP + ZeRO-1 setting.
 
 ## Citation
 

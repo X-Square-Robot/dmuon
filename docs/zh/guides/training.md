@@ -1,6 +1,9 @@
 # 训练指南
 
-本指南完整介绍 DMuon 的训练流程：从模型准备到训练循环。
+!!! tip "TL;DR"
+    1. 在 `fully_shard()` **之前**调用 `dmuon.dedicate_params(model, mesh, predicate=...)` 将矩阵参数分配给专属所有者。
+    2. 使用标准 FSDP2 的 `fully_shard()` 包装模型——DMuon 会自动跳过专属参数。
+    3. 使用 `dmuon.Muon(model, lr=0.02, adamw_lr=1e-3)` 作为优化器——在一次调用中同时处理 Muon（专属）和 AdamW（对称）参数。
 
 ---
 
@@ -237,9 +240,14 @@ fully_shard(model, mesh=hsdp)
 
 完整 API、同步/异步模式、fallback 协议、profile 说明见 [HSDP 训练指南](hsdp.md)。
 
-## 下一步
+FSDP 和 HSDP 下都适用的 DMuon-Z2 vs DMuon-Z3 packed buffer 生命周期选择，详见 [Z2 与 Z3 模式](z2-z3-modes.md)。
+
+## 相关文档
 
 - [HSDP 训练（多机）](hsdp.md) — 2D mesh + 异步 broadcast
+- [自定义 Hook 边界](custom-hook-boundaries.md) — 控制 DMuon 的前向/反向 hook 绑定到哪个模块
+- [Z2 与 Z3 模式](z2-z3-modes.md) — Packed buffer 生命周期与显存/通信权衡
+- [性能分析与 Fallback](profiling-and-fallback.md) — 广播延迟测量与异步 fallback 调优
 - [张量并行](tp-support.md) — 使用 DMuon + TP
 - [检查点](checkpoint.md) — 保存和加载训练状态
 - [梯度累积](grad-accumulation.md) — 等效批量大小扩展

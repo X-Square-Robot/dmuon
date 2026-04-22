@@ -59,6 +59,26 @@ HSDP 的两个维度：
 - **`shard`**：每个 replicate 行内部参数沿该轴分片（FSDP-ZeRO2/3 行为）
 - **`replicate`**：整套 shard 布局沿该轴**复制** —— 每个 replicate 行是一份独立的完整模型实例
 
+```mermaid
+graph LR
+  subgraph "Replicate 行 0（节点 0）"
+    r0s0["rank 0<br/>shard=0"]
+    r0s1["rank 1<br/>shard=1"]
+    r0s2["rank 2<br/>shard=2"]
+    r0s3["rank 3<br/>shard=3"]
+  end
+  subgraph "Replicate 行 1（节点 1）"
+    r1s0["rank 4<br/>shard=0"]
+    r1s1["rank 5<br/>shard=1"]
+    r1s2["rank 6<br/>shard=2"]
+    r1s3["rank 7<br/>shard=3"]
+  end
+  r0s0 -.->|replicate group<br/>节点间 IB| r1s0
+  r0s1 -.->|replicate group| r1s1
+  r0s2 -.->|replicate group| r1s2
+  r0s3 -.->|replicate group| r1s3
+```
+
 ```text
 示例：init_device_mesh("cuda", (2, 4), mesh_dim_names=("replicate", "shard"))
 
@@ -183,17 +203,48 @@ dmuon.set_optimizer_state_dict(model, optimizer, ckpt["optim"])
 
 ---
 
-## HSDP 下的 FSDP-ZeRO2 vs FSDP-ZeRO3
+## DMuon-Z2 vs DMuon-Z3（packed buffer 生命周期）
 
-HSDP 可以叠在 FSDP-ZeRO2（`reshard_after_forward=False`）或 ZeRO-3（`reshard_after_forward=True`，默认）之上。DMuon primitive 对这两种模式不变 —— 只有 non-Muon 参数行为不同（fwd/bwd 期间 param 保持 replicated vs shard）。按 cluster 显存预算选：
+DMuon 通过 `dedicate_params()` 自己的 `reshard_after_forward` kwarg，暴露和 FSDP2 同样的 memory-vs-comm tradeoff。这个参数控制 **Muon-target 的 packed buffer** 是否在 fwd 和 bwd 之间保持常驻（与 FSDP2 对 non-Muon 参数的同名 flag 思路一致，只是作用于 DMuon 自己的 buffer）。
+
+| 模式 | `reshard_after_forward` | 行为 | Muon-target 字节/步 | Muon-target 显存 |
+|---|---|---|---|---|
+| **DMuon-Z2** | `False` | packed buf 在 fwd+bwd 之间常驻；backward 直接复用 | `2(N-1)/N · P_M`（comm 最优）| P_M 每 shard rank 常驻 |
+| **DMuon-Z3** | `True`（默认）| packed buf 在 fwd 后 reshard；backward 进入重广播 | `3(N-1)/N · P_M` | 每 rank 单层 packed buf transient |
 
 ```python
-# ZeRO-3 HSDP（默认，显存最紧）
-fully_shard(layer, mesh=hsdp)
+# DMuon-Z3（默认）—— 推荐大模型（7B+），匹配 FSDP2 ZeRO-3 显存模型
+dmuon.dedicate_params(
+    model, hsdp["shard"],
+    predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    replicate_mesh=hsdp["replicate"],
+)
 
-# ZeRO-2 HSDP（fwd+bwd 期间 param 全副本，grad 分片 —— 每步省两次 AG）
-fully_shard(layer, mesh=hsdp, reshard_after_forward=False)
+# DMuon-Z2 —— 中小模型 opt-in，通信占主导且 packed bufs 放得下
+dmuon.dedicate_params(
+    model, hsdp["shard"],
+    predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    replicate_mesh=hsdp["replicate"],
+    reshard_after_forward=False,                # ← DMuon-Z2 模式
+)
 ```
+
+**推荐用法**：让 DMuon 的 `reshard_after_forward` 和 FSDP2 的 `fully_shard(..., reshard_after_forward=...)` 保持一致，让 Muon 和 non-Muon 参数在同一个显存模型下工作：
+
+```python
+# 全 ZeRO-3（默认，大模型）
+dmuon.dedicate_params(model, hsdp["shard"], ..., replicate_mesh=hsdp["replicate"])
+for layer in model.layers:
+    fully_shard(layer, mesh=hsdp)                 # FSDP2 default = Z3
+
+# 全 ZeRO-2（comm-optimal，中小模型）
+dmuon.dedicate_params(model, hsdp["shard"], ..., replicate_mesh=hsdp["replicate"],
+                      reshard_after_forward=False)                             # DMuon-Z2
+for layer in model.layers:
+    fully_shard(layer, mesh=hsdp, reshard_after_forward=False)                 # FSDP2 Z2
+```
+
+非对称组合（DMuon-Z2 + FSDP2-Z3 或反过来）合法且偶尔最优（例如 Muon 参数数量少但单个大 → DMuon-Z2；non-Muon 参数多但单个小 → FSDP2-Z3），但增加心智成本。推荐从对称 config 开始。
 
 ---
 
@@ -218,4 +269,8 @@ fully_shard(layer, mesh=hsdp, reshard_after_forward=False)
 - [核心概念](../getting-started/concepts.md) —— dedicated ownership 如何和 FSDP2 组合
 - [训练流程](training.md) —— 完整 1D shard workflow（先掌握这个，再加 HSDP 上面几个 knob）
 - [检查点](checkpoint.md) —— state-dict 语义
+- [自定义 Hook 边界](custom-hook-boundaries.md) —— 让 DMuon hook 边界与模型结构对齐
+- [Z2 与 Z3 模式](z2-z3-modes.md) —— packed buffer 生命周期与显存/通信权衡
+- [性能分析与 Fallback](profiling-and-fallback.md) —— 广播延迟详细分析与 fallback 调优
+- [集成方案](integration-recipes.md) —— HuggingFace Trainer、torchtitan 等框架集成
 - [API 文档](../reference/api.md) —— 完整 `dedicate_params` 和 `Muon` 签名

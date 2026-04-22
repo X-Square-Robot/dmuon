@@ -1,6 +1,9 @@
 # Training Guide
 
-This guide walks through the complete DMuon training workflow: from model preparation to a running training loop.
+!!! tip "TL;DR"
+    1. Call `dmuon.dedicate_params(model, mesh, predicate=...)` **before** `fully_shard()` to assign matrix parameters to dedicated owners.
+    2. Wrap with standard FSDP2 `fully_shard()` — DMuon auto-skips dedicated params.
+    3. Use `dmuon.Muon(model, lr=0.02, adamw_lr=1e-3)` as the optimizer — it handles both Muon (dedicated) and AdamW (symmetric) params in one call.
 
 ---
 
@@ -237,9 +240,14 @@ fully_shard(model, mesh=hsdp)
 
 See the dedicated [HSDP guide](hsdp.md) for the full API, sync vs async mode, the fallback protocol, and profiling.
 
-## Next
+For the DMuon-Z2 vs DMuon-Z3 packed-buffer lifecycle choice applicable under both FSDP and HSDP, see [Z2 vs Z3 Modes](z2-z3-modes.md).
+
+## See also
 
 - [HSDP (Multi-Node)](hsdp.md) — 2D mesh training with async broadcast
+- [Custom Hook Boundaries](custom-hook-boundaries.md) — Control which module receives DMuon's forward/backward hooks
+- [Z2 vs Z3 Modes](z2-z3-modes.md) — Packed-buffer lifecycle and memory/comm tradeoff
+- [Profiling & Fallback](profiling-and-fallback.md) — Measure broadcast latency and tune the async fallback protocol
 - [Tensor Parallelism](tp-support.md) — Using DMuon with TP
 - [Checkpointing](checkpoint.md) — Save and load training state
 - [Gradient Accumulation](grad-accumulation.md) — Effective batch size scaling

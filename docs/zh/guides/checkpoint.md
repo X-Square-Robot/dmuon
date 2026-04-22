@@ -1,6 +1,7 @@
 # 检查点
 
-DMuon 提供检查点函数，在单一统一的 state dict 中处理专属参数（DMuon 管理）和对称参数（FSDP2 管理）。
+!!! tip "TL;DR"
+    用 `dmuon.get_model_state_dict(model)` / `dmuon.set_model_state_dict(model, sd)` 代替 `model.state_dict()` / `model.load_state_dict()`。这些集合操作会从所有者 rank 收集专属参数，生成兼容单卡和 HuggingFace 的标准扁平 state dict。待处理的异步 HSDP 广播会在读取前自动 drain。
 
 ---
 
@@ -27,6 +28,11 @@ dist.barrier()
 
 !!! info "所有 rank 必须调用"
     `get_model_state_dict()` 和 `get_optimizer_state_dict()` 是集合操作——所有 rank 必须调用，即使只有 rank 0 保存结果。
+
+!!! tip "HSDP 异步 drain 自动处理"
+    `get_model_state_dict` 和 `get_optimizer_state_dict` 在读取前会自动调用
+    `wait_all_replicate_broadcasts(model)`，因此待处理的异步 post-step 广播不会
+    将过期的 `_owned_data` 泄漏到检查点中。**无需**手动 drain。
 
 ## 加载（恢复训练）
 
@@ -141,3 +147,23 @@ for step in range(start_step, total_steps):
     }
 }
 ```
+
+## 跨拓扑恢复
+
+当前 DMuon 检查点格式假设恢复时 `(shard_size, replicate_size)` 不变。跨拓扑恢复在 v1 中尚不支持，列入路线图。
+
+如需迁移拓扑，可走以下离线流程：
+
+1. 在旧拓扑用 `get_model_state_dict(model, cpu_offload=True)` 保存。
+2. 在单进程脚本中用 `torch.load` 加载。
+3. 在新拓扑下重新初始化模型 + DMuon。
+4. 用 `dmuon.set_model_state_dict(new_model, sd)` 恢复权重。
+
+优化器状态无法跨拓扑迁移；切换 mesh 形状后需从步数 0 重新开始优化器状态。
+
+## 相关文档
+
+- [HSDP 训练（多机）](hsdp.md) —— HSDP checkpoint 语义与异步 drain 详情
+- [训练流程](training.md) —— 完整训练流程
+- [集成方案](integration-recipes.md) —— HuggingFace Trainer 与 torchtitan 检查点 hook
+- [API 文档](../reference/api.md) —— `get_model_state_dict`、`set_model_state_dict` 签名

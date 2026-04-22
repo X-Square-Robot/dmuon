@@ -1,6 +1,12 @@
 # 张量并行
 
-本指南介绍 DMuon 如何与张量并行（TP）协同工作，以及可用于 TP 分片参数的不同 Newton-Schulz 模式。
+!!! tip "TL;DR"
+    先应用 TP（`parallelize_module`），再 DMuon（在 DP mesh 上 `dedicate_params`），最后 FSDP2（在 DP mesh 上 `fully_shard`）。DMuon 使用 Gram Newton-Schulz 在 TP 本地分片上运行，仅需一次小型 all-reduce，而无需收集完整梯度矩阵。
+
+---
+
+!!! warning "TP + HSDP 组合状态"
+    DMuon 的 TP 支持（Gram Newton-Schulz + TP SYRK 分解）仅在 **1D DP mesh**（纯 FSDP，无 HSDP replicate 维）上经过验证。2D HSDP × TP 组合尚未纳入测试矩阵。如需同时使用，请先用 FSDP+TP（单 replicate 行），并提交 issue。
 
 ---
 
@@ -190,3 +196,10 @@ gate_proj: local=(3584, 8192), full=(28672, 8192), shard_dim=0, tp_group=是
 up_proj:   local=(3584, 8192), full=(28672, 8192), shard_dim=0, tp_group=是
 down_proj: local=(8192, 3584), full=(8192, 28672), shard_dim=1, tp_group=是
 ```
+
+## 相关文档
+
+- [HSDP 训练（多机）](hsdp.md) —— 2D mesh 配置；注意 HSDP × TP 组合尚未验证（见上方警告）
+- [自定义 Hook 边界](custom-hook-boundaries.md) —— `hook_boundary_predicate` 可使用 `isinstance(m, TPWrappedModule)` 与 TP 包装模块对齐
+- [训练流程](training.md) —— 完整 1D 训练流程（在此基础上加 TP）
+- [API 文档](../reference/api.md) —— 含 `hook_boundary_predicate` 的 `dedicate_params` 签名

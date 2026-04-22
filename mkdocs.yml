@@ -1,52 +1,73 @@
 site_name: DMuon
-site_description: Dedicated ownership for Muon on PyTorch FSDP2
+site_description: Dedicated ownership for Muon optimizer on PyTorch DDP, FSDP2, and HSDP
 site_url: https://starrickliu.github.io/dmuon/
 repo_url: https://github.com/StarrickLiu/dmuon
 repo_name: StarrickLiu/dmuon
 
 exclude_docs: |
   internal/
+  examples/
 
 theme:
   name: material
+  logo: assets/dmuon-logo.png
+  favicon: assets/favicon.svg
   palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: dmuon-light
+    - scheme: default
+      primary: indigo
+      accent: amber
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
+    - scheme: slate
       primary: indigo
       accent: amber
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
+  font:
+    text: Inter
+    code: JetBrains Mono
   features:
+    # navigation.instant disabled for i18n language switcher compatibility
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.sections
     - navigation.expand
     - navigation.top
-    - navigation.tabs
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - search.share
     - content.code.copy
     - content.code.annotate
+    - content.tabs.link
     - toc.follow
   icon:
     repo: fontawesome/brands/github
 
-extra_css:
-  - stylesheets/custom.css
-
-extra:
-  alternate:
-    - name: English
-      link: /dmuon/
-      lang: en
-    - name: 中文
-      link: /dmuon/zh/
-      lang: zh
-
 plugins:
-  - search
+  - search:
+      lang:
+        - en
+        - zh
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: numpy
+            show_source: false
+            members_order: source
+            show_root_heading: true
+            show_root_full_path: false
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            merge_init_into_class: true
+            group_by_category: true
+            heading_level: 3
   - i18n:
       docs_structure: folder
       languages:
@@ -57,24 +78,31 @@ plugins:
         - locale: zh
           name: 中文
           build: true
-          nav:
-            - 首页: index.md
-            - 快速入门:
-              - 安装: getting-started/installation.md
-              - 快速开始: getting-started/quickstart.md
-              - 核心概念: getting-started/concepts.md
-            - 使用指南:
-              - 训练流程: guides/training.md
-              - HSDP 训练（多机）: guides/hsdp.md
-              - 张量并行: guides/tp-support.md
-              - 检查点: guides/checkpoint.md
-              - 梯度累积: guides/grad-accumulation.md
-            - 参考手册:
-              - API 文档: reference/api.md
-              - Newton-Schulz 算法: reference/newton-schulz.md
-            - 示例:
-              - 数据并行: examples/basic-dp.md
-              - TP + DP: examples/tp-dp.md
+          nav_translations:
+            Home: 首页
+            Getting Started: 快速入门
+            Installation: 安装
+            Quick Start: 快速开始
+            Core Concepts: 核心概念
+            User Guide: 使用指南
+            Training: 训练流程
+            HSDP (Multi-Node): HSDP 训练（多机）
+            Custom Hook Boundaries: 自定义 Hook 边界
+            Z2 vs Z3 Modes: Z2 与 Z3 模式
+            Profiling & Fallback: 性能分析与 Fallback
+            Integration Recipes: 集成方案
+            Tensor Parallelism: 张量并行
+            Checkpointing: 检查点
+            Gradient Accumulation: 梯度累积
+            Design: 设计
+            Architecture: 架构
+            Reference: 参考手册
+            API Reference: API 文档
+            Newton-Schulz Variants: Newton-Schulz 变体
+            Communication Cost Analysis: 通信成本分析
+            FAQ: 常见问题
+            Troubleshooting: 故障排查
+            Contributing: 参与贡献
 
 markdown_extensions:
   - admonition
@@ -100,8 +128,21 @@ markdown_extensions:
   - toc:
       permalink: true
 
+extra_css:
+  - assets/extra.css
+  - stylesheets/custom.css
+
 extra_javascript:
   - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+extra:
+  alternate:
+    - name: English
+      link: /dmuon/
+      lang: en
+    - name: 中文
+      link: /dmuon/zh/
+      lang: zh
 
 nav:
   - Home: index.md
@@ -109,15 +150,22 @@ nav:
     - Installation: getting-started/installation.md
     - Quick Start: getting-started/quickstart.md
     - Core Concepts: getting-started/concepts.md
-  - Guides:
+  - User Guide:
     - Training: guides/training.md
     - HSDP (Multi-Node): guides/hsdp.md
+    - Custom Hook Boundaries: guides/custom-hook-boundaries.md
+    - Z2 vs Z3 Modes: guides/z2-z3-modes.md
+    - Profiling & Fallback: guides/profiling-and-fallback.md
+    - Integration Recipes: guides/integration-recipes.md
     - Tensor Parallelism: guides/tp-support.md
     - Checkpointing: guides/checkpoint.md
     - Gradient Accumulation: guides/grad-accumulation.md
+  - Design:
+    - Architecture: design/architecture.md
   - Reference:
     - API Reference: reference/api.md
     - Newton-Schulz Variants: reference/newton-schulz.md
-  - Examples:
-    - Data Parallel: examples/basic-dp.md
-    - TP + DP: examples/tp-dp.md
+    - Communication Cost Analysis: reference/communication-cost.md
+  - FAQ: faq/index.md
+  - Troubleshooting: troubleshooting.md
+  - Contributing: contributing.md

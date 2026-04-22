@@ -1,6 +1,7 @@
 # 梯度累积
 
-DMuon 通过 `no_sync()` 上下文管理器支持梯度累积，遵循与 FSDP2 相同的模式。
+!!! tip "TL;DR"
+    用 `dmuon.no_sync(model)` 包裹累积的微批次，同时抑制专属参数和对称参数的梯度通信。仅在最后一个微批次调用 `optimizer.step()` + `optimizer.zero_grad()`。在 `.backward()` 前将 loss 除以 `accum_steps`，使累积梯度等价于单次大批次梯度。
 
 ---
 
@@ -84,3 +85,11 @@ for i, batch in enumerate(dataloader):
 
 !!! tip "Loss 缩放"
     在 `.backward()` 前将 loss 除以 `accum_steps`，这样累积后的梯度等价于单次大批次的梯度。
+
+!!! note "DMuon-Z2 与梯度累积"
+    注意 `reshard_after_forward=False`（DMuon-Z2）会在微批次之间保持 packed buffer 常驻，与梯度累积有交互——显存影响详见 [Z2 与 Z3 模式](z2-z3-modes.md)。
+
+## 相关文档
+
+- [训练流程](training.md) —— 完整 DMuon 训练流程
+- [Z2 与 Z3 模式](z2-z3-modes.md) —— packed buffer 生命周期及其对累积时显存的影响

@@ -1,386 +1,263 @@
 # API 文档
 
-DMuon 公开 API 的完整参考。
+!!! tip "TL;DR"
+    DMuon 公开四个功能区：**初始化**（`dedicate_params`、`install_patch`）、
+    **优化器**（`Muon`、`NewtonSchulz`、NS 函数与常量）、**状态管理**
+    （`no_sync`、`wait_all_reduces`、replicate-broadcast 工具函数、
+    `DedicatedCommContext`）以及**检查点**（`get/set_model/optimizer_state_dict`）。
+    从 `dedicate_params` + `Muon` 开始；需要精细控制时再使用其余接口。
 
 ---
 
-## 核心 API
+## 模块常量
 
-### `dmuon.dedicate_params`
+`dmuon.group` 中的两个模块级变量可在不修改优化器构造函数的情况下调整
+异步→同步降级协议。在训练开始前导入并修改：
 
 ```python
-dmuon.dedicate_params(
-    model: nn.Module,
-    mesh: DeviceMesh,
-    predicate: Callable[[str, nn.Parameter], bool],
-    compute_dtype: torch.dtype = None,
-    reshard_after_forward: bool = True,
-) -> dict[nn.Parameter, int]
+import dmuon.group as g
+
+g.REPLICATE_WAIT_THRESHOLD_US = 250   # 默认：100 μs；快速 IB 网络可适当调高
+g.REPLICATE_FALLBACK_CONSECUTIVE_STEPS = 5  # 默认：3；触发降级所需的连续慢步数
 ```
 
-标记参数为专属所有权并注册通信 hook。
+| 名称 | 默认值 | 说明 |
+|---|---|---|
+| `REPLICATE_WAIT_THRESHOLD_US` | `100.0` | 单层 replicate broadcast 等待时长超过此阈值则记为"慢步"。 |
+| `REPLICATE_FALLBACK_CONSECUTIVE_STEPS` | `3` | 连续慢步数达到此值后，该 group 永久切换为同步广播。 |
 
-满足 `predicate` 的参数通过均衡分配算法分配给所有者 rank。每个标记的参数将在后续 `fully_shard()` 调用中被自动忽略。
-
-**参数：**
-
-| 名称 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `model` | `nn.Module` | *必需* | 要分配参数的模型。 |
-| `mesh` | `DeviceMesh` | *必需* | 数据并行维度的 1D DeviceMesh。 |
-| `predicate` | `Callable` | *必需* | `(param_name, param) -> bool`。返回 True 的参数使用专属所有权。 |
-| `compute_dtype` | `torch.dtype` | `None` | 可选的通信数据类型（如 `torch.bfloat16`）。 |
-| `reshard_after_forward` | `bool` | `True` | True 时前向后重分片（类似 `FULL_SHARD`）。False 时保持完整（类似 `SHARD_GRAD_OP`）。 |
-
-**返回：** 将每个专属参数映射到其所有者 rank（int）的字典。
+重置已降级的 group：`dmuon.reset_replicate_fallback(model)`。
 
 ---
 
-### `dmuon.wait_all_reduces`
+## 初始化
 
-```python
-dmuon.wait_all_reduces(model: nn.Module) -> None
-```
+### dedicate_params
 
-等待所有待处理的梯度 reduce 完成。
+在 `fully_shard()` 之前调用一次。将每个 Muon 目标参数分配给单一 owner rank，
+并注册逐层的前向/反向 hook。常见自定义点见
+[自定义 Hook 边界](../../guides/custom-hook-boundaries.md) 和
+[Z2 与 Z3 模式](../../guides/z2-z3-modes.md)。
 
-由 `optimizer.step()` 自动调用。仅在需要在 step 前手动访问 `_reduced_grad` 时才需要。
+::: dmuon.dedicate_params
 
 ---
 
-### `dmuon.no_sync`
+### install_patch
 
-```python
-@contextmanager
-dmuon.no_sync(model: nn.Module)
-```
+`import dmuon` 会自动调用此函数。除非在不经过正常 import 路径的情况下
+构建 DMuon 环境，否则无需手动调用。
 
-禁用梯度归约的上下文管理器，用于梯度累积。
-
-在此上下文内，反向传播跳过 reduce 通信并在本地累积梯度。同时禁用 FSDP2 对对称参数的梯度同步。
-
-```python
-with dmuon.no_sync(model):
-    loss = model(batch).loss / accum_steps
-    loss.backward()
-```
+::: dmuon.install_patch
 
 ---
 
 ## 优化器
 
-### `dmuon.Muon`
+### Muon
 
-```python
-dmuon.Muon(
-    model: nn.Module,
-    lr: float = 0.02,
-    momentum: float = 0.95,
-    weight_decay: float = 0.0,
-    ns_steps: int = 5,
-    adamw_lr: float = 1e-3,
-    adamw_betas: tuple[float, float] = (0.9, 0.999),
-    adamw_weight_decay: float = 0.01,
-    adamw_eps: float = 1e-8,
-    nesterov: bool = True,
-    per_head_ns: bool = True,
-    block_diagonal_ns: bool = False,
-)
-```
+主优化器类。在同一对象中管理专属参数上的 Muon（Newton-Schulz + 动量）
+和 FSDP2 托管的对称参数上的 AdamW，兼容 `torch.optim.lr_scheduler`。
 
-DMuon 分布式训练的组合优化器。
-
-管理两个参数组：
-
-- **组 0**（专属参数）：Muon — 动量 + Newton-Schulz 正交化，仅所有者运行
-- **组 1**（对称参数）：AdamW，所有 rank 在 FSDP2 分片上运行
-
-**参数：**
-
-| 名称 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `model` | `nn.Module` | *必需* | 已应用 `dedicate_params` 和 `fully_shard` 的模型。 |
-| `lr` | `float` | `0.02` | 专属参数的 Muon 学习率。内部按 `0.2 * sqrt(max(m,n))` 缩放。 |
-| `momentum` | `float` | `0.95` | 专属参数的动量系数。 |
-| `weight_decay` | `float` | `0.0` | 专属参数的权重衰减（解耦式，类似 AdamW）。 |
-| `ns_steps` | `int` | `5` | Newton-Schulz 迭代次数。 |
-| `ns_backend` | `str` 或 `NewtonSchulz` | `"gram"` | NS 后端配置。传入字符串简写（`"gram"` 或 `"direct"`）使用默认系数，或传入 `NewtonSchulz` 对象完全自定义（见下方）。 |
-| `nesterov` | `bool` | `True` | 使用 Nesterov 动量：`ns_input = grad + mu * buf`。 |
-| `per_head_ns` | `bool` | `True` | 对窄 Shard(0) 参数（GQA k/v_proj）使用逐头本地 NS。 |
-| `block_diagonal_ns` | `bool` | `False` | 跳过所有 TP 参数的 Gram all-reduce（实验性）。 |
-| `adamw_lr` | `float` | `1e-3` | 对称参数的 AdamW 学习率。 |
-| `adamw_betas` | `tuple` | `(0.9, 0.999)` | AdamW beta 系数。 |
-| `adamw_weight_decay` | `float` | `0.01` | AdamW 权重衰减。 |
-| `adamw_eps` | `float` | `1e-8` | AdamW epsilon。 |
-
-**方法：**
-
-- `step(closure=None)` — 执行一步优化。内部：(1) 等待 reduce，(2) 对专属参数运行 Muon，(3) 对 FSDP2 参数运行 AdamW。
-- `zero_grad(set_to_none=True)` — 清除两类参数的梯度。
+::: dmuon.Muon
 
 ---
 
-### `dmuon.NewtonSchulz`
+### NewtonSchulz
 
-```python
-dmuon.NewtonSchulz(
-    backend: str = "gram",
-    coefficients: list[list[float]] = None,
-    restart_iterations: list[int] = None,
-)
-```
+可配置的 NS 后端对象。传入 `Muon(ns_backend=...)` 以选择算法变体、覆盖系数
+或启用确定性模式。完整对比见 [Newton-Schulz 变体](newton-schulz.md)。
 
-可配置的 Newton-Schulz 后端对象。传入 `Muon(ns_backend=...)` 以自定义系数或算法选择。
-
-**参数：**
-
-| 名称 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `backend` | `str` | `"gram"` | `"gram"`：Gram 空间 NS（SYRK + 重启）。`"direct"`：经典参数空间 NS。 |
-| `coefficients` | `list` | `None` | 逐步 `(a, b, c)` 系数。`None` 使用 `POLAR_EXPRESS_COEFFICIENTS`。 |
-| `restart_iterations` | `list[int]` | `None` | Gram 空间 NS 的重启位置。`None` 使用 `[2]`。`"direct"` 时忽略。 |
-
-**用法：**
-
-```python
-import dmuon
-
-# 默认 Gram 空间 NS
-optimizer = dmuon.Muon(model, lr=0.02, ns_backend="gram")
-
-# 经典 Muon/Moonlight + You 系数
-ns = dmuon.NewtonSchulz("direct", coefficients=dmuon.YOU_COEFFICIENTS)
-optimizer = dmuon.Muon(model, lr=0.02, ns_backend=ns)
-
-# Gram 空间 + You 系数
-ns = dmuon.NewtonSchulz("gram", coefficients=dmuon.YOU_COEFFICIENTS)
-optimizer = dmuon.Muon(model, lr=0.02, ns_backend=ns)
-```
-
-!!! note "说明"
-    需要 Gram 分解的 TP 参数（精确或块对角）内部始终使用 `gram_newton_schulz`——`backend` 设置仅影响本地（非 TP）参数和 TP 逐头参数。自定义 `coefficients` 应用于所有路径。
+::: dmuon.NewtonSchulz
 
 ---
 
-## Newton-Schulz 函数
+### newton_schulz
 
-### `dmuon.newton_schulz`
+独立 NS 函数，默认路由至 Gram 空间后端。在优化器循环外需要 NS 时直接使用，
+例如自定义训练循环或实验代码。
 
-```python
-dmuon.newton_schulz(
-    G: Tensor,
-    steps: int = 5,
-    eps: float = 1e-7,
-    coefficients: list[list[float]] = None,
-    restart_iterations: list[int] = None,
-) -> Tensor
-```
-
-Newton-Schulz 正交化（默认 Gram 空间后端）。
-
-路由到 `gram_newton_schulz_local()`，使用 Gram 空间迭代，支持逐步系数、重启机制和 SYRK 加速。
-
-**参数：**
-
-| 名称 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `G` | `Tensor` | *必需* | 梯度矩阵 (m, n)，任意 dtype。 |
-| `steps` | `int` | `5` | 忽略（由 `len(coefficients)` 决定）。 |
-| `eps` | `float` | `1e-7` | 归一化 epsilon。 |
-| `coefficients` | `list` | `POLAR_EXPRESS_COEFFICIENTS` | 逐步 `(a, b, c)` 系数。 |
-| `restart_iterations` | `list[int]` | `[2]` | 重启位置，提升数值稳定性。 |
-
-**返回：** 正交化后的更新，与 G 形状相同。
+::: dmuon.newton_schulz
 
 ---
 
-### `dmuon.gram_newton_schulz`
+### gram_newton_schulz
 
-```python
-dmuon.gram_newton_schulz(
-    G_shard: Tensor,
-    tp_group: dist.ProcessGroup,
-    steps: int = 5,
-    eps: float = 1e-7,
-    coefficients: list[list[float]] = None,
-    restart_iterations: list[int] = None,
-    shard_dim: int = None,
-    block_diagonal: bool = False,
-) -> Tensor
-```
+具备 TP 感知的 Gram NS（带 SYRK 分解）。`Muon` 内部为 Tensor-Parallel
+参数调用此函数；此处暴露供构建自定义 TP 优化器的用户使用。
+见 [张量并行](../../guides/tp-support.md)。
 
-带 TP SYRK 分解的 Gram Newton-Schulz。
-
-在 Gram 矩阵上迭代。`shard_dim` 控制使用哪侧 Gram：
-
-- **Shard(0)**（行分片）：转置使用 R 侧 G^TG（可分解为本地项之和）
-- **Shard(1)**（列分片）：使用 L 侧 GG^T（可分解为本地项之和）
-
-**参数：**
-
-| 名称 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `G_shard` | `Tensor` | *必需* | 当前 rank 的 TP 分片梯度。 |
-| `tp_group` | `ProcessGroup` | *必需* | 用于 all-reduce 的 TP 进程组。 |
-| `shard_dim` | `int` | `None` | TP 分片维度（0 或 1）。None 时回退到形状启发式。 |
-| `block_diagonal` | `bool` | `False` | True 时跳过 TP all-reduce（块对角近似）。 |
-
-**返回：** 正交化后的更新分片，与输入形状相同。
+::: dmuon.gram_newton_schulz
 
 ---
 
-### `dmuon.direct_newton_schulz`
+### get_ns_backend
 
-```python
-dmuon.direct_newton_schulz(
-    G: Tensor,
-    steps: int = 5,
-    eps: float = 1e-7,
-    coefficients: list[list[float]] = None,
-) -> Tensor
-```
+查询当前活跃的硬件后端。在不支持 SM80+ 的机器上调试时有用。
 
-标准的直接（参数）空间 Newton-Schulz。
-
-在完整 (m, n) 矩阵上迭代：$X_{k+1} = a_k X + b_k (XX^T)X + c_k (XX^T)^2 X$
-
-这是 Muon/Moonlight 的经典算法。用于基线对比或 Gram 空间开销不值得的小矩阵。
-
-**返回：** 正交化后的更新，与 G 形状相同。
+::: dmuon.get_ns_backend
 
 ---
 
-## 检查工具
+### YOU_COEFFICIENTS
 
-### `dmuon.get_dedicated_params`
+来自 [@YouJiacheng](https://x.com/YouJiacheng/status/1905861218138804534)
+的 5 步逐迭代 `(a, b, c)` 系数。传入 `NewtonSchulz(coefficients=...)` 或
+直接传入 NS 函数的 `coefficients` 参数。
 
-```python
-dmuon.get_dedicated_params(model: nn.Module) -> list[DedicatedParam]
-```
-
-从模型中收集所有 `DedicatedParam` 实例（跨所有 rank）。
+::: dmuon.YOU_COEFFICIENTS
 
 ---
 
-### `dmuon.get_owned_params`
+### POLAR_EXPRESS_COEFFICIENTS
 
-```python
-dmuon.get_owned_params(model: nn.Module, rank: int) -> list[DedicatedParam]
-```
+默认 5 步系数，来自 Polar Express 论文（arXiv:2505.16932），应用了 1.05
+安全因子。不传 `coefficients` 参数时默认使用。
 
-收集指定 rank 拥有的 `DedicatedParam` 实例。
-
----
-
-### `dmuon.get_comm_ctx`
-
-```python
-dmuon.get_comm_ctx(model: nn.Module) -> Optional[DedicatedCommContext]
-```
-
-获取模型的 `DedicatedCommContext`（如果存在）。
+::: dmuon.POLAR_EXPRESS_COEFFICIENTS
 
 ---
 
-### `dmuon.get_ns_backend`
+## 工具函数 — DMuon 状态管理
 
-```python
-dmuon.get_ns_backend() -> str
-```
+### no_sync
 
-返回当前 Newton-Schulz 后端：`"syrk_sm80"` 或 `"compiled"`。
+梯度累积的上下文管理器。在上下文内抑制 DMuon reduce 和 FSDP2 的
+reduce-scatter；最后一个 micro-batch 在上下文外调用 backward 以触发
+合并 reduce。见 [梯度累积](../../guides/grad-accumulation.md)。
 
----
-
-## 检查点函数
-
-### `dmuon.get_model_state_dict`
-
-```python
-dmuon.get_model_state_dict(
-    model: nn.Module,
-    *,
-    cpu_offload: bool = True,
-) -> dict[str, torch.Tensor]
-```
-
-获取包含专属参数和 FSDP2 参数的完整模型 state dict。
-
-生成的 state dict 与单卡模型输出相同。**集合操作**——所有 rank 必须调用。
+::: dmuon.no_sync
 
 ---
 
-### `dmuon.set_model_state_dict`
+### wait_all_reduces
 
-```python
-dmuon.set_model_state_dict(
-    model: nn.Module,
-    state_dict: dict[str, torch.Tensor],
-) -> None
-```
+等待所有异步梯度 reduce 完成。`Muon.step()` 会自动调用；
+仅当需要在 backward 和 step 之间手动访问 `_reduced_grad` 时才需要
+单独调用。
 
-将完整 state dict 加载到 DMuon 模型。处理专属参数和 FSDP2 参数。
+::: dmuon.wait_all_reduces
 
 ---
 
-### `dmuon.get_optimizer_state_dict`
+### broadcast_all_updates
 
-```python
-dmuon.get_optimizer_state_dict(
-    model: nn.Module,
-    optimizer: Muon,
-    *,
-    cpu_offload: bool = True,
-) -> dict
-```
+同步的后置 replicate broadcast（HSDP Phase B 路径）。将更新后的
+`_owned_data` 从全局 owner 广播到每个 replicate 对等节点。在 1D
+shard-only 模式下为空操作。除非调试，优先使用异步变体。
 
-获取 DMuon Muon 优化器的 state dict。**集合操作**——所有 rank 必须调用。
-
-返回包含以下段的字典：`"fsdp"`（AdamW 状态）、`"dedicated"`（Muon 动量缓冲区）、`"param_groups"`（超参数）。
+::: dmuon.broadcast_all_updates
 
 ---
 
-### `dmuon.set_optimizer_state_dict`
+### broadcast_all_updates_async
 
-```python
-dmuon.set_optimizer_state_dict(
-    model: nn.Module,
-    optimizer: Muon,
-    state_dict: dict,
-) -> None
-```
+异步的后置 replicate broadcast（`Muon` 默认值）。立即返回；每一层的
+event 在下一次前向传播开始时被消费。已触发降级协议的 group 在此调用内
+同步完成。见 [性能分析与 Fallback](../../guides/profiling-and-fallback.md)。
 
-将优化器 state dict 加载到 DMuon Muon 优化器。
+::: dmuon.broadcast_all_updates_async
 
 ---
 
-## DedicatedParam 属性
+### wait_all_replicate_broadcasts
 
-`DedicatedParam` 实例（由 `get_dedicated_params` / `get_owned_params` 返回）暴露以下属性：
+等待所有 group 的异步 replicate broadcast 完成。在正常前向/step 周期
+之外需要读取 `_owned_data` 的代码（如自定义检查点或评估逻辑）中调用。
 
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `is_owner` | `bool` | 当前 rank 是否拥有该参数。 |
-| `owner_rank` | `int` | 拥有该参数的 DP 本地 rank。 |
-| `numel` | `int` | （本地）参数的元素数。 |
-| `param_name` | `str` | 参数在父模块中的名称（如 `"weight"`）。 |
-| `is_dtensor` | `bool` | 是否为 TP 分片的 DTensor 参数。 |
-| `tp_group` | `ProcessGroup` | TP 进程组，非 DTensor 时为 None。 |
-| `shard_dim` | `int` | TP 分片维度（0 或 1），非 DTensor 时为 None。 |
-| `full_shape` | `torch.Size` | 完整（未分片）参数形状。 |
-| `_orig_size` | `torch.Size` | 本地（分片后）参数形状。 |
-| `_owned_data` | `Tensor` | 完整参数数据（仅所有者 rank）。 |
-| `_reduced_grad` | `Tensor` | 归约后的梯度（仅所有者，backward + wait 后）。 |
+::: dmuon.wait_all_replicate_broadcasts
 
 ---
 
-## 常量
+### reset_replicate_fallback
 
-### 系数集
+重新启用所有因降级协议而切换为同步的 group 的异步广播。修复慢 IB
+状况后可从训练循环中安全调用。
 
-```python
-dmuon.YOU_COEFFICIENTS          # @YouJiacheng 的 5 步系数
-dmuon.POLAR_EXPRESS_COEFFICIENTS  # Polar Express 论文的 5 步系数（默认）
-```
+::: dmuon.reset_replicate_fallback
 
-两者都是 `(a, b, c)` 元组的列表。传递给 NS 函数的 `coefficients` 参数。
+---
+
+### replicate_profile_report
+
+向标准输出打印逐 group 的等待时间汇总（仅 rank 0）。需要在进程启动前
+设置 `DMUON_REPLICATE_PROFILE=1`。在训练或分析窗口结束时调用。
+
+::: dmuon.replicate_profile_report
+
+---
+
+### get_dedicated_params
+
+枚举模型中所有 `DedicatedParam` 对象。用于检查 ownership 分配、参数数量
+和负载均衡情况。
+
+::: dmuon.get_dedicated_params
+
+---
+
+### get_owned_params
+
+筛选属于指定 rank 坐标的 `DedicatedParam` 对象。接受整数（1D）或
+`(shard, replicate)` 元组（HSDP）。
+
+::: dmuon.get_owned_params
+
+---
+
+### get_comm_ctx
+
+获取存储在模型上的 `DedicatedCommContext`。若未调用 `dedicate_params`
+则返回 `None`。
+
+::: dmuon.get_comm_ctx
+
+---
+
+### DedicatedCommContext
+
+持有专属 CUDA stream（broadcast、reduce、replicate-broadcast）和
+预取顺序状态的共享通信上下文。类比 FSDP2 的 `FSDPCommContext`。
+大多数用户无需直接构造。
+
+::: dmuon.DedicatedCommContext
+
+---
+
+## 检查点
+
+以下四个函数均为**集体操作** — 每个 rank 都必须调用。它们在读写张量前
+会排空待处理的异步状态。状态字典为标准格式，兼容单 GPU 的
+`torch.save`/`torch.load` 和 HuggingFace 检查点。
+见 [检查点指南](../../guides/checkpoint.md)。
+
+### get_model_state_dict
+
+::: dmuon.get_model_state_dict
+
+---
+
+### set_model_state_dict
+
+::: dmuon.set_model_state_dict
+
+---
+
+### get_optimizer_state_dict
+
+::: dmuon.get_optimizer_state_dict
+
+---
+
+### set_optimizer_state_dict
+
+::: dmuon.set_optimizer_state_dict
+
+---
+
+## 参见
+
+- [核心概念](../../getting-started/concepts.md)
+- [Newton-Schulz 变体](newton-schulz.md)
+- [通信成本分析](communication-cost.md)
+- [检查点指南](../../guides/checkpoint.md)
