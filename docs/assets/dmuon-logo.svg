@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" fill="none">
+  <defs>
+    <!-- Silver-steel gradient on the D ring -->
+    <linearGradient id="dRing" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#a5b0bf"/>
+      <stop offset="40%"  stop-color="#ecf0f4"/>
+      <stop offset="70%"  stop-color="#cdd5de"/>
+      <stop offset="100%" stop-color="#7a8797"/>
+    </linearGradient>
+  </defs>
+
+  <!-- D letter: taller aspect (1.2:1), square top-left/bottom-left corners -->
+  <path fill-rule="evenodd" fill="url(#dRing)" d="
+    M 45 25
+    L 95 25
+    A 75 75 0 0 1 95 175
+    L 45 175
+    Z
+    M 60 40
+    L 92 40
+    A 60 60 0 0 1 92 160
+    L 60 160
+    Z
+  "/>
+
+  <!-- 2×2 grid: large cells, left column sits ON the D's left stroke
+       (design break-out, matches reference artwork) -->
+  <rect x="45"  y="62" width="36" height="36" rx="7" fill="#3a4557"/>
+  <rect x="84"  y="62" width="36" height="36" rx="7" fill="#3a4557"/>
+  <rect x="45" y="101" width="36" height="36" rx="7" fill="#3a4557"/>
+  <rect x="84" y="101" width="36" height="36" rx="7" fill="#00BCD4"/>
+</svg>
