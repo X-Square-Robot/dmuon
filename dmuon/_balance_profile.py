@@ -75,28 +75,36 @@ def dump_assignment(
     alloc_units,
     assignment,
     rank_loads,
-    world_size: int,
+    shard_size: int,
+    replicate_size: int = 1,
     ns_steps: int = 5,
 ) -> None:
     """Print partition stats from rank 0. Called once at setup.
 
+    Owner coords are 2D ``(shard, replicate)`` tuples.  When ``replicate_size
+    == 1`` the output collapses to the old 1D listing.
+
     Args:
-        alloc_units: list of (params_list, layer_id, total_numel)
-        assignment:  dict[param, owner_rank]
-        rank_loads:  list[int] numel-weighted load per rank
-        world_size:  number of ranks
-        ns_steps:    NS step count for flops estimate
+        alloc_units:     list of (params_list, layer_id, total_numel)
+        assignment:      dict[param, (shard, replicate)]
+        rank_loads:      dict[(shard, replicate), int] numel-weighted loads
+        shard_size:      size of the shard (dp) dimension
+        replicate_size:  size of the HSDP replicate dimension (1 in shard-only mode)
+        ns_steps:        NS step count for flops estimate
     """
     if not enabled():
         return
     if _rank() != 0:
         return
 
-    rank_flops = [0] * world_size
-    rank_param_count = [0] * world_size
-    rank_items: list[list[tuple[str, tuple[int, ...], int, int]]] = [
-        [] for _ in range(world_size)
+    slots: list[tuple[int, int]] = [
+        (s, r) for s in range(shard_size) for r in range(replicate_size)
     ]
+    rank_flops: dict[tuple[int, int], int] = {slot: 0 for slot in slots}
+    rank_param_count: dict[tuple[int, int], int] = {slot: 0 for slot in slots}
+    rank_items: dict[
+        tuple[int, int], list[tuple[str, tuple[int, ...], int, int]]
+    ] = {slot: [] for slot in slots}
 
     # Build a param → (layer_id, numel) lookup so we can print per-param detail
     param_to_meta = {}
@@ -114,39 +122,48 @@ def dump_assignment(
         layer_id, _ = param_to_meta.get(id(p), (None, numel))
         rank_items[owner].append((str(layer_id), shape, numel, flops))
 
+    total_slots = shard_size * replicate_size
     print("\n" + "=" * 78)
     print("[DMUON_PROFILE_BALANCE] Partition assignment summary")
     print("=" * 78)
-    print(f"  world_size = {world_size}, ns_steps = {ns_steps}")
+    print(
+        f"  shard={shard_size}, replicate={replicate_size}, "
+        f"total_slots={total_slots}, ns_steps={ns_steps}"
+    )
     print(f"  alloc units = {len(alloc_units)}, total params = {len(assignment)}")
     print()
-    header = f"  {'rank':>4} {'n_params':>9} {'numel (M)':>12} {'ns_flops (G)':>14}"
+    header = (
+        f"  {'slot (s,r)':>12} {'n_params':>9} "
+        f"{'numel (M)':>12} {'ns_flops (G)':>14}"
+    )
     print(header)
     print("  " + "-" * (len(header) - 2))
-    for r in range(world_size):
-        numel_m = rank_loads[r] / 1e6
-        flops_g = rank_flops[r] / 1e9
+    for slot in slots:
+        numel_m = rank_loads[slot] / 1e6
+        flops_g = rank_flops[slot] / 1e9
         print(
-            f"  {r:>4d} {rank_param_count[r]:>9d} "
+            f"  {str(slot):>12} {rank_param_count[slot]:>9d} "
             f"{numel_m:>12.2f} {flops_g:>14.2f}"
         )
 
     def _stats(xs):
         if not xs:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0
         mx, mn = max(xs), min(xs)
         mean = sum(xs) / len(xs)
         return mx, mn, (mx / mn if mn > 0 else float("inf")), mean
 
-    mx, mn, ratio, mean = _stats(rank_loads)
+    numel_vals = [rank_loads[s] for s in slots]
+    flops_vals = [rank_flops[s] for s in slots]
+    mx, mn, ratio, _ = _stats(numel_vals)
     print(f"\n  numel     : max={mx/1e6:.2f}M  min={mn/1e6:.2f}M  max/min={ratio:.3f}")
-    mx, mn, ratio, mean = _stats(rank_flops)
+    mx, mn, ratio, _ = _stats(flops_vals)
     print(f"  ns_flops  : max={mx/1e9:.2f}G  min={mn/1e9:.2f}G  max/min={ratio:.3f}")
     print()
-    print("  Per-rank param list (layer, shape, numel, ns_flops):")
-    for r in range(world_size):
-        print(f"  --- rank {r} ---")
-        for layer_id, shape, numel, flops in rank_items[r]:
+    print("  Per-slot param list (layer, shape, numel, ns_flops):")
+    for slot in slots:
+        print(f"  --- slot {slot} ---")
+        for layer_id, shape, numel, flops in rank_items[slot]:
             print(
                 f"    {layer_id:>12}  shape={str(shape):<22} "
                 f"numel={numel/1e6:>7.2f}M  flops={flops/1e9:>7.2f}G"

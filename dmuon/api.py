@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 
+from ._owner_rank import normalize_owner_rank
 from .comm import DedicatedCommContext
 from .group import DedicatedParamGroup
 from .param import DedicatedParam
@@ -74,6 +75,7 @@ def dedicate_params(
     predicate: Callable[[str, nn.Parameter], bool],
     compute_dtype: torch.dtype = None,
     reshard_after_forward: bool = True,
+    replicate_mesh: Optional[DeviceMesh] = None,
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -88,7 +90,9 @@ def dedicate_params(
 
     Args:
         model: The model whose parameters to partition.
-        mesh: 1D DeviceMesh for the data-parallel dimension.
+        mesh: 1D DeviceMesh over the *shard* dimension (a.k.a. ``dp_group``).
+            When ``replicate_mesh`` is provided, this becomes the shard axis
+            of the HSDP 2D mesh.
         predicate: Callable ``(param_name, param) -> bool``. Parameters
             returning True will use dedicated ownership.
         compute_dtype: Optional dtype for communication (e.g., torch.bfloat16).
@@ -96,53 +100,82 @@ def dedicate_params(
             forward and re-broadcast in backward. If False (SHARD_GRAD_OP mode),
             keep params unsharded through forward+backward, eliminating backward
             broadcasts at the cost of higher memory.
+        replicate_mesh: Optional 1D DeviceMesh over the *replicate* dimension.
+            When provided, dedicate_params accepts a HSDP-style 2D layout; the
+            LPT partition then balances globally over ``G·R`` owner slots
+            (G = shard size, R = replicate size).  **Phase A** only plumbs the
+            2D owner coord — all actual collectives still run on the shard
+            group only; the replicate-dim reduce/broadcast lands in Phase B/C.
 
     Returns:
-        Assignment dict mapping each dedicated parameter to its owner rank.
+        Assignment dict mapping each dedicated parameter to its owner rank
+        (``int`` in 1D shard-only mode, ``Tuple[int, int]`` in HSDP mode).
     """
-    # 1. Compute balanced assignment
-    assignment = compute_balanced_assignment(model, mesh, predicate)
+    # 1. Compute balanced assignment (passes ``replicate_mesh`` through so
+    #    Phase A.3 can switch to 2D LPT; in Phase A partition.py still returns
+    #    plain shard ints, which are normalized below).
+    assignment = compute_balanced_assignment(
+        model, mesh, predicate, replicate_mesh=replicate_mesh
+    )
     if not assignment:
         logger.warning("dedicate_params: no parameters matched the predicate")
         return assignment
 
+    # Normalize every assignment value to a 2D ``(shard, replicate)`` coord.
+    # In shard-only mode (``replicate_mesh is None``) partition.py returns
+    # ints, which get promoted to ``(int, 0)`` — identical behaviour to
+    # pre-Phase-A code paths.
+    normalized: dict[nn.Parameter, tuple[int, int]] = {
+        param: normalize_owner_rank(owner) for param, owner in assignment.items()
+    }
+
     # Log assignment summary
-    world_size = mesh.size()
-    rank_loads = defaultdict(int)
-    for param, rank in assignment.items():
-        rank_loads[rank] += param.numel()
-    max_load = max(rank_loads.values())
-    min_load = min(rank_loads.values()) if len(rank_loads) == world_size else 0
+    shard_size = mesh.size()
+    replicate_size = replicate_mesh.size() if replicate_mesh is not None else 1
+    total_slots = shard_size * replicate_size
+    rank_loads: dict[tuple[int, int], int] = defaultdict(int)
+    for param, coord in normalized.items():
+        rank_loads[coord] += param.numel()
+    loads_list = [
+        rank_loads.get((s, r), 0)
+        for s in range(shard_size)
+        for r in range(replicate_size)
+    ]
+    max_load = max(loads_list) if loads_list else 0
+    min_load = min(loads_list) if loads_list else 0
     imbalance = (max_load - min_load) / max(max_load, 1)
+    mode = "HSDP" if replicate_mesh is not None else "shard-only"
     logger.info(
-        f"dedicate_params: {len(assignment)} params assigned to {world_size} ranks, "
-        f"imbalance={imbalance:.1%}, "
-        f"loads={[rank_loads.get(r, 0) for r in range(world_size)]}"
+        f"dedicate_params[{mode}]: {len(normalized)} params over {total_slots} "
+        f"owner slots (shard={shard_size}, replicate={replicate_size}), "
+        f"imbalance={imbalance:.1%}, loads={loads_list}"
     )
 
     # 2. Mark parameters
-    for param, owner_rank in assignment.items():
-        param._dedicated_owner_rank = owner_rank
+    for param, coord in normalized.items():
+        param._dedicated_owner_rank = coord
 
     # 3. Create shared communication context
     dp_group = mesh.get_group()
+    replicate_group = replicate_mesh.get_group() if replicate_mesh is not None else None
     device_type = mesh.device_type
     device = torch.device(device_type, torch.cuda.current_device())
-    comm_ctx = DedicatedCommContext(device)
+    comm_ctx = DedicatedCommContext(device, replicate_group=replicate_group)
 
     # 4. Group by layer module and create DedicatedParam + DedicatedState
     layer_to_dparams: dict[nn.Module, list[DedicatedParam]] = defaultdict(list)
 
-    for param, owner_rank in assignment.items():
+    for param, coord in normalized.items():
         layer_module, parent_module, param_name = _find_layer_module(model, param)
         d_param = DedicatedParam(
             param=param,
             module=parent_module,
             param_name=param_name,
-            owner_rank=owner_rank,
+            owner_rank=coord,
             dp_group=dp_group,
             device=device,
             compute_dtype=compute_dtype,
+            replicate_group=replicate_group,
         )
         layer_to_dparams[layer_module].append(d_param)
 
