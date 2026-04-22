@@ -149,10 +149,27 @@ def record_fallback_from_group(group, step: int) -> None:
 # ---- Convenience: collect all samples from a model ------------------------
 
 
-def collect_and_report(model: nn.Module) -> None:
-    """Called from user code (e.g. at end of training) to print the
-    rank-0 report.  No-op when the env var is off.
+def replicate_profile_report(model: nn.Module) -> None:
+    """Print the rank-0 per-group replicate-broadcast wait time report.
 
-    When distributed is initialised, rank 0 prints; other ranks skip.
+    Gated entirely by :envvar:`DMUON_REPLICATE_PROFILE`. When unset or ``"0"``
+    this is a cheap no-op; set ``DMUON_REPLICATE_PROFILE=1`` at process
+    start to enable sample collection in ``_pre_forward_wait``.
+
+    The report shows n / mean / p50 / p90 / p99 / max wait times (μs) per
+    DMuon group, plus fallback events if any were triggered. Intended to
+    be called once at the end of training (or at checkpoint time) to
+    diagnose async broadcast hiding quality.
+
+    Args:
+        model: The model with DMuon-attached groups. Only used here to
+            match the API shape of other public utilities; the actual
+            profile state is module-global.
+
+    When distributed is initialised, only rank 0 prints; other ranks skip.
     """
     get_profile().report()
+
+
+# Back-compat alias for existing imports (pre-rename 2026-04-22).
+collect_and_report = replicate_profile_report

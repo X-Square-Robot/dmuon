@@ -43,9 +43,7 @@ from .optim import (
     newton_schulz,
 )
 from .patch import install_patch
-from ._replicate_profile import (
-    collect_and_report as replicate_profile_report,
-)
+from ._replicate_profile import replicate_profile_report
 from .utils import (
     broadcast_all_updates,
     broadcast_all_updates_async,

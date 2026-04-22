@@ -54,6 +54,19 @@ class DedicatedCommContext:
         device: torch.device,
         replicate_group: Optional[dist.ProcessGroup] = None,
     ):
+        """Build the shared communication context for one model's
+        dedicated-ownership groups.
+
+        Args:
+            device: CUDA device the streams and collectives run on.
+            replicate_group: ``ProcessGroup`` spanning the replicate
+                dimension of the HSDP 2D mesh. ``None`` in 1D shard-only
+                mode (the default); downstream code short-circuits the
+                replicate-dim reduce/broadcast when this is ``None``.
+
+        Normally constructed by :func:`dmuon.dedicate_params`, not by
+        user code directly.
+        """
         self.device = device
         self.broadcast_stream = torch.cuda.Stream(device=device, priority=-1)
         self.reduce_stream = torch.cuda.Stream(device=device, priority=-1)

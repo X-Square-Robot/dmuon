@@ -33,7 +33,11 @@ logger = logging.getLogger(__name__)
 # Coefficients — per-step, from Dao-AILab/gram-newton-schulz
 # ---------------------------------------------------------------------------
 
-# https://x.com/YouJiacheng/status/1905861218138804534
+#: 5-step Newton-Schulz polynomial coefficients from @YouJiacheng
+#: (https://x.com/YouJiacheng/status/1905861218138804534). Tuned for faster
+#: convergence than the original Muon paper's coefficients at 5 iterations.
+#: Each inner list is ``[a, b, c]`` for one NS step's polynomial
+#: ``a*X + b*X*X^T*X + c*(X*X^T)^2*X``.
 YOU_COEFFICIENTS = [
     [4.0848, -6.8946, 2.9270],
     [3.9505, -6.3029, 2.6377],
@@ -51,6 +55,12 @@ _UNMODIFIED_POLAR_EXPRESS = [
     (3.3184196573706015, -2.488488024314874, 0.51004894012372),
     (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
 ]
+
+#: 5-step Newton-Schulz coefficients from the Polar Express paper
+#: (https://arxiv.org/abs/2505.16932), rescaled by a 1.05 safety factor
+#: for numerical stability. **This is DMuon's default backend** and is
+#: what ``NewtonSchulz("gram")`` / ``NewtonSchulz("direct")`` use when
+#: no explicit ``coefficients`` argument is provided.
 POLAR_EXPRESS_COEFFICIENTS = [
     (a / _SAFETY_FACTOR, b / _SAFETY_FACTOR**3, c / _SAFETY_FACTOR**5)
     for (a, b, c) in _UNMODIFIED_POLAR_EXPRESS
