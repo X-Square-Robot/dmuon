@@ -69,6 +69,63 @@ def _find_layer_module(
     return layer_module, parent_module, param_name
 
 
+def _find_hook_module(
+    model: nn.Module,
+    target_param: nn.Parameter,
+    hook_boundary_predicate: Optional[Callable[[nn.Module], bool]],
+    strict: bool = True,
+) -> Optional[nn.Module]:
+    """Return the lowest ancestor of ``target_param`` where the predicate is True.
+
+    When ``hook_boundary_predicate`` is None, returns None — caller should fall
+    back to the ``_find_layer_module`` path. This split keeps the two semantics
+    (partition layer key vs. hook attachment module) decoupled.
+
+    Args:
+        model: Root module to search within.
+        target_param: Parameter whose ancestor we want.
+        hook_boundary_predicate: Callable ``(module) -> bool``. None means the
+            caller opted out of explicit hook boundaries.
+        strict: When True (default), raise if no ancestor matches the predicate.
+            When False, fall back to the parameter's direct parent module.
+
+    Returns:
+        The chosen hook module, or None when predicate is None.
+    """
+    if hook_boundary_predicate is None:
+        return None
+
+    parent_module, _ = _find_parent_module(model, target_param)
+
+    # Find parent's FQN (relative to `model`)
+    parent_fqn: Optional[str] = None
+    for name, mod in model.named_modules():
+        if mod is parent_module:
+            parent_fqn = name
+            break
+
+    # Walk from longest prefix down to root, checking the submodule at each
+    # prefix against the predicate.
+    parts = parent_fqn.split(".") if parent_fqn else []
+    for depth in range(len(parts), -1, -1):
+        path = ".".join(parts[:depth])
+        try:
+            mod = model.get_submodule(path) if path else model
+        except AttributeError:
+            continue
+        if hook_boundary_predicate(mod):
+            return mod
+
+    if strict:
+        raise ValueError(
+            f"param of shape {tuple(target_param.shape)} "
+            f"(parent_fqn={parent_fqn!r}): no ancestor matched "
+            f"hook_boundary_predicate. Either extend the predicate to cover this "
+            f"module, or exclude the param via the dedicate_params `predicate` arg."
+        )
+    return parent_module
+
+
 def dedicate_params(
     model: nn.Module,
     mesh: DeviceMesh,
@@ -76,6 +133,8 @@ def dedicate_params(
     compute_dtype: torch.dtype = None,
     reshard_after_forward: bool = True,
     replicate_mesh: Optional[DeviceMesh] = None,
+    hook_boundary_predicate: Optional[Callable[[nn.Module], bool]] = None,
+    hook_boundary_strict: bool = True,
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -106,6 +165,18 @@ def dedicate_params(
             (G = shard size, R = replicate size).  **Phase A** only plumbs the
             2D owner coord — all actual collectives still run on the shard
             group only; the replicate-dim reduce/broadcast lands in Phase B/C.
+        hook_boundary_predicate: Optional ``(module) -> bool`` selector for the
+            hook attachment module. When set, DMuon registers its pre/post
+            forward hooks on the **lowest ancestor** of each dedicated param
+            where the predicate is True. Use this to align hook boundaries
+            with your FSDP2 ``fully_shard`` boundaries — e.g. treat the whole
+            ViT as one hook site even though its parameters are distributed
+            across ranks. Leave as None to use the built-in ``layers.N`` /
+            ``blocks.N`` heuristic (:func:`_find_layer_module`).
+        hook_boundary_strict: When True (default) and ``hook_boundary_predicate``
+            is given, raise if a dedicated param has no ancestor matching the
+            predicate. When False, fall back to the param's direct parent
+            module. Strict is recommended to avoid silent per-sub-module hooks.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its owner rank
@@ -166,7 +237,19 @@ def dedicate_params(
     layer_to_dparams: dict[nn.Module, list[DedicatedParam]] = defaultdict(list)
 
     for param, coord in normalized.items():
-        layer_module, parent_module, param_name = _find_layer_module(model, param)
+        if hook_boundary_predicate is not None:
+            # User-explicit hook boundary: lowest ancestor where predicate holds.
+            # Mirrors FSDP2 `fully_shard(module, ...)` granularity — the user
+            # tells DMuon where the per-layer unit is, independent of DMuon's
+            # global LPT partition.
+            layer_module = _find_hook_module(
+                model, param, hook_boundary_predicate, strict=hook_boundary_strict
+            )
+            parent_module, param_name = _find_parent_module(model, param)
+        else:
+            # Default heuristic: infer layer module from `layers.N` / `blocks.N`
+            # in the FQN; fall back to parent module if neither matches.
+            layer_module, parent_module, param_name = _find_layer_module(model, param)
         d_param = DedicatedParam(
             param=param,
             module=parent_module,

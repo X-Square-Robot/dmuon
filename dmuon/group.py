@@ -313,7 +313,18 @@ class DedicatedParamGroup:
         Detaching happens first (restores placeholders) so any forward after
         reshard sees a clear no-op tensor rather than a view into 0-sized
         storage.
+
+        If a broadcast was dispatched (e.g. via forward prefetch) but never
+        consumed by a ``wait_for_unshard``, we must drain that event *before*
+        freeing the packed buffer storage — otherwise (1) freeing mid-broadcast
+        is UB, and (2) the stale event persists to the next step, causing
+        ``unshard()`` to short-circuit on the ``_broadcast_event is not None``
+        guard and leaving ``_unsharded_param`` views pointing at freed storage.
         """
+        if self._broadcast_event is not None:
+            # Drain and discard — the prefetched unshard was not consumed.
+            torch.cuda.current_stream().wait_event(self._broadcast_event)
+            self._broadcast_event = None
         for p in self.params:
             p.reshard()
         from ._internal_utils import free_storage
