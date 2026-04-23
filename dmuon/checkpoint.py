@@ -29,7 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from .param import DedicatedParam
+from ._backends.fsdp2.param import DedicatedParam
 from .utils import get_dedicated_params, wait_all_replicate_broadcasts
 
 try:

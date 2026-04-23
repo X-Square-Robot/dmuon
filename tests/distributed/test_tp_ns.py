@@ -319,7 +319,7 @@ def test_shard_dim_full_shape(rank, world_size, device):
     )
 
     # Create DedicatedParam objects manually to test properties
-    from dmuon.param import DedicatedParam
+    from dmuon._backends.fsdp2.param import DedicatedParam
 
     dp_group = dist.group.WORLD
 

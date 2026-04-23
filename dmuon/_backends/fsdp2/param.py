@@ -6,8 +6,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ._internal_utils import unsafe_setattr_param
-from ._owner_rank import OwnerCoord, OwnerRankLike, normalize_owner_rank
+from dmuon._core.internal_utils import unsafe_setattr_param
+from dmuon._core.owner_rank import OwnerCoord, OwnerRankLike, normalize_owner_rank
 
 try:
     from torch.distributed.tensor import DTensor

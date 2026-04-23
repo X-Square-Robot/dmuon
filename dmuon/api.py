@@ -8,12 +8,12 @@ import torch
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 
-from ._owner_rank import normalize_owner_rank
-from .comm import DedicatedCommContext
-from .group import DedicatedParamGroup
-from .param import DedicatedParam
-from .partition import _extract_layer_id, compute_balanced_assignment
-from .state import DedicatedState
+from ._core.owner_rank import normalize_owner_rank
+from ._core.comm import DedicatedCommContext
+from ._backends.fsdp2.group import DedicatedParamGroup
+from ._backends.fsdp2.param import DedicatedParam
+from ._core.partition import _extract_layer_id, compute_balanced_assignment
+from ._core.state import DedicatedState
 
 logger = logging.getLogger(__name__)
 

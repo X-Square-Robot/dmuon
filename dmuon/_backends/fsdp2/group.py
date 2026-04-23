@@ -12,8 +12,8 @@ from typing import NamedTuple, Optional
 import torch
 import torch.distributed as dist
 
-from ._owner_rank import OwnerCoord
-from .comm import DedicatedCommContext
+from dmuon._core.owner_rank import OwnerCoord
+from dmuon._core.comm import DedicatedCommContext
 from .param import DedicatedParam
 
 try:
@@ -197,7 +197,7 @@ class DedicatedParamGroup:
         # Python dispatch + one fused kernel) instead of N separate ``.copy_``
         # calls. dst views survive ``free_storage`` → ``alloc_storage`` because
         # they share the packed buf's Storage object (resize is in-place).
-        from ._internal_utils import free_storage
+        from dmuon._core.internal_utils import free_storage
         self._packed_buf_by_owner: dict[OwnerCoord, torch.Tensor] = {}
         self._copy_in_dsts_by_owner: dict[OwnerCoord, list[torch.Tensor]] = {}
         if self._comm_dtype is not None:
@@ -243,7 +243,7 @@ class DedicatedParamGroup:
         broadcast_stream = self.comm_ctx.broadcast_stream
         broadcast_stream.wait_stream(torch.cuda.current_stream())
 
-        from ._internal_utils import alloc_storage
+        from dmuon._core.internal_utils import alloc_storage
         dp_group = self._dp_group
         local_shard_rank = dp_group.rank()
         with torch.cuda.stream(broadcast_stream):
@@ -327,7 +327,7 @@ class DedicatedParamGroup:
             self._broadcast_event = None
         for p in self.params:
             p.reshard()
-        from ._internal_utils import free_storage
+        from dmuon._core.internal_utils import free_storage
         for packed_buf in self._packed_buf_by_owner.values():
             with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
                 packed_buf
@@ -690,7 +690,7 @@ class DedicatedParamGroup:
             # (only waits on the two timing events on the default stream).
             end.synchronize()
             self._last_replicate_wait_us = start.elapsed_time(end) * 1000.0  # ms→μs
-            from . import _replicate_profile
+            from dmuon import _replicate_profile
             _replicate_profile.record_wait_from_group(
                 self, self._last_replicate_wait_us
             )

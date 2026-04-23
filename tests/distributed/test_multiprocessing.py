@@ -13,9 +13,9 @@ import torch.nn as nn
 # Add parent dir to path for import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from dmuon.comm import DedicatedCommContext
-from dmuon.group import DedicatedParamGroup
-from dmuon.param import DedicatedParam
+from dmuon._core.comm import DedicatedCommContext
+from dmuon._backends.fsdp2.group import DedicatedParamGroup
+from dmuon._backends.fsdp2.param import DedicatedParam
 
 
 def log(rank, msg):

@@ -16,7 +16,7 @@ sys.path.insert(
 )
 
 import dmuon.group as group_mod
-from dmuon.group import (
+from dmuon._backends.fsdp2.group import (
     REPLICATE_FALLBACK_CONSECUTIVE_STEPS,
     REPLICATE_WAIT_THRESHOLD_US,
 )

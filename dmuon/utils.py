@@ -5,9 +5,9 @@ from typing import Optional
 
 import torch.nn as nn
 
-from ._owner_rank import OwnerRankLike, normalize_owner_rank
-from .comm import DedicatedCommContext
-from .param import DedicatedParam
+from ._core.owner_rank import OwnerRankLike, normalize_owner_rank
+from ._core.comm import DedicatedCommContext
+from ._backends.fsdp2.param import DedicatedParam
 
 
 def get_dedicated_params(model: nn.Module) -> list[DedicatedParam]:

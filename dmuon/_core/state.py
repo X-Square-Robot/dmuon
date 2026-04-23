@@ -21,7 +21,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 
 from .comm import DedicatedCommContext
-from .group import DedicatedParamGroup
+from dmuon._backends.fsdp2.group import DedicatedParamGroup
 
 try:
     from torch.distributed.tensor import DTensor as _DTensor

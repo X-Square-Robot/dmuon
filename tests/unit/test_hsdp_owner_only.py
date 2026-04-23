@@ -29,7 +29,7 @@ sys.path.insert(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
 )
 
-from dmuon.param import DedicatedParam
+from dmuon._backends.fsdp2.param import DedicatedParam
 import dmuon.param as param_module
 
 

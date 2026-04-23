@@ -12,8 +12,8 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
-    from .group import DedicatedParamGroup
-    from .state import DedicatedState
+    from ._backends.fsdp2.group import DedicatedParamGroup
+    from ._core.state import DedicatedState
 
 
 class DedicatedCommContext:

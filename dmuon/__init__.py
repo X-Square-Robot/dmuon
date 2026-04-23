@@ -32,7 +32,7 @@ from .checkpoint import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
-from .comm import DedicatedCommContext
+from ._core.comm import DedicatedCommContext
 from .optim import (
     POLAR_EXPRESS_COEFFICIENTS,
     YOU_COEFFICIENTS,
@@ -42,7 +42,7 @@ from .optim import (
     gram_newton_schulz,
     newton_schulz,
 )
-from .patch import install_patch
+from ._backends.fsdp2.patch import install_patch
 from ._replicate_profile import replicate_profile_report
 from .utils import (
     broadcast_all_updates,

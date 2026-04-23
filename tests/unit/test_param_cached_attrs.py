@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from dmuon.param import DedicatedParam
+from dmuon._backends.fsdp2.param import DedicatedParam
 
 
 def _make_local_param(shape, requires_grad=True):

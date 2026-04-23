@@ -9,7 +9,7 @@ semantics we rely on, not the distributed unshard flow itself (covered by
 import pytest
 import torch
 
-from dmuon._internal_utils import alloc_storage, free_storage
+from dmuon._core.internal_utils import alloc_storage, free_storage
 
 
 def _cuda_or_skip():
