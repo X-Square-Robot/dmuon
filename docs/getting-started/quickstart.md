@@ -20,7 +20,7 @@ See [Installation](installation.md) for SYRK acceleration and requirements.
 
 ## Step 2 — Choose your topology
 
-All three variants use the same model definition:
+Both variants use the same model definition:
 
 ```python title="model.py (shared across tabs)"
 import torch
@@ -48,53 +48,14 @@ class TinyMLP(nn.Module):
         return self.head(x).sum()
 ```
 
-=== "Single Node — DDP-style (1D mesh, no fully_shard)"
-
-    Simplest setup: 1D mesh, dedicated ownership only, no FSDP2 sharding.
-    Good for quick sanity checks or models that fit in single-GPU memory.
-
-    ```python title="train_ddp.py"
-    import torch
-    import torch.distributed as dist
-    from torch.distributed.device_mesh import init_device_mesh
-    import dmuon
-    from model import TinyMLP
-
-    def main() -> None:
-        dist.init_process_group("nccl")
-        rank, world_size = dist.get_rank(), dist.get_world_size()
-        torch.cuda.set_device(rank)
-
-        mesh = init_device_mesh("cuda", (world_size,))
-        torch.manual_seed(42)
-        model = TinyMLP().cuda()
-
-        dmuon.dedicate_params(
-            model, mesh,
-            predicate=lambda n, p: "proj" in n and p.ndim == 2,
-        )
-        optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, ns_steps=5,
-                               adamw_lr=1e-3)
-
-        for step in range(20):
-            optimizer.zero_grad()
-            loss = model(torch.randn(4, 512, device="cuda"))
-            loss.backward()
-            optimizer.step()
-            if rank == 0 and step % 5 == 0:
-                print(f"step {step:3d}  loss={loss.item():.4f}")
-
-        dist.destroy_process_group()
-
-    if __name__ == "__main__":
-        main()
-    ```
-
 === "Single Node — FSDP2 (default Z3 mode)"
 
-    Adds `fully_shard` on top. Non-Muon params (LayerNorm) use FSDP2
-    ZeRO-3. Dedicated params are auto-skipped by the `import dmuon`
-    monkey-patch.
+    Adds `fully_shard` on top of dedicated ownership. The non-dedicated
+    params here are `ln.weight`, `ln.bias` (1D), and `head.weight` (2D
+    but excluded by the `"proj" in n` predicate) — FSDP2 ZeRO-3 shards
+    them. The monkey-patch installed at `import dmuon` makes
+    `fully_shard()` skip any parameter already claimed by
+    `dedicate_params`, so the two systems partition disjoint sets.
 
     ```python title="train_fsdp2.py"
     import torch
@@ -219,6 +180,23 @@ step  10  loss=0.4217
 step  15  loss=0.1583
 ```
 
+!!! tip "Confirm the fast path"
+    Add a one-liner at the top of your script to verify which SYRK
+    kernel will run — handy for bug reports and sanity-checking new
+    cluster builds:
+
+    ```python
+    import dmuon
+    print(dmuon.get_ns_backend())
+    # Gram NS · kernel=cute_sm80 (SM80, DMuon internal)   ← A100/A800 fast path
+    # Gram NS · kernel=cublas (SM80, universal fallback)   ← CuteDSL not built
+    # Gram NS · kernel=quack (SM90, Tri Dao quack)         ← H100 fast path (Phase B-H)
+    ```
+
+    See [Backend dispatch](../reference/newton-schulz.md#backend-dispatch)
+    for the full auto-detection ladder and the `kernel=` / `DMUON_NS_KERNEL`
+    overrides.
+
 ---
 
 ## What just happened?
@@ -227,8 +205,10 @@ step  15  loss=0.1583
    assigned to one owner rank. Owners store the full parameter; others hold
    placeholders. Forward/backward hooks registered at layer level.
 
-2. **`fully_shard()`** — FSDP2 sharded non-dedicated params (LayerNorm).
-   Dedicated params skipped automatically by the `import dmuon` monkey-patch.
+2. **`fully_shard()`** — FSDP2 shards the remaining non-dedicated params
+   (`ln.weight`, `ln.bias`, `head.weight`). The monkey-patch installed at
+   `import dmuon` makes `fully_shard()` skip any parameter already claimed
+   by `dedicate_params`, so DMuon and FSDP2 partition disjoint sets.
 
 3. **`dmuon.Muon()`** — Newton-Schulz on owned dedicated params; AdamW on
    FSDP2-sharded params. No all-gather needed.

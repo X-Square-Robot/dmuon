@@ -194,9 +194,14 @@ for step, batch in enumerate(dataloader):
 
 ```python
 print(f"NS 后端: {dmuon.get_ns_backend()}")
-# "syrk_sm80" = CuteDSL SYRK 内核（最快）
-# "compiled"  = @torch.compile 后备方案
+# "Gram NS · kernel=cute_sm80 (SM80, DMuon internal)"    — A100/A800 快路径
+# "Gram NS · kernel=quack    (SM90, Tri Dao quack)"      — H100/B200/B300 快路径
+# "Gram NS · kernel=cublas   (SM80, universal fallback)" — 通用 cuBLAS 后备
 ```
+
+`dmuon.get_backend_status()` 返回完整的各后端可用性 dict。完整的
+自动检测阶梯与 `kernel=` / `DMUON_NS_KERNEL` 覆盖方式详见
+[后端分发](../reference/newton-schulz.md#backend-dispatch)。
 
 ### 验证参数分配
 

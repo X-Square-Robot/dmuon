@@ -25,6 +25,34 @@
 
 ---
 
+## Completed (2026-04-23 → 2026-04-24 NS backend dispatch sweep — B1–B8)
+
+Canonical docs: `docs/internal/research/backend_dispatch_design.md`,
+`docs/internal/research/ns_backend_dispatch_plan.md`,
+`docs/internal/benchmarks/ns_backend_bench_a800.md`,
+`docs/internal/benchmarks/quack_smoke_b300.md`.
+
+- [x] **B1** — `syrk_quack.py` soft-dep shell + `ADAPTER_READY` circuit breaker
+- [x] **B2** — `syrk_backends.py` unified dispatch (`SyrkBackend` enum, auto-detection ladder, `syrk_dispatch` entry)
+- [x] **B3** — `get_ns_backend()` rewrite + new `get_backend_status()` public API
+- [x] **B4** — `NewtonSchulz(kernel=…)` + `DMUON_NS_KERNEL` env var + `deterministic` backward-compat alias
+- [x] **B5** — Autotune cache split per (GPU × backend) + legacy `.bak_preB5` migration
+- [x] **B6-A** — A800 benchmark matrix (24 cells), 1.3–1.7× cute_sm80 speedup at M ≥ 4096
+- [x] **B7** — quack API smoke on B300 (SM103): signature, dtype/shape matrix, perf crossover at M ≈ 4096
+- [x] **B8** — real `syrk_quack.syrk` adapter + 9 correctness tests; B300 `kernel=auto → quack` end-to-end, Gram NS parity with cuBLAS
+- [x] User-facing docs — `reference/newton-schulz.md` (EN+中文) backend dispatch section with 3 ASCII diagrams + quickstart `get_ns_backend()` self-check
+
+---
+
+## NS Backend Dispatch — Phase B-H remainder (hardware-blocked)
+
+Waiting on H100 / B200 access; B300 work is covered in the "Completed" block above.
+
+- [ ] **B9** — H100 + B200 benchmark matrix (re-run `tests/precision/bench_backends.py` on each), verify `kernel="auto"` selects quack, export to `docs/internal/benchmarks/ns_backend_bench_h100.md` + `…_b200.md`
+- [ ] **B10** — Cross-backend loss parity (single training step, `kernel="quack"` vs `kernel="cublas"`, bf16 atol=1e-4) + pin `quack-kernels` version range in `pyproject.toml` + changelog entry for the new opt-in backend
+
+---
+
 ## Pre-Paper Submission P0 (2026-05 engineering, ~10 days total)
 
 ### Naive Baseline Scripts (for E1 per-byte traces + E2 speedup A/B)

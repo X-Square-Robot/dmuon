@@ -103,7 +103,7 @@ dmuon.replicate_profile_report()
 `_update_replicate_fallback` 调用生效：
 
 ```python title="tune_thresholds.py"
-import dmuon.group as g
+import dmuon._backends.fsdp2.group as g
 
 # 把阈值提高到 250 μs，才算一次"慢步骤"
 g.REPLICATE_WAIT_THRESHOLD_US = 250.0      # 默认：100.0

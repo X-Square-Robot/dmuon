@@ -113,7 +113,7 @@ module-global in `dmuon.group`; changes take effect immediately for all subseque
 `_update_replicate_fallback` calls:
 
 ```python title="tune_thresholds.py"
-import dmuon.group as g
+import dmuon._backends.fsdp2.group as g
 
 # Raise the threshold to 250 μs before declaring a step "slow".
 g.REPLICATE_WAIT_THRESHOLD_US = 250.0      # default: 100.0

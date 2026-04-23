@@ -55,3 +55,6 @@ site/
 
 # Precision experiment artifacts (generated on demand)
 tests/precision/artifacts/
+
+# torch.profiler trace artifacts — regenerate, don't commit
+tests/distributed/*.pt.trace.json
