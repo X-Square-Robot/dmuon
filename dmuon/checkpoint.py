@@ -29,7 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from ._backends.fsdp2.param import DedicatedParam
+from ._backends.fsdp2 import DedicatedParam
 from .utils import get_dedicated_params, wait_all_replicate_broadcasts
 
 try:
@@ -236,11 +236,22 @@ def get_model_state_dict(
 
     sd: dict[str, torch.Tensor] = {}
 
-    # 1. Dedicated params: broadcast from owner.
+    # 1. Dedicated params.
+    #    FSDP2 path: broadcast from owner (every shard-peer holds _owned_data;
+    #    non-shard-peers need the bytes).
+    #    DDP path: every rank already has the live ``nn.Parameter`` in sync
+    #    (post-step broadcast was drained above), so read .data directly.
     for dp, fqn in dp_fqns.items():
-        sd[fqn] = _broadcast_from_owner(dp, cpu_offload=cpu_offload)
+        mode = getattr(dp._orig_param if hasattr(dp, "_orig_param") else None,
+                       "_dedicated_mode", None)
+        if mode == "ddp":
+            t = dp._orig_param.data
+            sd[fqn] = t.cpu() if cpu_offload else t.clone()
+        else:
+            sd[fqn] = _broadcast_from_owner(dp, cpu_offload=cpu_offload)
 
-    # 2. FSDP2 symmetric params: all-gather sharded DTensors.
+    # 2. Non-dedicated params. FSDP2 path → all-gather sharded DTensors.
+    #    DDP-replicate path → param is already full on every rank; read .data.
     for name, param in model.named_parameters():
         if name in dedicated_fqn_set:
             continue
@@ -276,16 +287,21 @@ def set_model_state_dict(
     fqn_to_dp = {fqn: dp for dp, fqn in dp_fqns.items()}
     dedicated_fqn_set = set(fqn_to_dp.keys())
 
-    # 2. Load dedicated params: copy from state_dict into every rank that
-    # actually holds an ``_owned_data`` buffer — that is, every shard-peer
-    # of the owner across replicate rows.  Without this, non-global-owner
-    # shard-peers keep their pre-load value and the next shard-dim broadcast
-    # sends stale data for the other row's shard column.
+    # 2. Load dedicated params.
+    #    FSDP2 path: copy from state_dict into every rank that holds
+    #    ``_owned_data`` (every shard-peer across replicate rows).
+    #    DDP path: every rank holds ``_owned_data`` AND the live
+    #    ``nn.Parameter`` — copy the state into both so subsequent forwards
+    #    see the loaded value and the next NS step reads from it.
     for fqn, dp in fqn_to_dp.items():
         if fqn not in state_dict:
             continue
         if dp._owned_data is not None:
             dp._owned_data.copy_(state_dict[fqn].to(dp._orig_dtype).to(dp.device))
+        # DDP path: sync the live parameter too.
+        orig_param = getattr(dp, "_orig_param", None)
+        if orig_param is not None and getattr(orig_param, "_dedicated_mode", None) == "ddp":
+            orig_param.data.copy_(state_dict[fqn].to(orig_param.dtype).to(orig_param.device))
 
     # 3. Load symmetric params: manually shard full tensors into FSDP2 DTensors.
     for name, param in model.named_parameters():

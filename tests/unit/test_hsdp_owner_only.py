@@ -30,7 +30,7 @@ sys.path.insert(
 )
 
 from dmuon._backends.fsdp2.param import DedicatedParam
-import dmuon.param as param_module
+import dmuon._backends.fsdp2.param as param_module
 
 
 class _StubGroup:

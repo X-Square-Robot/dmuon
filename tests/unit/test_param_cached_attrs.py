@@ -35,8 +35,8 @@ def _make_dp(
         def get_global_rank(group, rank):
             return rank
 
-    # Patch dmuon.param.dist.get_global_rank for this construction
-    import dmuon.param as param_module
+    # Patch dmuon._backends.fsdp2.param.dist.get_global_rank for this construction
+    import dmuon._backends.fsdp2.param as param_module
 
     orig_dist = param_module.dist
     param_module.dist = _StubDist()

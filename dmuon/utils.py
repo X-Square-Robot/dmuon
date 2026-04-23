@@ -5,9 +5,10 @@ from typing import Optional
 
 import torch.nn as nn
 
-from ._core.owner_rank import OwnerRankLike, normalize_owner_rank
+from ._backends.ddp import DedicatedParamGroupDDP
+from ._backends.fsdp2 import DedicatedParam
 from ._core.comm import DedicatedCommContext
-from ._backends.fsdp2.param import DedicatedParam
+from ._core.owner_rank import OwnerRankLike, normalize_owner_rank
 
 
 def get_dedicated_params(model: nn.Module) -> list[DedicatedParam]:
@@ -42,10 +43,20 @@ def wait_all_reduces(model: nn.Module) -> None:
     Gradient reduces are dispatched asynchronously during backward to overlap
     with backward computation. This function waits for them to finish and
     makes ``_reduced_grad`` available on each owner's DedicatedParam.
+
+    T2: after the DP reduce pipeline resolves, kick off the TP gather (no-op
+    for groups with no TP-sharded params) so every TP owner has its
+    ``_tp_full_grad`` ready for the optimizer step.  The gather is
+    dispatched on ``reduce_stream`` — see
+    ``DedicatedParamGroup.tp_gather_grads``.
     """
     for module in model.modules():
         if hasattr(module, "_dedicated_state"):
-            module._dedicated_state.group.wait_for_reduce()
+            g = module._dedicated_state.group
+            g.wait_for_reduce()
+            gather = getattr(g, "tp_gather_grads", None)
+            if gather is not None:
+                gather()
 
 
 def _iter_groups(model: nn.Module):
@@ -55,20 +66,61 @@ def _iter_groups(model: nn.Module):
             yield module._dedicated_state.group
 
 
-def broadcast_all_updates(model: nn.Module) -> None:
-    """Phase B.2 (sync): fan the post-step ``_owned_data`` from each global
-    owner to its replicate peers (HSDP only; no-op in 1D mode).
+def _dispatch_post_step_sync(g) -> None:
+    """Dispatch the post-step broadcast for one group (sync variant).
 
-    The dispatch and wait phases are separated so the NCCL collectives can
-    pipeline before we start blocking on events.  Phase C's async path
-    uses :func:`broadcast_all_updates_async` + per-layer wait via
-    ``_pre_forward_wait`` instead.
+    FSDP2 path:
+      1. (T2b) ``tp_scatter_delta`` — fan the full-matrix NS update back
+         to each DP-owner TP shard (no-op when the group has no TP-sharded
+         params).  Must run BEFORE the replicate broadcast so every DP
+         owner's ``_owned_data`` carries the TP-correct update.
+      2. ``replicate_broadcast_sync`` — fans ``_owned_data`` from the
+         global owner to replicate peers along the HSDP replicate axis
+         (no-op in 1D shard-only mode).
+
+    DDP path: fans ``_owned_data`` from the owner across the DP group.
+    """
+    if isinstance(g, DedicatedParamGroupDDP):
+        g.post_step_broadcast_sync()
+    else:
+        scatter = getattr(g, "tp_scatter_delta", None)
+        if scatter is not None:
+            scatter()
+        g.replicate_broadcast_sync()
+
+
+def _dispatch_post_step_async(g) -> None:
+    if isinstance(g, DedicatedParamGroupDDP):
+        g.post_step_broadcast_async()
+    else:
+        # T2d: async TP scatter (O2 overlap per tp_design.md §4.2) —
+        # dispatch on ``replicate_broadcast_stream`` without waiting; the
+        # cross-call event is drained on the next ``_pre_forward_wait``.
+        scatter_async = getattr(g, "tp_scatter_delta_async", None)
+        if scatter_async is not None:
+            scatter_async()
+        g.replicate_broadcast_async()
+
+
+def _wait_post_step(g) -> None:
+    if isinstance(g, DedicatedParamGroupDDP):
+        g.wait_for_post_step_broadcast()
+    else:
+        g.wait_for_replicate_broadcast()
+
+
+def broadcast_all_updates(model: nn.Module) -> None:
+    """Sync post-step broadcast of updated ``_owned_data``.
+
+    Dispatches on every dedicated group, then drains. FSDP2 path fans
+    across the HSDP replicate axis (no-op for 1D); DDP path fans across
+    the DP group.
     """
     groups = list(_iter_groups(model))
     for g in groups:
-        g.replicate_broadcast_sync()
+        _dispatch_post_step_sync(g)
     for g in groups:
-        g.wait_for_replicate_broadcast()
+        _wait_post_step(g)
 
 
 def broadcast_all_updates_async(model: nn.Module) -> None:
@@ -107,15 +159,21 @@ def broadcast_all_updates_async(model: nn.Module) -> None:
             seen.add(id(g))
             order.append(g)
     for g in order:
-        g.replicate_broadcast_async()
+        _dispatch_post_step_async(g)
 
 
 def update_replicate_fallback(model: nn.Module) -> None:
-    """Phase C.4: advance the async→sync fallback state machine on every
-    group.  Cheap no-op when the profile env var is off (every group's
-    ``_last_replicate_wait_us`` stays at 0.0)."""
+    """Phase C.4 + T2e: advance BOTH the replicate-broadcast and TP-scatter
+    async→sync fallback state machines on every group.  Cheap no-op when
+    the profile env var is off (every group's wait-time sample stays 0.0
+    and the state machine short-circuits)."""
     for g in _iter_groups(model):
-        g._update_replicate_fallback()
+        update_fn = getattr(g, "_update_replicate_fallback", None)
+        if update_fn is not None:
+            update_fn()
+        tp_update = getattr(g, "_update_tp_scatter_fallback", None)
+        if tp_update is not None:
+            tp_update()
 
 
 def reset_replicate_fallback(model: nn.Module) -> None:
@@ -126,6 +184,17 @@ def reset_replicate_fallback(model: nn.Module) -> None:
     """
     for g in _iter_groups(model):
         g.reset_replicate_fallback()
+
+
+def wait_all_post_step_broadcasts(model: nn.Module) -> None:
+    """Alias for :func:`wait_all_replicate_broadcasts`.
+
+    Exposed under a more path-neutral name so DDP-path users do not have
+    to think about HSDP's ``replicate`` terminology. Both FSDP2-path
+    groups (HSDP replicate broadcast) and DDP-path groups (post-step
+    broadcast across the DP group) are drained.
+    """
+    wait_all_replicate_broadcasts(model)
 
 
 def wait_all_replicate_broadcasts(model: nn.Module) -> None:
@@ -140,7 +209,7 @@ def wait_all_replicate_broadcasts(model: nn.Module) -> None:
     """
     for g in _iter_groups(model):
         # Drain both the sync event (if any) and the async state.
-        g.wait_for_replicate_broadcast()
+        _wait_post_step(g)
         g._pre_forward_wait()
 
 
@@ -165,7 +234,7 @@ def no_sync(model: nn.Module):
                 optimizer.step()
                 optimizer.zero_grad()
     """
-    # Disable reduce for dedicated params
+    # Disable reduce for dedicated params (both FSDP2 and DDP paths)
     groups = []
     for module in model.modules():
         if hasattr(module, "_dedicated_state"):
@@ -175,6 +244,12 @@ def no_sync(model: nn.Module):
     # Disable reduce-scatter for FSDP2 symmetric params
     if hasattr(model, "set_requires_gradient_sync"):
         model.set_requires_gradient_sync(False)
+    # Disable all-reduce on the DDP-path replicated group, if present.
+    rep_group = getattr(model, "_replicated_group", None)
+    rep_prev: Optional[bool] = None
+    if rep_group is not None:
+        rep_prev = rep_group._sync_enabled
+        rep_group._sync_enabled = False
     try:
         yield
     finally:
@@ -182,3 +257,5 @@ def no_sync(model: nn.Module):
             group.reduce_grads_enabled = True
         if hasattr(model, "set_requires_gradient_sync"):
             model.set_requires_gradient_sync(True)
+        if rep_group is not None and rep_prev is not None:
+            rep_group._sync_enabled = rep_prev

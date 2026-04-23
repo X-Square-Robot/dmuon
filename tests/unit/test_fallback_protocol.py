@@ -15,7 +15,7 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-import dmuon.group as group_mod
+import dmuon._backends.fsdp2.group as group_mod
 from dmuon._backends.fsdp2.group import (
     REPLICATE_FALLBACK_CONSECUTIVE_STEPS,
     REPLICATE_WAIT_THRESHOLD_US,

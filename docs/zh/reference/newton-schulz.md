@@ -151,67 +151,156 @@ ns = dmuon.NewtonSchulz("gram", restart_iterations=[1, 3])
 
 ---
 
-## SYRK 加速
+## 后端分发（Backend dispatch）
 
-Gram 矩阵 $R = X X^T$ 是对称的。DMuon 的 CuteDSL SYRK 内核
-（改编自 [Dao-AILab/quack](https://github.com/Dao-AILab/quack)）利用这一特性：
+Newton-Schulz 有两条正交选择轴：**算法**（Gram 或 direct）以及底层 **SYRK 内核**实现。
+DMuon 自动分发两者，也分别暴露为用户可显式覆盖的参数。
 
-- 仅计算 $R$ 的下三角半
-- 将结果镜像到上三角
-- 相比通用 GEMM 节省约 50% tile
+### 双轴结构
 
-适用于所有 Gram 空间变体（`newton_schulz`、`gram_newton_schulz`）。
-直接空间变体不使用 SYRK。
+```
+┌─────────────────────────────────────────────────────────────┐
+│  User API:  dmuon.NewtonSchulz(                             │
+│                 backend="gram",     ← 轴 1：算法             │
+│                 kernel="auto",       ← 轴 2：SYRK 内核        │
+│             )                                                │
+├─────────────────────────────────────────────────────────────┤
+│  轴 1 — 算法（Algorithm）                                    │
+│     "gram"    → Gram 空间 NS + SYRK 操作 + 重启机制（默认）  │
+│     "direct"  → 经典参数空间 NS                               │
+├─────────────────────────────────────────────────────────────┤
+│  轴 2 — SYRK 内核后端                                        │
+│     "auto"       → 自动选择当前 GPU 的最佳路径（默认）        │
+│     "quack"      → Tri Dao quack（SM90+，软依赖，opt-in）    │
+│     "cute_sm80"  → DMuon 内置 CuteDSL 内核（仅 SM80/87）     │
+│     "cublas"     → torch.mm / torch.addmm（通用后备）        │
+└─────────────────────────────────────────────────────────────┘
+```
 
-查询当前后端：
+两轴互相正交——任意 `backend` × `kernel` 组合均合法。直接空间 NS 不使用 SYRK，
+因此 `backend="direct"` 时 `kernel` 参数为无效 no-op。
+
+### 自动检测阶梯
+
+`kernel="auto"`（默认）下，DMuon 按如下阶梯为当前设备选择最快可用后端：
+
+```
+在 import 时探测 SM 版本 ─►
+    ┌── SM ≥ 90  ─── quack 已安装？  ── 是 ──► quack
+    │                              │
+    │                              └── 否 ──► cublas + 警告
+    │
+    ├── SM 80/87 ─── cute_sm80 已编译？── 是 ──► cute_sm80
+    │                              │
+    │                              └── 否 ──► cublas
+    │
+    └── SM < 80  ─────────────────────────► cublas
+```
+
+分发遵循 **graceful degradation** 原则：`kernel="auto"` 永远选出一条能跑的路径，
+启动时日志打印实际选中的内核。在 SM80 设备上显式指定 `kernel="quack"` 会**立即报错**
+并给出安装提示。
+
+### 解析优先级
+
+多档开关同时存在时的优先级：
+
+```
+NewtonSchulz(kernel=...) 显式参数           ← 最高（永远获胜）
+          │
+          ▼ 仅当 kernel 仍为 "auto" 时
+DMUON_NS_KERNEL 环境变量
+          │
+          ▼ 仅当环境变量未设置时
+deterministic=True                        ← 旧版别名，映射为 "cublas"
+          │
+          ▼
+自动检测结果
+```
+
+若同时设置 `deterministic=True` 和 `kernel="cute_sm80"`，DMuon 会发出 warning 并
+按显式 `kernel` 生效。
+
+### 查询当前后端
 
 ```python
 import dmuon
 
+# 人类可读的一行概要——适合启动日志
 print(dmuon.get_ns_backend())
-# "syrk_sm80"  — CuteDSL SYRK 内核（SM80+，如 A100/H100）
-# "compiled"   — @torch.compile 后备方案（任意 CUDA GPU）
+# "Gram NS · kernel=cute_sm80 (SM80, DMuon internal)"
+# "Gram NS · kernel=quack (SM90, Tri Dao quack)"
+# "Gram NS · kernel=cublas (SM80, universal fallback)"
+
+# 完整诊断字典——适合 bug report / 程序化检查
+print(dmuon.get_backend_status())
+# {
+#   "sm_version": 80,
+#   "auto_choice": "cute_sm80",
+#   "quack_available": False,
+#   "cute_sm80_available": True,
+#   "cublas_always_available": True,
+# }
 ```
 
-SYRK 内核在 SM80+ GPU 且 CuteDSL 可用时自动激活，否则回退到
-`@torch.compile` PyTorch 实现。
-
-### 确定性模式
-
-SYRK 内核由于浮点累加顺序可能在不同运行间产生非确定性结果。
-如需完全可复现：
+### 强制指定内核
 
 ```python
-ns = dmuon.NewtonSchulz(deterministic=True)
-optimizer = dmuon.Muon(model, ns_backend=ns)
+# 强制 cuBLAS 以获得跨运行的 bit-exact 可复现性
+ns = dmuon.NewtonSchulz(kernel="cublas")
+ns = dmuon.NewtonSchulz(deterministic=True)   # 旧版等价写法
+
+# 强制 SM80 CuteDSL 内核（若未编译则构造时抛错）
+ns = dmuon.NewtonSchulz(kernel="cute_sm80")
+
+# 集群级覆盖（只有当代码里写的是 "auto" 时生效）
+# export DMUON_NS_KERNEL=cublas
 ```
 
-!!! warning "SYRK B != A 已知问题"
-    CuteDSL SYRK 内核在 `B != A` 时（Gram 递推中的某些中间计算）存在已知的
-    非确定性问题。解决方案是使用 `deterministic=True`，将所有运算路由到
-    cuBLAS，代价是约 1.5x 的性能损失。此问题正在追踪中，待后续内核修复。
+!!! info "quack 后端"
+    `quack` SYRK 后端在 SM90+ 设备上、已安装 `quack-kernels` 软依赖（`pip install dmuon[quack]`）
+    时自动启用。已在 B300（SM103）上端到端验证——详见
+    `docs/internal/benchmarks/quack_smoke_b300.md`（含 correctness 矩阵与性能拐点：
+    quack 从 M ≈ 4096 开始占优，M ≥ 8192 时领先显著）。
+
+    运行时 circuit-breaker `dmuon.kernels.syrk_quack.ADAPTER_READY`
+    可设为 `False` 紧急禁用 quack 路径（无需卸载包），届时 `kernel="auto"`
+    会回退到 `cublas`。
+
+    `get_backend_status()["auto_choice"]` 永远反映真正会跑的 kernel，
+    一眼看清 ground truth。
 
 ---
 
-## TP 路由总结
+## TP 路由
 
-当 `Muon` 遇到 TP 分片参数时，按如下决策树选择 NS 路径：
+NS 核函数（`newton_schulz`、`gram_newton_schulz`、`direct_newton_schulz`）
+是**TP 无感**的：它们总是对完整（未分片）矩阵做运算，不接受 `tp_group`
+参数。对于 TP-sharded 参数，DMuon runtime 在调用 NS 之前通过 All-to-All
+gather 把完整矩阵汇聚到指定的 TP owner，NS 运行完后再 scatter 回去：
 
 ```
-参数是带有 TP 组的 DTensor 吗？
-├── 否  → NewtonSchulz.local()  （标准 Gram NS 或 direct，无通信）
-└── 是
-    ├── per_head_ns=True 且 Shard(0) 且 full_m < full_n
-    │   → NewtonSchulz.local()   （逐头，零 TP 通信）
-    ├── block_diagonal_ns=True
-    │   → NewtonSchulz.tp(..., block_diagonal=True)   （零 TP 通信）
-    └── 其他（默认）
-        → NewtonSchulz.tp(..., shard_dim=dp.shard_dim)  （精确 Gram，TP all-reduce）
+DP reduce → TP gather（dist.gather on reduce_stream）→
+    TP owner 在完整 (m, n) 矩阵上跑 Newton-Schulz →
+TP scatter（dist.scatter on replicate_broadcast_stream）→
+    replicate broadcast
 ```
 
-对于 **Shard(0)**（行分片）：迭代转置后使用 $G^T G$，可精确分解为
-$\sum_i G_i^T G_i$——一次 all-reduce 即得精确 Gram。
-对于 **Shard(1)**（列分片）：使用 $G G^T$，分解为 $\sum_i G_i G_i^T$。
+对于任何 `device_mesh` 含有非 DP 轴的 `DTensor` 参数，这套流程会**自动
+触发**——`dmuon.Muon` 不需要任何显式 TP 开关。TP owner 由 `assign_tp_owner`
+选定（MVP 策略 `"rank0"`）。
+
+实际影响：
+
+* **NS 精度与是否 TP 无关**——kernel 永远看到完整矩阵。
+* **每个 TP-sharded 参数的额外通信**：一次 `dist.gather` + 一次
+  `dist.scatter`，每步字节量 `(T−1)/T · |p|`。两者都跑在 DMuon 专用
+  comm stream 上，toy 3D HSDP×TP 上实测和 backward compute **~100%**
+  overlap。
+* **非 TP 参数行为不变**。
+
+具体配置见 [TP 支持指南](../guides/tp-support.md)；完整 lifecycle +
+sync / async 语义见 [`tp_design.md`](../../internal/research/tp_design.md)。
 
 ---
 

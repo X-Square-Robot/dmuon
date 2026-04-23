@@ -53,18 +53,12 @@ class Muon(Optimizer):
 
             ``"gram"`` uses Gram-space NS with SYRK acceleration and restarts.
             ``"direct"`` uses classic parameter-space NS (Muon/Moonlight).
-            TP params requiring Gram decomposition always use
-            ``gram_newton_schulz`` regardless.
+            NS always runs on the full (un-sharded) matrix: for TP-sharded
+            parameters the runtime reassembles the matrix via All-to-All
+            before calling NS (see ``tp_design.md``).
         nesterov: If True (default), use Nesterov momentum lookahead
             before NS orthogonalization: ``ns_input = grad + μ * buf``.
             Recommended by original Muon paper and used by Moonlight.
-        per_head_ns: If True (default), use per-head local NS for narrow
-            Shard(0) params (GQA k/v_proj) where full m < n. Each rank
-            orthogonalizes its heads independently with zero TP communication.
-        block_diagonal_ns: If True, skip Gram all-reduce for ALL TP params
-            and use local Gram only (block-diagonal approximation). Eliminates
-            all TP optimizer communication. Experimental — needs convergence
-            validation.
 
     Example::
 
@@ -98,8 +92,6 @@ class Muon(Optimizer):
         adamw_eps: float = 1e-8,
         ns_backend: Union[str, NewtonSchulz] = "gram",
         nesterov: bool = True,
-        per_head_ns: bool = True,
-        block_diagonal_ns: bool = False,
         replicate_async: bool = True,
     ):
         if isinstance(ns_backend, str):
@@ -113,8 +105,6 @@ class Muon(Optimizer):
         self._ns_steps = ns_steps
         self._ns = ns_backend
         self._nesterov = nesterov
-        self._per_head_ns = per_head_ns
-        self._block_diagonal_ns = block_diagonal_ns
         # Phase C: toggle between async (default, hides broadcast inside
         # the next forward) and Phase B sync (simpler, always-correct).
         # When True, each group's pending event is consumed by its own
@@ -128,6 +118,7 @@ class Muon(Optimizer):
             raise ValueError(
                 "Model has no _dedicated_comm_ctx. Call dmuon.dedicate_params() first."
             )
+        self._comm_ctx = comm_ctx
         self._dedicated_params = []
         for module in model.modules():
             if hasattr(module, "_dedicated_state"):
@@ -135,18 +126,60 @@ class Muon(Optimizer):
                     if dp.is_owner:
                         self._dedicated_params.append(dp)
 
-        # Discover FSDP2-managed params
-        self._fsdp_params = []
+        # Discover FSDP2-managed params AND DDP-replicated params. Both go
+        # into the same AdamW param group downstream. ``_fsdp_params`` keeps
+        # its name for backwards compat with checkpoint.py even though the
+        # list may now contain plain ``nn.Parameter`` (DDP path) alongside
+        # FSDP2's sharded params.
+        self._fsdp_params: list[nn.Parameter] = []
+        fsdp_hit = False
         for module in model.modules():
             fsdp_state = getattr(module, "_get_fsdp_state", lambda: None)()
             if fsdp_state is not None and fsdp_state._fsdp_param_group is not None:
                 for fp in fsdp_state._fsdp_param_group.fsdp_params:
                     self._fsdp_params.append(fp.sharded_param)
+                fsdp_hit = True
 
-        # Build param_groups for Optimizer base class
-        # Group 0: placeholders for dedicated params (for LR scheduler compat)
-        # Group 1: FSDP2 params (AdamW)
-        dedicated_placeholders = [dp._placeholder for dp in self._dedicated_params]
+        rep_group = getattr(model, "_replicated_group", None)
+        replicate_hit = rep_group is not None
+        if replicate_hit:
+            self._fsdp_params.extend(rep_group.params)
+
+        # Non-dedicated parameters must be covered by either fully_shard or
+        # replicate — otherwise their grads are never synced and they never
+        # receive an AdamW update. Fail loudly.
+        non_dedicated_exists = any(
+            not hasattr(p, "_dedicated_owner_rank") and p.requires_grad
+            for p in model.parameters()
+        )
+        if (
+            self._dedicated_params
+            and non_dedicated_exists
+            and not (fsdp_hit or replicate_hit)
+        ):
+            raise RuntimeError(
+                "dmuon.Muon: model has non-dedicated parameters but neither "
+                "fully_shard nor dmuon.replicate was called. Those parameters "
+                "would not be synced across ranks nor updated. Call one of "
+                "fully_shard() or dmuon.replicate(model, mesh=...) before "
+                "constructing Muon."
+            )
+
+        # Build param_groups for Optimizer base class.
+        # Group 0: placeholders for dedicated params (for LR scheduler compat).
+        #   FSDP2 path uses the 0-size _placeholder; DDP path uses the live
+        #   nn.Parameter (there is no separate placeholder, and the LR
+        #   scheduler does not care about the tensor content — it only needs
+        #   a stable Parameter ref).
+        # Group 1: non-dedicated params (FSDP2-sharded or DDP-replicated).
+        dedicated_placeholders = [
+            # FSDP2 path has ``_placeholder`` (0-size nn.Parameter); DDP path
+            # has ``_orig_param`` (live full Parameter). Pick whichever exists
+            # — ``or`` cannot be used because bool() on an empty Tensor is
+            # ambiguous.
+            dp._placeholder if hasattr(dp, "_placeholder") else dp._orig_param
+            for dp in self._dedicated_params
+        ]
         param_groups = [
             {
                 "params": dedicated_placeholders if dedicated_placeholders else [torch.zeros(1)],
@@ -256,6 +289,14 @@ class Muon(Optimizer):
         pt = self._profile_param_timer
         per_param = _balance_profile.per_param_enabled()
 
+        # T2: if any TP-sharded param is present, ``tp_gather_grads`` on
+        # ``reduce_stream`` produced ``_tp_full_grad`` for the TP owner.
+        # Synchronise the compute stream once before the loop so the NS
+        # read below sees that buffer.  No-op when no TP path is live
+        # (reduce_stream is idle or already drained).
+        if any(dp.tp_group is not None for dp in self._dedicated_params):
+            torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
+
         for dp in self._dedicated_params:
             if dp._reduced_grad is None:
                 continue
@@ -266,9 +307,43 @@ class Muon(Optimizer):
                     tuple(dp._owned_data.shape),
                 )
 
-            grad = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1)
+            # TP path (All-to-All): only the TP owner runs NS on the
+            # reassembled full matrix; other DP-owner TP ranks produced
+            # ``_reduced_grad`` too but leave NS to the owner — their
+            # ``_owned_data`` will be overwritten by ``tp_scatter_delta``
+            # with the owner's scattered shard.
+            is_tp = dp.is_dtensor and dp.tp_group is not None
 
-            # Momentum accumulation: buf = μ * buf + grad
+            if is_tp and not dp.is_tp_owner:
+                # Nothing to compute here; tp_scatter_delta will deliver
+                # the update.  Momentum state is owned solely by the TP
+                # owner; non-owner ranks do not track it.  Still publish
+                # the weight-decay factor so the scatter's in-place fuse
+                # on this rank sees a matching wd — every DP-owner rank
+                # computes wd identically from the same lr, wd config.
+                #
+                # DO NOT clear ``_reduced_grad`` here: ``tp_scatter_delta``
+                # uses it as the per-rank "participate in collective"
+                # gate (every rank must agree on the participant set).
+                # It is cleared at the end of the scatter alongside
+                # ``_tp_full_grad`` / ``_tp_full_delta``.
+                dp._tp_wd_factor = (1.0 - lr * wd) if wd > 0 else 1.0
+                if per_param:
+                    pt.end()
+                continue
+
+            if is_tp:
+                assert dp._tp_full_grad is not None, (
+                    f"{getattr(dp, 'param_name', '?')}: tp_gather_grads did "
+                    "not populate _tp_full_grad on TP owner"
+                )
+                grad = dp._tp_full_grad.view(dp._tp_full_grad.shape[0], -1)
+            else:
+                grad = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1)
+
+            # Momentum accumulation: buf = μ * buf + grad.  For TP-sharded
+            # params the buf lives only on the TP owner and is sized to
+            # the full matrix; non-owner ranks never touch this dict.
             dp_id = id(dp)
             if dp_id not in self.state:
                 self.state[dp_id] = {}
@@ -280,54 +355,47 @@ class Muon(Optimizer):
             buf = state["momentum_buffer"]
 
             # Nesterov lookahead: ns_input = grad + μ * buf
-            # (standard Muon/Moonlight convention, gives better direction estimate)
             ns_input = grad.add(buf, alpha=mu) if self._nesterov else buf
 
-            # Newton-Schulz orthogonalization — TP-aware routing:
-            #   Per-head NS: narrow Shard(0) (GQA k/v_proj) → local NS, zero TP comm
-            #   Block-diag NS: skip all-reduce, use local Gram only (experimental)
-            #   Exact Gram NS: all-reduce decomposable Gram → standard path
-            #   Non-TP: local NS (pure DP, owner has full gradient)
-            ns = self._ns
+            # Newton-Schulz on the full (un-sharded) matrix.
+            update = self._ns.local(ns_input, self._ns_steps)
 
-            if dp.is_dtensor and dp.tp_group is not None:
-                shard_dim = dp.shard_dim
-                full_shape = dp.full_shape
-                m_full = full_shape[0]
-                n_full = full_shape[1] if len(full_shape) > 1 else m_full
+            if is_tp:
+                # Produce the **pre-scaled** full-matrix update that
+                # tp_scatter_delta will chop and hand to each DP-owner
+                # TP shard.  Each receiving rank does
+                # ``_owned_data.mul_(wd_factor).add_(scatter_shard)``
+                # to finish the Moonlight update in place — no further
+                # NS-related work on the receivers.
+                m_full = dp.full_shape[0]
+                n_full = (
+                    dp.full_shape[1] if len(dp.full_shape) > 1 else m_full
+                )
+                scale = 0.2 * (max(m_full, n_full) ** 0.5)
+                update_full = update.view(dp.full_shape).to(dp._owned_data.dtype)
+                update_full.mul_(-lr * scale)
+                dp._tp_full_delta = update_full
+                dp._tp_wd_factor = (1.0 - lr * wd) if wd > 0 else 1.0
 
-                if self._per_head_ns and shard_dim == 0 and m_full < n_full:
-                    # Per-head NS: each rank has complete KV heads
-                    update = ns.local(ns_input, self._ns_steps)
-                elif self._block_diagonal_ns:
-                    # Block-diagonal NS: zero TP comm (experimental)
-                    update = ns.tp(
-                        ns_input, dp.tp_group, self._ns_steps,
-                        shard_dim=shard_dim, block_diagonal=True,
-                    )
-                else:
-                    # Exact Gram NS with TP all-reduce
-                    update = ns.tp(
-                        ns_input, dp.tp_group, self._ns_steps, shard_dim=shard_dim,
-                    )
             else:
-                update = ns.local(ns_input, self._ns_steps)
+                # Non-TP path: owner holds full tensor locally; apply in place.
+                owned = dp._owned_data
+                m = owned.shape[0]
+                n = owned.view(m, -1).shape[1]
+                scale = 0.2 * (max(m, n) ** 0.5)
 
-            # Per-param scaling (Moonlight): 0.2 * sqrt(max(m, n))
-            owned = dp._owned_data
-            m = owned.shape[0]
-            n = owned.view(m, -1).shape[1]
-            scale = 0.2 * (max(m, n) ** 0.5)
+                if wd > 0:
+                    owned.mul_(1.0 - lr * wd)
+                owned.add_(
+                    update.view(owned.shape).to(owned.dtype), alpha=-lr * scale
+                )
 
-            # Weight decay (decoupled, like AdamW)
-            if wd > 0:
-                owned.mul_(1.0 - lr * wd)
-
-            # Apply update
-            owned.add_(update.view(owned.shape).to(owned.dtype), alpha=-lr * scale)
-
-            # Clear gradient
-            dp._reduced_grad = None
+            # Non-TP params: clear now.  TP params defer the clear to
+            # ``tp_scatter_delta`` so every TP group peer still sees the
+            # "I had a grad this step" signal when scatter builds its
+            # per-param work list.
+            if not is_tp:
+                dp._reduced_grad = None
 
             if per_param:
                 pt.end()

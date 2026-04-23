@@ -114,6 +114,24 @@ class DedicatedParam:
         self.shard_dim: Optional[int] = self._compute_shard_dim()
         self.full_shape: torch.Size = self._compute_full_shape()
         self.tp_group: Optional[dist.ProcessGroup] = self._compute_tp_group()
+        # T2: TP owner selection (MVP = rank 0 in the TP process group; see
+        # ``tp_design.md`` §8.2).  ``is_tp_owner`` is True on exactly one
+        # rank per (DP-owner × TP group) combo — that rank runs NS on the
+        # full matrix gathered by ``tp_gather_grads``.
+        # ``_tp_owner_global_rank`` is the global rank to pass to
+        # ``dist.gather(dst=...)`` / ``dist.scatter(src=...)``.
+        if self.tp_group is not None:
+            self._tp_owner_local_rank: int = 0
+            self._tp_owner_global_rank: Optional[int] = dist.get_global_rank(
+                self.tp_group, self._tp_owner_local_rank
+            )
+            self.is_tp_owner: bool = (
+                self.tp_group.rank() == self._tp_owner_local_rank
+            )
+        else:
+            self._tp_owner_local_rank = 0
+            self._tp_owner_global_rank = None
+            self.is_tp_owner = False
 
         # Storage: every rank in the owner's shard column keeps a populated
         # ``_owned_data``.
@@ -165,6 +183,23 @@ class DedicatedParam:
 
         # Accumulated gradient for no_sync gradient accumulation (all ranks)
         self._accumulated_grad: Optional[torch.Tensor] = None
+
+        # T2: TP full-matrix buffers.  These only carry data on the TP owner
+        # rank for TP-sharded params; every other rank keeps them at None.
+        #   * ``_tp_full_grad``  — populated by ``tp_gather_grads`` with the
+        #     reassembled (M, N) gradient; consumed by the optimizer step.
+        #   * ``_tp_full_delta`` — populated by the optimizer with the
+        #     **pre-scaled** update ``-lr*scale*NS_output``; consumed by
+        #     ``tp_scatter_delta`` which chops it back into TP-local
+        #     shards and delivers to every DP-owner TP rank.
+        #   * ``_tp_wd_factor``  — ``(1 - lr*wd)``; broadcast via a simple
+        #     Python attribute write before scatter so every receiving
+        #     rank can do ``_owned_data.mul_(wd_factor).add_(shard)`` to
+        #     finish Moonlight's weight-decay + update fuse in place.
+        # For non-TP params (``tp_group is None``) these stay None / 1.0.
+        self._tp_full_grad: Optional[torch.Tensor] = None
+        self._tp_full_delta: Optional[torch.Tensor] = None
+        self._tp_wd_factor: float = 1.0
 
         # Set module to sharded state
         unsafe_setattr_param(self.module, self.param_name, self._placeholder)

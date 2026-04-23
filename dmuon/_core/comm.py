@@ -12,8 +12,11 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
-    from ._backends.fsdp2.group import DedicatedParamGroup
-    from ._core.state import DedicatedState
+    from dmuon._core.state import DedicatedState
+
+    # ``post_forward_order`` is shared across both backends; the list holds
+    # whichever concrete group type is registered (FSDP2 or DDP), so we
+    # leave it untyped rather than enumerate backends here.
 
 
 class DedicatedCommContext:
@@ -77,7 +80,7 @@ class DedicatedCommContext:
         # starving shard-dim collectives.
         self.replicate_broadcast_stream = torch.cuda.Stream(device=device)
         self.replicate_group: Optional[dist.ProcessGroup] = replicate_group
-        self.post_forward_order: list[DedicatedParamGroup] = []
+        self.post_forward_order: list = []  # DedicatedParamGroup | DedicatedParamGroupDDP
         self.all_states: list[DedicatedState] = []
         self.post_backward_final_callback_queued: bool = False
 

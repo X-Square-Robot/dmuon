@@ -12,11 +12,13 @@ sys.path.insert(
 import pytest
 import torch.nn as nn
 
-from dmuon.partition import SMALL_PARAM_THRESHOLD, compute_balanced_assignment
+from dmuon._core.partition import SMALL_PARAM_THRESHOLD, compute_balanced_assignment
 
 
 class FakeDeviceMesh:
     """Minimal stub for DeviceMesh; partition only touches ``.size()``."""
+
+    mesh_dim_names = None
 
     def __init__(self, world_size: int):
         self._world_size = world_size
@@ -63,7 +65,7 @@ def test_1d_returns_int_owners():
     model = _model()
     assignment = compute_balanced_assignment(
         model, mesh, predicate=lambda n, p: "proj" in n
-    )
+    ).dp_owners
     assert assignment, "expected non-empty assignment"
     for owner in assignment.values():
         assert isinstance(owner, int), f"shard-only must return int, got {type(owner)}"
@@ -81,7 +83,7 @@ def test_2d_returns_tuple_owners():
         shard_mesh,
         predicate=lambda n, p: "proj" in n,
         replicate_mesh=replicate_mesh,
-    )
+    ).dp_owners
     assert assignment
     for owner in assignment.values():
         assert isinstance(owner, tuple) and len(owner) == 2, (
@@ -113,7 +115,7 @@ def test_2d_load_balance(shard, replicate, num_layers):
         shard_mesh,
         predicate=lambda n, p: "proj" in n,
         replicate_mesh=replicate_mesh,
-    )
+    ).dp_owners
 
     slot_loads: dict[tuple[int, int], int] = {
         (s, r): 0 for s in range(shard) for r in range(replicate)
@@ -149,7 +151,7 @@ def test_same_layer_distinct_slots_when_enough_slots():
         shard_mesh,
         predicate=lambda n, p: "proj" in n,
         replicate_mesh=replicate_mesh,
-    )
+    ).dp_owners
 
     for layer_idx in range(4):
         layer_large_slots: list[tuple[int, int]] = []
@@ -182,7 +184,7 @@ def test_small_params_merged_in_hsdp():
         shard_mesh,
         predicate=lambda n, p: "proj" in n,
         replicate_mesh=replicate_mesh,
-    )
+    ).dp_owners
     for layer_idx in range(4):
         k = next(
             (p for n, p in model.named_parameters()
@@ -220,7 +222,7 @@ def test_all_slots_used_when_enough_params():
         shard_mesh,
         predicate=lambda n, p: "proj" in n,
         replicate_mesh=replicate_mesh,
-    )
+    ).dp_owners
     used = set(assignment.values())
     expected = {(s, r) for s in range(4) for r in range(2)}
     assert used == expected, f"unused slots: {expected - used}"
@@ -238,13 +240,13 @@ def test_replicate_size_1_matches_shard_only():
 
     flat = compute_balanced_assignment(
         model, shard_mesh, predicate=lambda n, p: "proj" in n
-    )
+    ).dp_owners
     twod = compute_balanced_assignment(
         model,
         shard_mesh,
         predicate=lambda n, p: "proj" in n,
         replicate_mesh=trivial_replicate,
-    )
+    ).dp_owners
 
     assert set(flat.keys()) == set(twod.keys())
     for p in flat:

@@ -1,205 +1,208 @@
 # 张量并行
 
-!!! tip "TL;DR"
-    先应用 TP（`parallelize_module`），再 DMuon（在 DP mesh 上 `dedicate_params`），最后 FSDP2（在 DP mesh 上 `fully_shard`）。DMuon 使用 Gram Newton-Schulz 在 TP 本地分片上运行，仅需一次小型 all-reduce，而无需收集完整梯度矩阵。
+DMuon 通过 `DTensor` 原生支持 PyTorch 张量并行（TP）。你按照惯常方式应用
+TP——DMuon 会**自动检测** TP 分片的参数，并将其导向 All-to-All gather →
+完整矩阵 Newton-Schulz → scatter 流水线；在每个 rank 只持有权重分片的
+情形下仍然保持 Muon 的数学定义不变。
+
+**关键特性**：TP 路径对用户完全透明。`dedicate_params` **不接受** `tp_mesh`
+参数——你传进去的是和 `fully_shard` 一样的 DP 切片，DMuon 通过每个参数的
+`DTensor` 结构自动推断 TP 维度。这与 FSDP2 的 TP-oblivious 设计同构。
 
 ---
 
-!!! warning "TP + HSDP 组合状态"
-    DMuon 的 TP 支持（Gram Newton-Schulz + TP SYRK 分解）仅在 **1D DP mesh**（纯 FSDP，无 HSDP replicate 维）上经过验证。2D HSDP × TP 组合尚未纳入测试矩阵。如需同时使用，请先用 FSDP+TP（单 replicate 行），并提交 issue。
+## 工作原理
+
+对每个被 `dedicate_params` 选中的参数：
+
+* **普通 `torch.Tensor`** — DMuon 标准 DP 路径（reduce→owner、broadcast）。
+  与非 TP 场景完全一致。
+* **仅在 DP 维度上分片的 `DTensor`** — 同上。
+* **在非 DP mesh 维度（即 TP 轴）上分片的 `DTensor`** — DMuon 在 TP group
+  内选定一个 rank 作为 "TP owner"。每个 optimizer step：
+  1. 该 TP group 内所有 DP-owner rank 走 `dist.gather` on
+     `reduce_stream`，把完整 `(m, n)` 梯度汇聚到 TP owner。
+     （gather 借用 DP reduce 的 comm stream，所以和 backward compute 天然
+     并行——8-GPU 3D HSDP×TP toy 下测到 **~100% overlap**。）
+  2. TP owner 在**完整矩阵**上跑 Newton-Schulz（和非 TP 路径走同一个 NS
+     kernel）。
+  3. `dist.scatter` on `replicate_broadcast_stream`，把 update 的每一片
+     发回各 DP-owner rank。
+  4. 标准 HSDP replicate broadcast 把 update 扩散到 replicate peer。
+
+Sync（`replicate_async=False`）和 async（默认 `replicate_async=True`）两路
+的 post-step 通信在 3D HSDP×TP 下产生**bit-identical** 权重轨迹——async
+只改变 scatter 完成的**时间**，不改变数值结果。
 
 ---
 
-## 挑战
+## 配置
 
-使用 TP 时，每个 rank 持有的是参数的**分片**，而非完整矩阵。所有者 rank 的梯度也是 TP 分片。标准 Newton-Schulz 需要完整的 (m, n) 矩阵——但我们在每个 TP rank 上只有 (m/T, n) 或 (m, n/T)。
-
-**朴素方案**：跨 TP rank all-gather 完整梯度 → O(mn) 通信，违背了 DMuon 的初衷。
-
-**DMuon 方案**：**Gram Newton-Schulz** — 在 Gram 矩阵上迭代，而非完整参数。Gram 矩阵可以通过对更小的 (d, d) 矩阵做一次 all-reduce 从 TP 分片重构。
-
-## Gram NS 原理
-
-标准 NS 在完整的 (m, n) 矩阵 X 上迭代。Gram NS 将迭代改写为在 Gram 矩阵 R = X @ X^T（m x m）或 R = X^T @ X（n x n）上进行。
-
-关键洞察是 Gram 矩阵在 TP 分片下**可分解**：
-
-| TP 分片方式 | 示例 | 本地形状 | 可分解的 Gram | All-reduce 大小 |
-|---|---|---|---|---|
-| **Shard(0)**（行分片） | q_proj, gate_proj | (m/T, n) | R 侧: $G^TG = \sum_i G_i^T G_i$ | n x n |
-| **Shard(1)**（列分片） | o_proj, down_proj | (m, n/T) | L 侧: $GG^T = \sum_i G_i G_i^T$ | m x m |
-
-每个 TP rank 计算本地 Gram $G_i^T G_i$ 或 $G_i G_i^T$，然后跨 TP rank 做一次 **all-reduce** 即可得到精确的全局 Gram。NS 迭代在这个 (d, d) 矩阵上本地进行。
-
-!!! success "通信量降低"
-    对于标准 Transformer，all-reduce 大小始终是 **d_model x d_model**，与参数形状无关。这是 O(d^2) vs O(mn)——对于 FFN 层（intermediate_size >> d_model）显著降低。
-
-## 设置：TP + DMuon + FSDP2
-
-设置顺序是：**先 TP，再 DMuon，最后 FSDP2**。
+调用顺序：**先 TP，再 DMuon，最后 FSDP2。** DMuon 必须在 `fully_shard`
+**之前**被调用，这样它的参数才能 opt out 于 FSDP2 的分片契约。
 
 ```python
-from torch.distributed.device_mesh import init_device_mesh
+import dmuon
+from torch.distributed import init_device_mesh
+from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel, RowwiseParallel, parallelize_module,
 )
-from torch.distributed.fsdp import fully_shard
-import dmuon
 
-# 2D mesh: dp_size x tp_size
-mesh_2d = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-dp_mesh = mesh_2d["dp"]
-tp_mesh = mesh_2d["tp"]
+# 2D mesh（dp × tp）— 最常见布局
+mesh = init_device_mesh(
+    "cuda", (dp_size, tp_size),
+    mesh_dim_names=("dp", "tp"),        # 必须传 dim 名称
+)
 
 model = MyModel().cuda()
 
-# 第 1 步：应用 TP
+# Step 1 — TP
 for layer in model.layers:
     parallelize_module(
-        layer.self_attn, tp_mesh,
+        layer.self_attn, mesh["tp"],
         {
-            "q_proj": ColwiseParallel(),   # Shard(0)
-            "k_proj": ColwiseParallel(),   # Shard(0)
-            "v_proj": ColwiseParallel(),   # Shard(0)
-            "o_proj": RowwiseParallel(),   # Shard(1)
+            "q_proj": ColwiseParallel(),
+            "k_proj": ColwiseParallel(),
+            "v_proj": ColwiseParallel(),
+            "o_proj": RowwiseParallel(),
         },
     )
     parallelize_module(
-        layer.mlp, tp_mesh,
+        layer.mlp, mesh["tp"],
         {
-            "gate_proj": ColwiseParallel(),  # Shard(0)
-            "up_proj": ColwiseParallel(),    # Shard(0)
-            "down_proj": RowwiseParallel(),  # Shard(1)
+            "gate_proj": ColwiseParallel(),
+            "up_proj":   ColwiseParallel(),
+            "down_proj": RowwiseParallel(),
         },
     )
 
-# 第 2 步：DMuon（使用 dp_mesh）
+# Step 2 — DMuon（只传 DP 切片，不传 TP 切片）
 dmuon.dedicate_params(
-    model, dp_mesh,
+    model, mesh["dp"],
     predicate=lambda n, p: "proj" in n and p.ndim == 2,
 )
 
-# 第 3 步：FSDP2（也使用 dp_mesh）
+# Step 3 — FSDP2（同样是 DP 切片）
 for layer in model.layers:
-    fully_shard(layer, mesh=dp_mesh)
-fully_shard(model, mesh=dp_mesh)
+    fully_shard(layer, mesh=mesh["dp"])
+fully_shard(model, mesh=mesh["dp"])
 
-# 优化器
-optimizer = dmuon.Muon(model, lr=0.02, ns_steps=5, adamw_lr=1e-3)
+# Optimizer — 不需要任何 TP 专属参数
+optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, adamw_lr=1e-3)
 ```
 
-!!! info "为什么用 dp_mesh？"
-    `dedicate_params` 和 `fully_shard` 使用 **DP mesh**——它们在数据并行 rank 之间分发参数。TP 分片已经应用完毕；DMuon 操作的是 TP 本地分片。
+!!! info "为什么是 `mesh["dp"]` 而不是完整 mesh?"
+    `dedicate_params` 和 `fully_shard` 都只处理 DP 维度——它们是
+    TP-oblivious 的。TP 分片已经通过 `parallelize_module` 应用到参数上，
+    DMuon 通过 `DTensor.device_mesh` 看到这个信息。这是 FSDP2 的标准约定。
 
-## 三种 NS 模式
+### 3D mesh：HSDP × TP
 
-DMuon 为 TP 分片参数提供三种 NS 模式，通过优化器参数选择：
-
-### 1. 精确 Gram NS（默认）
-
-跨 TP rank all-reduce Gram 矩阵，得到精确的全局 Gram。
+多机训练加上 replicate 轴。DMuon 原生支持三轴 mesh：
 
 ```python
+mesh3d = init_device_mesh(
+    "cuda", (R, G, T),
+    mesh_dim_names=("replicate", "shard", "tp"),
+)
+
+# Step 1 — TP
+parallelize_module(model, mesh3d["tp"], plan)
+
+# Step 2 — DMuon（DP = replicate × shard）
+dmuon.dedicate_params(
+    model,
+    mesh=mesh3d["shard"],
+    replicate_mesh=mesh3d["replicate"],
+    predicate=...,
+)
+
+# Step 3 — FSDP2（同一个 DP 2D 切片）
+fully_shard(model, mesh=mesh3d["replicate", "shard"])
+
 optimizer = dmuon.Muon(model, lr=0.02)
-# per_head_ns=True（默认），block_diagonal_ns=False（默认）
 ```
 
-**各参数行为：**
+---
 
-| 参数 | 分片方式 | Gram 侧 | All-reduce 大小 | 精确？ |
-|------|----------|---------|-----------------|--------|
-| q_proj (8192, 8192) | Shard(0) | R 侧 G^TG | 8192 x 8192 | 是 |
-| k_proj (1024, 8192) | Shard(0) | 逐头 NS | *无* | 是 |
-| gate_proj (28672, 8192) | Shard(0) | R 侧 G^TG | 8192 x 8192 | 是 |
-| o_proj (8192, 8192) | Shard(1) | L 侧 GG^T | 8192 x 8192 | 是 |
-| down_proj (8192, 28672) | Shard(1) | L 侧 GG^T | 8192 x 8192 | 是 |
+## 要求
 
-### 2. 逐头 NS（GQA k/v_proj 默认使用）
+1. **有 TP 时必须用带 `mesh_dim_names` 的 DeviceMesh。** DMuon 通过名称
+   集合差识别 TP 轴（`parameter.DTensor.mesh_dim_names − dp_mesh_dim_names
+   = TP dim names`）。未命名 mesh 下的 `DTensor` 会 raise `ValueError`。
+2. **TP size = 1 自动视为无 TP。** `(dp=N, tp=1)` mesh 行为和 `(dp=N,)`
+   **bit-identical**——检测 guard 会短路到纯 DP 路径。
+3. **调用顺序**：`parallelize_module` → `dmuon.dedicate_params` →
+   `fully_shard`。DMuon 必须在 FSDP2 注册分片契约之前看到 TP-wrapped
+   的参数。
 
-对于 GQA 模型，k_proj 和 v_proj 的头数少于 q_proj（例如 Llama-3 中 8 个 KV 头 vs 32 个 Q 头）。当 TP 大小 <= KV 头数时，每个 TP rank 持有**完整的 KV 头**。
+---
 
-这意味着每个 rank 上的本地 NS 是**精确的**——无需 TP 通信。
+## Sync vs async post-step
+
+`Muon` 只有一个 TP 相关的开关：
 
 ```python
-optimizer = dmuon.Muon(model, lr=0.02, per_head_ns=True)  # 默认
+# 默认 — scatter + broadcast 异步（留到下一次 forward 的 pre_forward_wait 消费）
+optimizer = dmuon.Muon(model, lr=0.02)                        # async
+optimizer = dmuon.Muon(model, lr=0.02, replicate_async=True)  # 显式
+
+# 同步 — scatter + broadcast 在 step() 返回前完成
+optimizer = dmuon.Muon(model, lr=0.02, replicate_async=False)
 ```
 
-**检测逻辑**：参数在以下三个条件同时满足时使用逐头 NS：
+两种模式在 3D HSDP×TP 上产生**bit-identical loss 轨迹**（2026-04-24
+验证）。async 的好处纯粹是 scatter NCCL kernel 能和下一个 iter 的
+forward compute 并发——toy 3D mesh 下 step time 大约低 3%，跨节点慢链路
+（IB）场景下会更明显。
 
-1. `per_head_ns=True`（默认）
-2. `shard_dim == 0`（行分片，ColwiseParallel）
-3. `full_m < full_n`（窄矩阵——完整行维度小于列维度）
-
-这能正确识别 GQA k/v_proj，同时排除 q_proj、gate_proj 等。
-
-!!! example "Llama-3 8B，TP=8"
-    - k_proj：完整 (1024, 8192) → 1024 < 8192 → **逐头 NS**（零 TP 通信）
-    - q_proj：完整 (8192, 8192) → 8192 = 8192 → **精确 Gram NS**
-    - gate_proj：完整 (28672, 8192) → 28672 > 8192 → **精确 Gram NS**
-
-### 3. 块对角 NS（实验性）
-
-完全跳过 Gram all-reduce，仅使用本地部分 Gram。以近似为代价消除**所有** TP 优化器通信。
-
-```python
-optimizer = dmuon.Muon(model, lr=0.02, block_diagonal_ns=True)
-```
-
-!!! warning "实验性"
-    块对角 NS 是一种近似。它将 Shampoo 的块对角预条件化原理扩展到 Newton-Schulz。收敛验证仍在进行中——请谨慎使用并监控 loss 曲线。
-
-## 注意力变体参考
-
-不同注意力架构产生不同的 TP 分片模式。DMuon 通过通用路由逻辑（shard_dim + full_shape）处理所有变体，无需知道注意力类型。
-
-| 变体 | 关键差异 | k/v_proj 形状 | 逐头 NS？ | 特殊说明 |
-|------|---------|---------------|----------|---------|
-| **MHA** | n_heads = n_kv_heads | (d, d) | 否（方阵） | 全部使用精确 Gram NS |
-| **GQA** | n_kv_heads < n_heads | (kv_dim, d) | 是 | k/v 零 TP 通信 |
-| **MQA** | n_kv_heads = 1 | (head_dim, d) | 是 | 比 GQA 更窄 |
-| **GateDelta** | V 头 > QK 头 | (d, d)（v） | 否（不窄） | a/b_proj 太小——用 AdamW |
-| **GLA** | 类似 GQA | 视具体而定 | 取决于形状 | 检查 full_m vs full_n |
-| **RetNet** | 类似 MHA | (d, d) | 否 | 全部使用精确 Gram NS |
-
-**GateDelta 的 predicate 建议：**
-
-```python
-def predicate(n, p):
-    if p.ndim != 2:
-        return False
-    # 排除非常小的投影（GateDelta 中的 a_proj, b_proj）
-    if p.numel() < 100_000:
-        return False
-    return "proj" in n
-```
+---
 
 ## 查看 TP 属性
 
 ```python
+import dmuon
+import torch.distributed as dist
+
 for dp in dmuon.get_owned_params(model, rank=dist.get_rank()):
     print(
         f"{dp.param_name}: "
         f"local={tuple(dp._orig_size)}, "
         f"full={tuple(dp.full_shape)}, "
         f"shard_dim={dp.shard_dim}, "
-        f"tp_group={'是' if dp.tp_group else '否'}"
+        f"is_tp_owner={dp.is_tp_owner}, "
+        f"tp_group_size={dp.tp_group.size() if dp.tp_group else 1}"
     )
 ```
 
-示例输出（Llama-3 8B, TP=8）：
-```
-q_proj:    local=(1024, 8192), full=(8192, 8192), shard_dim=0, tp_group=是
-k_proj:    local=(128, 8192),  full=(1024, 8192), shard_dim=0, tp_group=是
-v_proj:    local=(128, 8192),  full=(1024, 8192), shard_dim=0, tp_group=是
-o_proj:    local=(8192, 1024), full=(8192, 8192), shard_dim=1, tp_group=是
-gate_proj: local=(3584, 8192), full=(28672, 8192), shard_dim=0, tp_group=是
-up_proj:   local=(3584, 8192), full=(28672, 8192), shard_dim=0, tp_group=是
-down_proj: local=(8192, 3584), full=(8192, 28672), shard_dim=1, tp_group=是
-```
+一个 TP-sharded 参数会显示 `tp_group_size > 1`、非 None 的 `shard_dim`，
+并且 `is_tp_owner=True` 仅出现在 TP group 内的一个 rank 上（MVP 固定为
+TP rank 0；post-MVP 再做 LPT-balanced TP ownership）。
 
-## 相关文档
+---
 
-- [HSDP 训练（多机）](hsdp.md) —— 2D mesh 配置；注意 HSDP × TP 组合尚未验证（见上方警告）
-- [自定义 Hook 边界](custom-hook-boundaries.md) —— `hook_boundary_predicate` 可使用 `isinstance(m, TPWrappedModule)` 与 TP 包装模块对齐
-- [训练流程](training.md) —— 完整 1D 训练流程（在此基础上加 TP）
-- [API 文档](../reference/api.md) —— 含 `hook_boundary_predicate` 的 `dedicate_params` 签名
+## 限制
+
+* **MVP 只支持 1D TP 轴。** 2D TP 会在 `get_tp_mesh` 抛 assert；有需求
+  时再扩。
+* **每个 TP group 单 owner 跑 NS。** TP owner 独家执行 Newton-Schulz，
+  其余 `T-1` 个 rank 在 `dist.gather` / `dist.scatter` 期间等待。
+  Canzona 风格的 fused All-to-All + micro-group batching（把 NS
+  并行化到整个 TP group）列为 future work。
+* **TP-sharded 小参数不参与 DMuon 的 small-param 合并**
+  （`SMALL_PARAM_THRESHOLD`）。每个 TP-sharded 参数独立跑一次 gather
+  / scatter，即使 numel < 5M。实际训练里这种小 TP-sharded 参数很少见。
+
+---
+
+## 参考
+
+* [HSDP 指南](hsdp.md) — replicate × shard 配置；和 TP 叠加使用
+* [`dedicate_params` API](../reference/api.md) — 完整签名
+* `docs/internal/research/tp_design.md` — 设计文档（lifecycle 图、overlap
+  策略、fallback 语义、change log）
+* `docs/internal/research/tp_overlap_profile.md` — NSight 风格
+  overlap 测量（8-GPU 3D mesh toy 下 100%）
+* `docs/internal/research/tp_alignment_report.md` — sync / async
+  bit-identical 对齐验证

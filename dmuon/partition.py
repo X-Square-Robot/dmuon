@@ -8,6 +8,7 @@ downstream callers continue to work unchanged::
 """
 
 from dmuon._core.partition import (  # noqa: F401
+    AssignmentResult,
     OwnerCoord,
     OwnerValue,
     SMALL_PARAM_THRESHOLD,
@@ -17,6 +18,7 @@ from dmuon._core.partition import (  # noqa: F401
 )
 
 __all__ = [
+    "AssignmentResult",
     "OwnerCoord",
     "OwnerValue",
     "SMALL_PARAM_THRESHOLD",

@@ -253,7 +253,13 @@ def test_muon_nesterov(rank, world_size, device, mesh):
 
 
 # ---------------------------------------------------------------------------
-# Test 4: TP params get updated through gram_newton_schulz path
+# Test 4: TP params — pre-T2 guard.
+#
+# The Gram-AR TP path was removed; the All-to-All path lands in T2.  Until
+# T2 ships, ``muon.step()`` must trip a ``NotImplementedError`` when any
+# dedicated param is TP-sharded.  This test asserts that guard fires; it
+# will be replaced by a bit-identical / loss-parity check once T2a+T2b+T2b2
+# land.
 # ---------------------------------------------------------------------------
 
 def test_muon_tp_path(rank, world_size, device, mesh):
@@ -308,26 +314,28 @@ def test_muon_tp_path(rank, world_size, device, mesh):
         log(rank, "PASSED: test_muon_tp_path (no owned params on this rank)")
         return
 
-    # Record initial weights for first owned param
-    dp = optimizer._dedicated_params[0]
-    w_before = dp._owned_data.clone()
-
-    # forward -> backward -> step
+    # forward -> backward -> step.  Until T2 lands, the TP branch in
+    # muon._step_muon raises NotImplementedError; we treat its absence as
+    # a regression (Gram-AR accidentally reintroduced or guard removed).
     optimizer.zero_grad()
     x = torch.randn(4, 256, device=device)
     loss = model(x)
     loss.backward()
-    optimizer.step()
+    try:
+        optimizer.step()
+    except NotImplementedError as e:
+        assert "T2" in str(e), (
+            f"TP step raised NotImplementedError but message lacks T2 marker: {e}"
+        )
+        torch.cuda.synchronize()
+        log(rank, "PASSED: test_muon_tp_path (pre-T2 guard fires as expected)")
+        return
 
-    # Assert weights actually changed (NS update applied)
-    max_diff = (dp._owned_data - w_before).abs().max().item()
-    assert max_diff > 1e-6, (
-        f"Rank {rank}: TP param weights did not change after optimizer step "
-        f"(max_diff={max_diff}). Likely _reduced_grad was None."
+    raise AssertionError(
+        "TP step unexpectedly succeeded — Gram-AR path may have been "
+        "reintroduced, or the T2 all-to-all path is live and this test "
+        "needs to be updated to assert numerical correctness instead."
     )
-
-    torch.cuda.synchronize()
-    log(rank, "PASSED: test_muon_tp_path")
 
 
 # ---------------------------------------------------------------------------
