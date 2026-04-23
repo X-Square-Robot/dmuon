@@ -7,10 +7,10 @@ from .newton_schulz import (
     NewtonSchulz,
     direct_newton_schulz,
     gram_newton_schulz,
-    gram_newton_schulz_local,
+    gram_newton_schulz_local,  # back-compat alias for gram_newton_schulz
     newton_schulz,
 )
-from .syrk_dispatch import get_ns_backend
+from .syrk_dispatch import get_backend_status, get_ns_backend
 
 __all__ = [
     "Muon",
@@ -20,6 +20,7 @@ __all__ = [
     "gram_newton_schulz",
     "gram_newton_schulz_local",
     "get_ns_backend",
+    "get_backend_status",
     "YOU_COEFFICIENTS",
     "POLAR_EXPRESS_COEFFICIENTS",
 ]

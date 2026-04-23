@@ -40,46 +40,100 @@ except ImportError:
 
 
 def get_ns_backend() -> str:
-    """Return a human-readable name of the active Newton-Schulz kernel backend.
+    """Return a human-readable one-liner describing the active NS kernel.
 
-    Returns one of:
-      * ``"CuteDSL SYRK (SM80)"`` — CuteDSL SYRK kernel compiled for SM80
-        (A100 / A800). 1.4–1.5× end-to-end speedup on Gram NS ops vs fallback.
-      * ``"CuteDSL SYRK (SM90)"`` — CuteDSL SYRK kernel compiled for SM90+
-        (H100 / H200), when supported by the installed CuteDSL version.
-      * ``"torch.compile (fallback)"`` — generic ``@torch.compile``-compiled
-        reference path, used when no CuteDSL SYRK is available for the
-        current GPU (e.g. V100 / RTX 30xx / consumer Blackwell).
+    Format: ``"Gram NS · kernel=<name> (SM<ver>, <detail>)"``.  Typical
+    results:
 
-    Call once at startup to confirm you are on the fast path:
+      * ``"Gram NS · kernel=cute_sm80 (SM80, DMuon internal)"``
+      * ``"Gram NS · kernel=quack (SM90, Tri Dao quack)"``
+      * ``"Gram NS · kernel=cublas (SM80, universal fallback)"``
+
+    This is the terse one-liner meant for startup log / user sanity-check.
+    Use :func:`get_backend_status` for the full dict of availability
+    flags.
 
     >>> import dmuon
     >>> print(dmuon.get_ns_backend())
-    CuteDSL SYRK (SM80)
+    Gram NS · kernel=cute_sm80 (SM80, DMuon internal)
     """
-    if HAS_SYRK:
-        return f"CuteDSL SYRK (SM{_SM_VERSION})"
-    return "torch.compile (fallback)"
+    from dmuon.kernels.syrk_backends import SyrkBackend, detect_best_backend
+
+    choice = detect_best_backend()
+    if choice == SyrkBackend.QUACK:
+        detail = "Tri Dao quack"
+    elif choice == SyrkBackend.CUTE_SM80:
+        detail = "DMuon internal"
+    else:
+        detail = "universal fallback"
+    return f"Gram NS · kernel={choice.value} (SM{_SM_VERSION}, {detail})"
+
+
+def get_backend_status() -> dict:
+    """Return a full diagnostic snapshot of the NS kernel dispatch state.
+
+    Returns a plain dict with:
+
+      * ``sm_version``                  — int, detected compute capability (0 on CPU)
+      * ``auto_choice``                  — which backend ``kernel="auto"`` resolves to
+      * ``quack_available``              — bool, soft-dep flag
+      * ``cute_sm80_available``          — bool, CuteDSL SYRK importable
+      * ``cublas_always_available``      — bool, always ``True``
+
+    Useful for programmatic checks and bug reports.
+    """
+    from dmuon.kernels.syrk_backends import get_backend_status as _status
+    return _status()
 
 
 # ---------------------------------------------------------------------------
 # SYRK autotune: benchmark all tile configs vs cuBLAS, cache per shape
 # ---------------------------------------------------------------------------
+#
+# B5 (ns_backend_dispatch_plan.md §3) split the persistent cache per
+# (GPU, backend) so quack and cute_sm80 don't pollute each other's
+# per-shape tile choices.  The in-memory cache key is extended with a
+# ``backend`` string so a single process can autotune both if the user
+# deliberately benchmarks multiple backends.
+#
+# Key:      (M, K, device_idx, dtype, has_C, backend_str)
+# Filename: ~/.cache/dmuon/syrk_autotune_<GPU>_<backend>.json
+# Legacy:   ~/.cache/dmuon/syrk_autotune_<GPU>.json  (pre-B5)
+#           — migrated on first load, original kept as *.bak_preB5
 
-# Cache: (M, K, device_idx, dtype, has_C) -> (tile_m, tile_k, num_stages) or None
+# Default backend name tag used when callers don't override — the
+# autotune layer still defaults to cute_sm80 on SM80, matching the
+# pre-B5 behaviour.
+_DEFAULT_AUTOTUNE_BACKEND = "cute_sm80"
+
+# In-memory cache keyed by the full tuple including backend
 _syrk_autotune_cache: dict[tuple, tuple | None] = {}
 
 
-def _get_autotune_cache_path() -> Path:
-    """Get path for persistent autotune cache file."""
+def _cache_dir() -> Path:
     cache_dir = os.environ.get("DMUON_CACHE_DIR")
     if cache_dir:
         p = Path(cache_dir)
     else:
         p = Path.home() / ".cache" / "dmuon"
     p.mkdir(parents=True, exist_ok=True)
-    gpu_name = torch.cuda.get_device_name(0).replace(" ", "_") if torch.cuda.is_available() else "cpu"
-    return p / f"syrk_autotune_{gpu_name}.json"
+    return p
+
+
+def _gpu_tag() -> str:
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name(0).replace(" ", "_")
+    return "cpu"
+
+
+def _get_autotune_cache_path(backend: str = _DEFAULT_AUTOTUNE_BACKEND) -> Path:
+    """Per-(GPU, backend) cache file path."""
+    return _cache_dir() / f"syrk_autotune_{_gpu_tag()}_{backend}.json"
+
+
+def _get_legacy_cache_path() -> Path:
+    """Pre-B5 single-file path (no backend suffix)."""
+    return _cache_dir() / f"syrk_autotune_{_gpu_tag()}.json"
 
 
 _DTYPE_TO_STR = {torch.float16: "fp16", torch.bfloat16: "bf16", torch.float32: "fp32"}
@@ -87,49 +141,83 @@ _STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
 
 
 def _key_to_json(key: tuple) -> str:
-    """Serialize cache key to JSON-safe string."""
-    M, K, dev_idx, dtype, has_C = key
+    """Serialize cache key (without backend, which is the file tag) to JSON."""
+    M, K, dev_idx, dtype, has_C, _backend = key
     return json.dumps([M, K, dev_idx, _DTYPE_TO_STR.get(dtype, str(dtype)), has_C])
 
 
-def _json_to_key(s: str) -> tuple:
-    """Deserialize cache key from JSON string."""
+def _json_to_key(s: str, backend: str) -> tuple:
+    """Deserialize a JSON cache row into the 6-tuple in-memory key."""
     M, K, dev_idx, dtype_str, has_C = json.loads(s)
-    return (M, K, dev_idx, _STR_TO_DTYPE.get(dtype_str, dtype_str), has_C)
+    return (M, K, dev_idx, _STR_TO_DTYPE.get(dtype_str, dtype_str), has_C, backend)
 
 
-def _load_autotune_cache() -> None:
-    """Load persistent autotune cache from disk."""
+def _migrate_legacy_cache_if_present() -> None:
+    """One-shot migration of the pre-B5 single-file cache.
+
+    The pre-B5 file stored only cute_sm80 data (cublas was never
+    autotuned).  We copy it to the new cute_sm80 path and rename the
+    original to ``*.bak_preB5`` so the user can recover if B5 introduces
+    a regression.
+    """
+    legacy = _get_legacy_cache_path()
+    if not legacy.exists():
+        return
+    new_path = _get_autotune_cache_path(_DEFAULT_AUTOTUNE_BACKEND)
+    if new_path.exists():
+        # Backend-specific file already written; the user has a fresh
+        # cache; leave the legacy alone (don't overwrite newer data).
+        return
+    try:
+        new_path.write_bytes(legacy.read_bytes())
+        backup = legacy.with_suffix(legacy.suffix + ".bak_preB5")
+        legacy.replace(backup)
+        logger.info(
+            "Migrated pre-B5 autotune cache %s → %s (backup: %s)",
+            legacy, new_path, backup,
+        )
+    except OSError as e:
+        logger.debug("Could not migrate legacy cache: %s", e)
+
+
+def _load_autotune_cache(backend: str = _DEFAULT_AUTOTUNE_BACKEND) -> None:
+    """Load persistent autotune cache from disk for ``backend``."""
     global _syrk_autotune_cache
     try:
-        path = _get_autotune_cache_path()
+        path = _get_autotune_cache_path(backend)
         if path.exists():
             with open(path) as f:
                 data = json.load(f)
             for k, v in data.items():
-                key = _json_to_key(k)
+                key = _json_to_key(k, backend)
                 _syrk_autotune_cache[key] = tuple(v) if v is not None else None
-            logger.info(f"Loaded {len(data)} autotune entries from {path}")
+            logger.info(
+                "Loaded %d autotune entries for backend=%s from %s",
+                len(data), backend, path,
+            )
     except Exception as e:
-        logger.debug(f"Could not load autotune cache: {e}")
+        logger.debug("Could not load autotune cache for backend=%s: %s", backend, e)
 
 
-def _save_autotune_cache() -> None:
-    """Save autotune cache to disk."""
+def _save_autotune_cache(backend: str = _DEFAULT_AUTOTUNE_BACKEND) -> None:
+    """Save entries for ``backend`` to its per-backend JSON file."""
     try:
-        path = _get_autotune_cache_path()
+        path = _get_autotune_cache_path(backend)
         data = {}
         for k, v in _syrk_autotune_cache.items():
+            if k[-1] != backend:
+                continue
             data[_key_to_json(k)] = list(v) if v is not None else None
         with open(path, "w") as f:
             json.dump(data, f)
     except Exception as e:
-        logger.debug(f"Could not save autotune cache: {e}")
+        logger.debug("Could not save autotune cache for backend=%s: %s", backend, e)
 
 
-# Load persistent cache at import time
+# Migrate legacy cache file once, then load per-backend caches at import.
 if HAS_SYRK:
-    _load_autotune_cache()
+    _migrate_legacy_cache_if_present()
+    _load_autotune_cache(_DEFAULT_AUTOTUNE_BACKEND)
 
 
 def _bench_median(fn, warmup=5, repeat=20):
@@ -150,9 +238,14 @@ def _bench_median(fn, warmup=5, repeat=20):
 
 
 def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
-                    has_C: bool = False) -> tuple | None:
-    """Find best SYRK config for shape (M, K). Returns (tile_m, tile_k, num_stages) or None if cuBLAS wins."""
-    key = (M, K, device.index or 0, dtype, has_C)
+                    has_C: bool = False,
+                    backend: str = _DEFAULT_AUTOTUNE_BACKEND) -> tuple | None:
+    """Find best SYRK config for shape (M, K).  Returns ``(tile_m, tile_k,
+    num_stages)`` or ``None`` if cuBLAS wins.
+
+    ``backend`` tags the cache entry so quack / cute_sm80 autotune results
+    never pollute each other's choices (B5)."""
+    key = (M, K, device.index or 0, dtype, has_C, backend)
     if key in _syrk_autotune_cache:
         return _syrk_autotune_cache[key]
 
@@ -196,7 +289,7 @@ def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
     )
 
     _syrk_autotune_cache[key] = best_config
-    _save_autotune_cache()
+    _save_autotune_cache(backend)
     return best_config
 
 

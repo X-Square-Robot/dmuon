@@ -25,24 +25,26 @@ Usage::
 
 __version__ = "0.2.0"
 
-from .api import dedicate_params
+from .api import dedicate_params, dedicate_params_ddp
+from ._backends.ddp import replicate
+from ._backends.fsdp2 import install_patch
+from ._core.comm import DedicatedCommContext
 from .checkpoint import (
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
 )
-from ._core.comm import DedicatedCommContext
 from .optim import (
     POLAR_EXPRESS_COEFFICIENTS,
     YOU_COEFFICIENTS,
     Muon,
     NewtonSchulz,
+    get_backend_status,
     get_ns_backend,
     gram_newton_schulz,
     newton_schulz,
 )
-from ._backends.fsdp2.patch import install_patch
 from ._replicate_profile import replicate_profile_report
 from .utils import (
     broadcast_all_updates,
@@ -52,6 +54,7 @@ from .utils import (
     get_owned_params,
     no_sync,
     reset_replicate_fallback,
+    wait_all_post_step_broadcasts,
     wait_all_reduces,
     wait_all_replicate_broadcasts,
 )
@@ -61,6 +64,8 @@ install_patch()
 
 __all__ = [
     "dedicate_params",
+    "dedicate_params_ddp",
+    "replicate",
     "Muon",
     "NewtonSchulz",
     "newton_schulz",
@@ -73,6 +78,7 @@ __all__ = [
     "no_sync",
     "wait_all_reduces",
     "wait_all_replicate_broadcasts",
+    "wait_all_post_step_broadcasts",
     "broadcast_all_updates",
     "broadcast_all_updates_async",
     "reset_replicate_fallback",
