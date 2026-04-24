@@ -37,14 +37,20 @@
 ??? warning "CUDA extension fails to load / CuteDSL SYRK not available"
     **Cause:** CUDA version mismatch or missing CuteDSL dependencies.
 
-    **Fix:** DMuon automatically falls back to `@torch.compile` PyTorch for NS
-    when the SYRK kernel is unavailable.  Verify the active backend:
+    **Fix:** DMuon automatically falls back to cuBLAS (`torch.mm` / `torch.addmm`)
+    for Gram-NS SYRK ops when no CuteDSL kernel is available.  Verify the active
+    backend:
     ```python
     import dmuon
-    print(dmuon.get_ns_backend())  # "compiled" is acceptable
+    print(dmuon.get_ns_backend())
+    # "Gram NS · kernel=cublas (SM80, universal fallback)" is an acceptable state
+    # — correctness is preserved, only SYRK acceleration is off.
     ```
-    For SM80+ SYRK, ensure CUDA 11.8+ and that the `cutedsl` wheel in the repo
-    is compiled against your CUDA toolkit.
+    For the A-card `cute_sm80` fast path, install the `[syrk]` extras.  For
+    SM90+ machines, install `dmuon[quack]` to pick up Tri Dao's quack SYRK
+    automatically via `kernel="auto"`.  See
+    [Backend dispatch](reference/newton-schulz.md#backend-dispatch) for the
+    full auto-detection ladder.
 
 ---
 
@@ -110,12 +116,14 @@
     dtype, or leave it as `None` to inherit the parameter dtype.
 
     **Persistent NaN in Gram NS:** if NaN appears only with the `"gram"`
-    backend, try `deterministic=True` to isolate whether it is the SYRK
-    kernel:
+    backend, switch to the cuBLAS reference kernel to isolate whether the
+    fast SYRK path is the culprit:
     ```python
-    ns = dmuon.NewtonSchulz(deterministic=True)
+    ns = dmuon.NewtonSchulz(kernel="cublas")  # same as deterministic=True
     optimizer = dmuon.Muon(model, ns_backend=ns)
     ```
+    If cuBLAS also NaNs, the problem is in the Gram iteration itself
+    (coefficients, restart positions, input scale) rather than the kernel.
 
 ---
 
@@ -136,9 +144,11 @@
     **Cause — LR too high:** Muon's internal scaling is `0.2 * sqrt(max(m, n))`.
     Start with `lr=0.02` and reduce if divergence appears.
 
-    **Cause — NS backend mismatch:** ensure every rank uses the same
-    `ns_backend` configuration; mixing deterministic and non-deterministic
-    modes is unsupported.
+    **Cause — NS kernel mismatch across ranks:** ensure every rank uses
+    the same `ns_backend` / `kernel=` setting; mixing different SYRK
+    kernels (e.g. `cute_sm80` on some ranks and `cublas` on others) can
+    accumulate numerical drift across the DP / replicate axes.  Run
+    `dmuon.get_ns_backend()` on every rank and cross-check.
 
     **Debug:** compare loss curves between `"gram"` and `"direct"` backends
     on a small model first.
@@ -232,13 +242,40 @@
 
 ## Tensor Parallelism
 
-??? warning "HSDP + TP (3D parallelism) produces incorrect results"
-    **Cause:** 2D HSDP × TP combination is not yet validated.  The TP Gram
-    all-reduce and the HSDP replicate all-reduce may run on overlapping process
-    groups in ways not tested.
+??? warning "`ValueError: DMuon requires named DeviceMesh for TP detection`"
+    **Cause:** you passed a mesh without `mesh_dim_names` to
+    `parallelize_module` / `fully_shard` / `dedicate_params`.  DMuon
+    identifies the TP axis by subtracting DP dim names from each
+    parameter's `DTensor.mesh_dim_names`, so names are mandatory.
 
-    **Fix:** use 1D FSDP + TP instead.  Apply TP, then DMuon, then `fully_shard`
-    on a 1D mesh.  See [Tensor Parallelism](guides/tp-support.md).
+    **Fix:** construct the mesh with names:
+    ```python
+    mesh = init_device_mesh("cuda", (dp_size, tp_size),
+                            mesh_dim_names=("dp", "tp"))
+    ```
+
+??? warning "`RuntimeError: tp_scatter_delta_async: previous event still pending`"
+    **Cause:** two consecutive `optimizer.step()` calls without an
+    intervening forward (which is what drains the async scatter event).
+    Usually a bug in a custom training loop that calls `step()` twice
+    per iteration, or calls `step()` then saves a checkpoint without
+    doing a forward first.
+
+    **Fix:** do one forward between any two `step()` calls, OR switch
+    to sync post-step to avoid the cross-call event:
+    ```python
+    optimizer = dmuon.Muon(model, lr=0.02, replicate_async=False)
+    ```
+
+??? info "HSDP × TP (3D mesh) — supported"
+    The 3D mesh `(replicate, shard, tp)` is validated (see
+    [TP support guide](guides/tp-support.md) and the internal reports
+    `tp_design.md`, `tp_alignment_report.md`).  Sync and async post-step
+    paths produce bit-identical loss trajectories.  The order is:
+
+    1. `parallelize_module(model, mesh["tp"], plan)`
+    2. `dmuon.dedicate_params(model, mesh["shard"], replicate_mesh=mesh["replicate"], ...)`
+    3. `fully_shard(model, mesh=mesh["replicate","shard"])`
 
 ---
 

@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-from dmuon._internal_utils import (
+from dmuon._core.internal_utils import (
     alloc_storage,
     free_storage,
     set_requires_grad_if_needed,

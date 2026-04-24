@@ -15,7 +15,7 @@
 异步→同步降级协议。在训练开始前导入并修改：
 
 ```python
-import dmuon.group as g
+import dmuon._backends.fsdp2.group as g
 
 g.REPLICATE_WAIT_THRESHOLD_US = 250   # 默认：100 μs；快速 IB 网络可适当调高
 g.REPLICATE_FALLBACK_CONSECUTIVE_STEPS = 5  # 默认：3；触发降级所需的连续慢步数
@@ -93,9 +93,22 @@ g.REPLICATE_FALLBACK_CONSECUTIVE_STEPS = 5  # 默认：3；触发降级所需的
 
 ### get_ns_backend
 
-查询当前活跃的硬件后端。在不支持 SM80+ 的机器上调试时有用。
+查询当前活跃的 NS 内核。返回形如
+`"Gram NS · kernel=cute_sm80 (SM80, DMuon internal)"`、
+`"Gram NS · kernel=quack (SM90, Tri Dao quack)"` 或
+`"Gram NS · kernel=cublas (SM70, universal fallback)"` 的单行摘要。详见
+[后端分发](newton-schulz.md#backend-dispatch)。
 
 ::: dmuon.get_ns_backend
+
+---
+
+### get_backend_status
+
+NS 内核分发层的完整诊断 dict —— `sm_version`、`auto_choice`，以及各
+后端的可用性标志。适合程序化检查和 bug report。
+
+::: dmuon.get_backend_status
 
 ---
 

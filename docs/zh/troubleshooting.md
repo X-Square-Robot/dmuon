@@ -35,14 +35,18 @@
 ??? warning "CUDA 扩展加载失败 / CuteDSL SYRK 不可用"
     **原因：** CUDA 版本不匹配或缺少 CuteDSL 依赖。
 
-    **修复：** DMuon 在 SYRK 内核不可用时自动回退到 `@torch.compile` PyTorch。
-    验证当前后端：
+    **修复：** DMuon 在 CuteDSL 内核不可用时自动回退到 cuBLAS
+    （`torch.mm` / `torch.addmm`）。验证当前后端：
     ```python
     import dmuon
-    print(dmuon.get_ns_backend())  # "compiled" 是可接受的
+    print(dmuon.get_ns_backend())
+    # "Gram NS · kernel=cublas (SM80, universal fallback)" 是可接受状态
+    # —— 正确性不受影响，只是 SYRK 加速不在。
     ```
-    如需 SM80+ SYRK，确保使用 CUDA 11.8+ 且仓库中的 `cutedsl` wheel
-    已针对你的 CUDA 工具链编译。
+    若需要 A 卡 `cute_sm80` 快路径，安装 `[syrk]` extras；SM90+ 机器
+    请 `pip install dmuon[quack]`，`kernel="auto"` 会自动挑中 Tri Dao
+    的 quack SYRK。完整的自动检测阶梯见
+    [后端分发](reference/newton-schulz.md#backend-dispatch)。
 
 ---
 
@@ -104,12 +108,14 @@
     `dedicate_params` 中的 `compute_dtype` 与模型的 autocast dtype 一致，
     或留为 `None` 以继承参数 dtype。
 
-    **Gram NS 中的持续 NaN：** 若 NaN 仅在 `"gram"` 后端出现，尝试使用
-    `deterministic=True` 来排查是否是 SYRK 内核的问题：
+    **Gram NS 中的持续 NaN：** 若 NaN 仅在 `"gram"` 后端出现，切到 cuBLAS
+    参考内核排查是不是快路径 SYRK 的问题：
     ```python
-    ns = dmuon.NewtonSchulz(deterministic=True)
+    ns = dmuon.NewtonSchulz(kernel="cublas")  # 等价于 deterministic=True
     optimizer = dmuon.Muon(model, ns_backend=ns)
     ```
+    若 cuBLAS 也 NaN，问题在 Gram 迭代本身（系数、重启位置、输入尺度）
+    而非 kernel。
 
 ---
 
@@ -129,8 +135,10 @@
     **原因——学习率过高：** Muon 的内部缩放为 `0.2 * sqrt(max(m, n))`。
     从 `lr=0.02` 开始，若出现发散则降低。
 
-    **原因——NS 后端不匹配：** 确保每个 rank 使用相同的 `ns_backend`
-    配置；不支持混用确定性和非确定性模式。
+    **原因——各 rank 使用了不同的 NS 内核：** 确保每个 rank 使用相同的
+    `ns_backend` / `kernel=` 配置；在 DP / replicate 轴上混用不同 SYRK
+    内核（例如部分 rank 走 `cute_sm80`、部分走 `cublas`）会累积跨 rank
+    的数值漂移。建议每个 rank 打印 `dmuon.get_ns_backend()` 并交叉核对。
 
     **调试：** 先在小模型上对比 `"gram"` 和 `"direct"` 后端的 loss 曲线。
 
@@ -226,12 +234,38 @@
 
 ## 张量并行
 
-??? warning "HSDP + TP（3D 并行）产生错误结果"
-    **原因：** 2D HSDP × TP 组合尚未验证。TP Gram all-reduce 和 HSDP
-    replicate all-reduce 可能在未经测试的方式下运行于重叠的进程组上。
+??? warning "`ValueError: DMuon requires named DeviceMesh for TP detection`"
+    **原因：** 你传给 `parallelize_module` / `fully_shard` /
+    `dedicate_params` 的 mesh 没有 `mesh_dim_names`。DMuon 通过名称
+    集合差识别 TP 轴，所以必须传名称。
 
-    **修复：** 改用 1D FSDP + TP。先应用 TP，再应用 DMuon，然后在 1D
-    mesh 上 `fully_shard`。详见[张量并行](guides/tp-support.md)。
+    **修复：** 构造 mesh 时带上 `mesh_dim_names`：
+    ```python
+    mesh = init_device_mesh("cuda", (dp_size, tp_size),
+                            mesh_dim_names=("dp", "tp"))
+    ```
+
+??? warning "`RuntimeError: tp_scatter_delta_async: previous event still pending`"
+    **原因：** 两次 `optimizer.step()` 之间没有 forward。async 的 scatter
+    event 依赖**下一次 forward** 的 `_pre_forward_wait` 来 drain。常见于
+    自定义训练 loop 在一个 iter 内调 `step()` 两次，或者 `step()` 之后
+    不做 forward 直接存 checkpoint。
+
+    **修复：** 保证两次 `step()` 之间有一次 forward；或者把 post-step
+    通信改为 sync：
+    ```python
+    optimizer = dmuon.Muon(model, lr=0.02, replicate_async=False)
+    ```
+
+??? info "HSDP × TP（3D mesh）— 已支持"
+    3D mesh `(replicate, shard, tp)` 已经验证过（见
+    [TP 支持指南](guides/tp-support.md) 和内部报告 `tp_design.md` /
+    `tp_alignment_report.md`）。sync 与 async post-step 路径产生
+    bit-identical loss 轨迹。调用顺序：
+
+    1. `parallelize_module(model, mesh["tp"], plan)`
+    2. `dmuon.dedicate_params(model, mesh["shard"], replicate_mesh=mesh["replicate"], ...)`
+    3. `fully_shard(model, mesh=mesh["replicate","shard"])`
 
 ---
 

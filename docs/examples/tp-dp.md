@@ -1,6 +1,8 @@
 # Example: TP + DP Training
 
-A complete example using Tensor Parallelism (TP) combined with Data Parallelism (DP) on a 2D device mesh.
+Complete example using Tensor Parallelism (TP) combined with Data
+Parallelism (DP) on a 2D device mesh.  DMuon detects TP-sharded
+parameters automatically via `DTensor` — no TP-specific API.
 
 ---
 
@@ -19,72 +21,79 @@ A complete example using Tensor Parallelism (TP) combined with Data Parallelism 
 ### 2D Mesh Setup
 
 ```python
-# 4 GPUs: 2 DP ranks x 2 TP ranks
-mesh_2d = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
-dp_mesh = mesh_2d["dp"]
-tp_mesh = mesh_2d["tp"]
+# 4 GPUs: 2 DP x 2 TP
+mesh = init_device_mesh("cuda", (2, 2), mesh_dim_names=("dp", "tp"))
 ```
 
-The mesh is 2D: DP dimension for data parallelism, TP dimension for tensor parallelism.
+`mesh_dim_names` is required — DMuon infers the TP axis by name-set
+subtraction (`DTensor.mesh_dim_names − dp_mesh_dim_names`).
 
-### Apply TP First
+### Call Order: TP → DMuon → FSDP2
 
 ```python
+# 1. TP
 for layer in model.layers:
     parallelize_module(
-        layer.attn, tp_mesh,
+        layer.attn, mesh["tp"],
         {
-            "q_proj": ColwiseParallel(),   # Shard(0) — row-sharded
-            "k_proj": ColwiseParallel(),   # Shard(0)
-            "v_proj": ColwiseParallel(),   # Shard(0)
-            "o_proj": RowwiseParallel(),   # Shard(1) — col-sharded
+            "q_proj": ColwiseParallel(),
+            "k_proj": ColwiseParallel(),
+            "v_proj": ColwiseParallel(),
+            "o_proj": RowwiseParallel(),
         },
     )
     parallelize_module(
-        layer.mlp, tp_mesh,
+        layer.mlp, mesh["tp"],
         {
             "gate_proj": ColwiseParallel(),
-            "up_proj": ColwiseParallel(),
+            "up_proj":   ColwiseParallel(),
             "down_proj": RowwiseParallel(),
         },
     )
-```
 
-TP must be applied **before** DMuon and FSDP2.
-
-### Then DMuon + FSDP2
-
-```python
-# DMuon uses dp_mesh (data parallel dimension)
-dmuon.dedicate_params(model, dp_mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2)
-
-# FSDP2 also uses dp_mesh
-for layer in model.layers:
-    fully_shard(layer, mesh=dp_mesh)
-fully_shard(model, mesh=dp_mesh)
-```
-
-### Optimizer with TP Options
-
-```python
-optimizer = dmuon.Muon(
-    model, lr=0.02,
-    per_head_ns=True,         # Zero TP comm for GQA k/v_proj (default)
-    block_diagonal_ns=False,  # Set True for zero TP comm everywhere (experimental)
-    adamw_lr=1e-3,
+# 2. DMuon — pass only the DP slice
+dmuon.dedicate_params(
+    model, mesh["dp"],
+    predicate=lambda n, p: "proj" in n and p.ndim == 2,
 )
+
+# 3. FSDP2 — also the DP slice
+for layer in model.layers:
+    fully_shard(layer, mesh=mesh["dp"])
+fully_shard(model, mesh=mesh["dp"])
 ```
 
-The optimizer automatically detects TP-sharded parameters and routes to the appropriate NS variant.
+DMuon must precede `fully_shard` so its parameters can opt out of
+FSDP2's sharding contract.
+
+### Optimizer
+
+```python
+optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, adamw_lr=1e-3)
+```
+
+No TP-specific knobs.  The only TP-related flag is `replicate_async`
+(default `True`): whether the post-step scatter + replicate broadcast
+overlap with the next iteration's forward compute.  Both sync and async
+produce **bit-identical** loss trajectories on 3D HSDP×TP.
 
 ## What Happens Under the Hood
 
-For each dedicated parameter, the optimizer checks:
+For each dedicated parameter, DMuon's optimizer step:
 
-1. **Is it a DTensor with a TP group?** If no → local `newton_schulz()`
-2. **Is it narrow Shard(0)?** (e.g., GQA k/v_proj where full_m < full_n) → per-head `newton_schulz()`, zero TP communication
-3. **Is `block_diagonal_ns=True`?** → `gram_newton_schulz(..., block_diagonal=True)`, zero TP communication
-4. **Otherwise** → `gram_newton_schulz(..., shard_dim=dp.shard_dim)`, exact Gram with TP all-reduce
+1. **DP reduce** → gathers the gradient to the DP owner rank (standard
+   DMuon path, unchanged by TP).
+2. **TP gather** (only for TP-sharded `DTensor` params, on `reduce_stream`
+   so it overlaps with backward compute) → reassembles the full `(m, n)`
+   gradient at a designated TP owner inside the TP group.
+3. **Newton-Schulz** — runs on the full matrix at the TP owner,
+   identical kernel path to the non-TP case.
+4. **TP scatter** (on `replicate_broadcast_stream`) → fans the update
+   back to each DP-owner rank as a TP-local shard.
+5. **Replicate broadcast** — standard HSDP fan-out to replicate peers.
+
+Plain (non-TP) `DTensor` and `torch.Tensor` parameters skip steps 2/4
+entirely.
 
 ## Run
 
@@ -92,3 +101,7 @@ For each dedicated parameter, the optimizer checks:
 # Requires 4 GPUs (2 DP x 2 TP)
 torchrun --nproc_per_node=4 examples/tp_dp.py
 ```
+
+See also: [TP Support guide](../guides/tp-support.md) — deeper treatment
+of the All-to-All pipeline, 3D HSDP×TP mesh setup, sync/async semantics,
+and inspection APIs.

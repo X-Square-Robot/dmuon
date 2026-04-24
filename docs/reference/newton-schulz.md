@@ -160,71 +160,167 @@ ns = dmuon.NewtonSchulz("gram", restart_iterations=[1, 3])
 
 ---
 
-## SYRK acceleration
+## Backend dispatch
 
-The Gram matrix $R = X X^T$ is symmetric.  DMuon's CuteDSL SYRK kernel
-(adapted from [Dao-AILab/quack](https://github.com/Dao-AILab/quack)) exploits
-this:
+Newton-Schulz has two independent axes: the **algorithm** (Gram vs. direct)
+and the underlying **SYRK kernel** implementation.  DMuon dispatches both
+automatically and exposes each as an override knob.
 
-- Computes only the lower-triangular half of $R$
-- Mirrors the result to the upper triangle
-- Saves approximately 50 % of tiles vs. a general GEMM
+### Two-axis architecture
 
-This applies to all Gram-space variants (`newton_schulz`, `gram_newton_schulz`).
-The direct-space variant does not use SYRK.
+```
+┌─────────────────────────────────────────────────────────────┐
+│  User API:  dmuon.NewtonSchulz(                             │
+│                 backend="gram",     ← Axis 1: algorithm     │
+│                 kernel="auto",       ← Axis 2: SYRK kernel  │
+│             )                                                │
+├─────────────────────────────────────────────────────────────┤
+│  Axis 1 — Algorithm                                         │
+│     "gram"    → Gram-space NS + SYRK ops + restarts (default)│
+│     "direct"  → classic parameter-space NS                  │
+├─────────────────────────────────────────────────────────────┤
+│  Axis 2 — SYRK kernel backend                               │
+│     "auto"       → pick best for current GPU (default)      │
+│     "quack"      → Tri Dao quack (SM90+, opt-in soft dep)   │
+│     "cute_sm80"  → DMuon-internal CuteDSL (SM80/87 only)    │
+│     "cublas"     → torch.mm / torch.addmm (universal)       │
+└─────────────────────────────────────────────────────────────┘
+```
 
-Check the active backend:
+The two axes are orthogonal — any `backend` × `kernel` combination is
+valid.  Direct-space NS does not use SYRK, so the `kernel` argument is
+a no-op when `backend="direct"`.
+
+### Auto-detection ladder
+
+With `kernel="auto"` (the default), DMuon picks the fastest available
+backend for the current device:
+
+```
+SM version detected at import ─►
+    ┌── SM ≥ 90  ─── quack installed?  ── yes ──► quack
+    │                                │
+    │                                └── no  ──► cublas  + warn
+    │
+    ├── SM 80/87 ─── cute_sm80 built? ── yes ──► cute_sm80
+    │                                │
+    │                                └── no  ──► cublas
+    │
+    └── SM < 80  ─────────────────────────────► cublas
+```
+
+Graceful degradation is the rule: `kernel="auto"` always picks something
+that works, logging the chosen path at startup.  Explicit `kernel="quack"`
+on an SM80 device fails fast with an install hint.
+
+### Resolution priority
+
+When multiple knobs are set, precedence is:
+
+```
+explicit NewtonSchulz(kernel=...)      ← highest (always wins)
+          │
+          ▼ only if kernel left at "auto"
+DMUON_NS_KERNEL env var
+          │
+          ▼ only if env unset
+deterministic=True                     ← legacy alias, maps to "cublas"
+          │
+          ▼
+auto-detected default
+```
+
+Setting `deterministic=True` and `kernel="cute_sm80"` simultaneously
+emits a warning and honours the explicit kernel.
+
+### Inspecting the active backend
 
 ```python
 import dmuon
 
+# Human-readable one-liner — good for startup logs
 print(dmuon.get_ns_backend())
-# "syrk_sm80"  — CuteDSL SYRK kernel (SM80+, e.g. A100/H100)
-# "compiled"   — @torch.compile fallback (any CUDA GPU)
+# "Gram NS · kernel=cute_sm80 (SM80, DMuon internal)"
+# "Gram NS · kernel=quack (SM90, Tri Dao quack)"
+# "Gram NS · kernel=cublas (SM80, universal fallback)"
+
+# Full diagnostic dict — good for bug reports / programmatic checks
+print(dmuon.get_backend_status())
+# {
+#   "sm_version": 80,
+#   "auto_choice": "cute_sm80",
+#   "quack_available": False,
+#   "cute_sm80_available": True,
+#   "cublas_always_available": True,
+# }
 ```
 
-The SYRK kernel activates automatically on SM80+ GPUs when CuteDSL is
-available.  It falls back to `@torch.compile` PyTorch on other hardware.
-
-### Deterministic mode
-
-The SYRK kernel may produce non-deterministic results across runs due to
-float accumulation order.  Force cuBLAS for exact reproducibility:
+### Forcing a specific kernel
 
 ```python
-ns = dmuon.NewtonSchulz(deterministic=True)
-optimizer = dmuon.Muon(model, ns_backend=ns)
+# Force cuBLAS for bit-exact reproducibility across runs
+ns = dmuon.NewtonSchulz(kernel="cublas")
+ns = dmuon.NewtonSchulz(deterministic=True)   # legacy equivalent
+
+# Force the SM80 CuteDSL kernel (raises if cute_sm80 wasn't built)
+ns = dmuon.NewtonSchulz(kernel="cute_sm80")
+
+# Cluster-wide override via env var (takes effect only when code uses "auto")
+# export DMUON_NS_KERNEL=cublas
 ```
 
-!!! warning "SYRK B != A bug"
-    The CuteDSL SYRK kernel has a known non-determinism issue when `B != A`
-    (certain intermediate computations in the Gram recurrence).  The workaround
-    is `deterministic=True`, which routes all ops through cuBLAS at a ~1.5x
-    performance cost.  This is being tracked for a future kernel fix.
+!!! info "quack backend"
+    The `quack` SYRK backend is enabled on SM90+ devices when the
+    `quack-kernels` soft dependency is installed (`pip install dmuon[quack]`).
+    Validated end-to-end on B300 (SM103) — see
+    `docs/internal/benchmarks/quack_smoke_b300.md` for the correctness
+    matrix and performance crossover (quack wins from M ≈ 4096, clear
+    advantage at M ≥ 8192).
+
+    A runtime circuit-breaker
+    `dmuon.kernels.syrk_quack.ADAPTER_READY` can be flipped to `False`
+    to emergency-disable the quack path without uninstalling the
+    package; `kernel="auto"` then falls back to `cublas`.
+
+    `get_backend_status()["auto_choice"]` always reports the kernel
+    that will actually run, so you can see ground truth at a glance.
 
 ---
 
-## TP routing summary
+## TP handling
 
-When `Muon` encounters a TP-sharded parameter, it selects the NS path
-according to the following decision tree:
+The NS kernels (`newton_schulz`, `gram_newton_schulz`,
+`direct_newton_schulz`) are **TP-agnostic**: they operate on a full
+(un-sharded) matrix and have no `tp_group` argument.  For TP-sharded
+parameters the DMuon runtime reassembles the full matrix at a
+designated TP owner via All-to-All gather before invoking NS, then
+scatters the update back to each DP-owner rank:
 
 ```
-Is the param a DTensor with a TP group?
-├── No  → NewtonSchulz.local()  (standard Gram NS or direct, no comm)
-└── Yes
-    ├── per_head_ns=True AND Shard(0) AND full_m < full_n
-    │   → NewtonSchulz.local()   (per-head, zero TP comm)
-    ├── block_diagonal_ns=True
-    │   → NewtonSchulz.tp(..., block_diagonal=True)   (zero TP comm)
-    └── Otherwise (default)
-        → NewtonSchulz.tp(..., shard_dim=dp.shard_dim)  (exact Gram, TP all-reduce)
+DP reduce  →  TP gather (dist.gather on reduce_stream)  →
+    Newton-Schulz on full (m, n) matrix at TP owner  →
+TP scatter (dist.scatter on replicate_broadcast_stream)  →
+    replicate broadcast
 ```
 
-For **Shard(0)** (row-sharded): the iteration transposes to use $G^T G$, which
-decomposes exactly as $\sum_i G_i^T G_i$ — one all-reduce gives the exact Gram.
-For **Shard(1)** (col-sharded): uses $G G^T$, which decomposes as
-$\sum_i G_i G_i^T$.
+This is automatic for any `DTensor` parameter whose `device_mesh`
+contains a mesh dim outside the DP dim names — no explicit TP flag on
+`dmuon.Muon`.  TP ownership is picked by `assign_tp_owner` (MVP policy
+`"rank0"`).
+
+Practical consequences:
+
+* Same NS precision regardless of TP — the kernel always sees the full
+  matrix.
+* Extra comm cost per TP-sharded param: one `dist.gather` + one
+  `dist.scatter`, both sized `(T − 1)/T · |p|`.  Both run on DMuon's
+  dedicated comm streams and empirically achieve ~100% overlap with
+  backward compute on 8-GPU 3D HSDP×TP toy.
+* No change to non-TP param behaviour.
+
+See the [TP support guide](../guides/tp-support.md) for setup and
+[`tp_design.md`](../../internal/research/tp_design.md) for the full
+lifecycle + sync / async semantics.
 
 ---
 

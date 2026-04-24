@@ -12,8 +12,9 @@ from typing import NamedTuple, Optional
 import torch
 import torch.distributed as dist
 
-from ._owner_rank import OwnerCoord
-from .comm import DedicatedCommContext
+from dmuon._core.comm import DedicatedCommContext
+from dmuon._core.owner_rank import OwnerCoord
+
 from .param import DedicatedParam
 
 try:
@@ -41,6 +42,34 @@ class ReplicateReduceState(NamedTuple):
 # monkey-patching inside the group object.
 REPLICATE_WAIT_THRESHOLD_US: float = 100.0
 REPLICATE_FALLBACK_CONSECUTIVE_STEPS: int = 3
+
+
+class TPScatterState(NamedTuple):
+    """State kept alive across the async post-step TP scatter.
+
+    T2d analogue of :class:`ReplicateBroadcastState`: the scatter is
+    dispatched on ``replicate_broadcast_stream`` and the caller returns
+    without waiting; the event is consumed on the next iteration's
+    :meth:`_pre_forward_wait` hook (cross-call event-chain pattern, same
+    as FSDP2's ``AllGatherState``).
+
+    **Do NOT pin ``recv_shards`` Python-refs across iterations.**  The
+    dispatch body already calls ``recv_shard.record_stream(bcast_stream)``
+    which is the correct allocator-safety primitive — the caching
+    allocator keeps the memory reserved until the scatter kernel
+    completes on ``bcast_stream``.  Holding Python refs in a state tuple
+    on top of that is NOT belt-and-suspenders: it changes the allocator's
+    free-block pattern across iterations, which shifts the addresses of
+    subsequent NCCL transport buffers and produces a different (but
+    self-consistent) floating-point reduction trajectory than the sync
+    path.  The ``recv_shards`` field therefore always carries an EMPTY
+    list — we keep it for schema symmetry with ``ReplicateBroadcastState``.
+    See ``docs/internal/research/tp_alignment_report.md`` (Phase B/C,
+    2026-04-24) for the diagnostic trail.
+    """
+
+    recv_shards: list[torch.Tensor]
+    event: torch.cuda.Event
 
 
 class ReplicateBroadcastState(NamedTuple):
@@ -130,6 +159,16 @@ class DedicatedParamGroup:
         # Fallback state machine — count of consecutive slow waits.
         self._replicate_slow_wait_count: int = 0
 
+        # T2d: async TP scatter state — mirrors ``_replicate_broadcast_state``
+        # but covers the per-TP-group ``dist.scatter`` dispatched by
+        # ``tp_scatter_delta_async``.  Consumed together with the replicate
+        # broadcast state in ``_pre_forward_wait``.  See ``tp_design.md``
+        # §4.2 (O2) + §5 fallback.
+        self._tp_scatter_state: Optional[TPScatterState] = None
+        self._tp_sync_fallback: bool = False
+        self._last_tp_scatter_wait_us: float = 0.0
+        self._tp_scatter_slow_wait_count: int = 0
+
         # Partial accumulator across ``no_sync`` micro-batches (per-param, on
         # the shard-owner rank).  Set during grad-accum when
         # ``replicate_grads_enabled`` is False; flushed into the next Stage-2
@@ -197,7 +236,7 @@ class DedicatedParamGroup:
         # Python dispatch + one fused kernel) instead of N separate ``.copy_``
         # calls. dst views survive ``free_storage`` → ``alloc_storage`` because
         # they share the packed buf's Storage object (resize is in-place).
-        from ._internal_utils import free_storage
+        from dmuon._core.internal_utils import free_storage
         self._packed_buf_by_owner: dict[OwnerCoord, torch.Tensor] = {}
         self._copy_in_dsts_by_owner: dict[OwnerCoord, list[torch.Tensor]] = {}
         if self._comm_dtype is not None:
@@ -243,7 +282,7 @@ class DedicatedParamGroup:
         broadcast_stream = self.comm_ctx.broadcast_stream
         broadcast_stream.wait_stream(torch.cuda.current_stream())
 
-        from ._internal_utils import alloc_storage
+        from dmuon._core.internal_utils import alloc_storage
         dp_group = self._dp_group
         local_shard_rank = dp_group.rank()
         with torch.cuda.stream(broadcast_stream):
@@ -327,7 +366,7 @@ class DedicatedParamGroup:
             self._broadcast_event = None
         for p in self.params:
             p.reshard()
-        from ._internal_utils import free_storage
+        from dmuon._core.internal_utils import free_storage
         for packed_buf in self._packed_buf_by_owner.values():
             with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
                 packed_buf
@@ -527,6 +566,207 @@ class DedicatedParamGroup:
 
         self._pending_reduce = []
 
+    # ---- TP gather (T2a) -------------------------------------------------
+
+    def tp_gather_grads(self) -> None:
+        """Reassemble the full (M, N) gradient on the TP owner for every
+        TP-sharded parameter in this group.
+
+        Pre-condition (enforced by caller ordering): ``wait_for_reduce`` has
+        already populated ``p._reduced_grad`` on every DP-owner rank — one
+        per TP coord — so every rank in the TP process group holds its
+        TP-local shard of the averaged gradient (shape ``p._orig_size``).
+        Ranks that are not DP owners have ``_reduced_grad is None`` and
+        skip the collective entirely.
+
+        Post-condition: on the TP owner (``p.is_tp_owner`` is True),
+        ``p._tp_full_grad`` is a fresh ``(full_shape)`` tensor holding the
+        reassembled gradient, ready for NS.  On non-owner TP ranks
+        ``_tp_full_grad`` stays ``None`` (they still participate in the
+        gather as senders).  Non-TP params are no-ops.
+
+        Runs on ``reduce_stream`` so the gather overlaps with whatever
+        subsequent work the user submits on the compute stream — the
+        optimizer step consumes ``_tp_full_grad`` and will be serialised
+        via a stream wait inserted by the caller right before NS.
+
+        §2.3 阶段 ③ + §4.1 O1 overlap.
+        """
+        reduce_stream = self.comm_ctx.reduce_stream
+        # Build per-param work list.  Only TP-sharded params with a
+        # populated ``_reduced_grad`` participate (ranks that are not DP
+        # owners hold no grad and must stay silent).
+        work: list[tuple[DedicatedParam, torch.Tensor]] = []
+        for p in self.params:
+            if p.tp_group is None:
+                continue
+            if p._reduced_grad is None:
+                # This rank is not a DP owner for `p` — skip entirely.
+                continue
+            work.append((p, p._reduced_grad))
+
+        if not work:
+            return
+
+        # Ensure the gather sees the final reduced grad (wait_for_reduce
+        # already ran on the current stream; reduce_stream may still be
+        # mid-flight from an unrelated reduce).
+        reduce_stream.wait_stream(torch.cuda.current_stream())
+
+        with torch.cuda.stream(reduce_stream):
+            with dist._coalescing_manager(group=None, device=self.device):
+                for p, local_grad in work:
+                    tp_size = p.tp_group.size()
+                    if p.is_tp_owner:
+                        # Allocate the full (M, N) buffer fresh every step
+                        # (MVP — see tp_design.md §6.7 note on pre-alloc
+                        # deferral).  gather_list entries must be separate
+                        # tensors; we cat them post-gather along shard_dim.
+                        shard_dim = p.shard_dim if p.shard_dim is not None else 0
+                        recv_bufs = [
+                            torch.empty_like(local_grad) for _ in range(tp_size)
+                        ]
+                        dist.gather(
+                            local_grad,
+                            gather_list=recv_bufs,
+                            dst=p._tp_owner_global_rank,
+                            group=p.tp_group,
+                        )
+                        p._tp_full_grad = torch.cat(recv_bufs, dim=shard_dim)
+                    else:
+                        dist.gather(
+                            local_grad,
+                            gather_list=None,
+                            dst=p._tp_owner_global_rank,
+                            group=p.tp_group,
+                        )
+                        p._tp_full_grad = None
+        # No event record: the TP owner consumes ``_tp_full_grad`` on the
+        # default (compute) stream in optimizer.step, which will
+        # ``wait_stream(reduce_stream)`` just before reading.
+
+    # ---- TP scatter (T2b) ------------------------------------------------
+
+    def _tp_scatter_dispatch(self) -> Optional[list[torch.Tensor]]:
+        """Shared dispatch body for sync + async TP scatter.
+
+        Queues the scatter + ``_owned_data.mul_(wd).add_(shard)`` fuse on
+        ``replicate_broadcast_stream`` and returns the list of transient
+        ``recv_shard`` buffers.  Callers:
+          * sync  (``tp_scatter_delta``) — ``wait_stream`` joins back.
+          * async (``tp_scatter_delta_async``) — records event + stores
+            the recv-shard list in :attr:`_tp_scatter_state`.
+
+        Returns ``None`` when the group has no TP-sharded params with
+        pending updates (no dispatch happened).
+        """
+        work: list[DedicatedParam] = [
+            p for p in self.params
+            if p.tp_group is not None and p._reduced_grad is not None
+        ]
+        if not work:
+            return None
+
+        bcast_stream = self.comm_ctx.replicate_broadcast_stream
+        bcast_stream.wait_stream(torch.cuda.current_stream())
+
+        recv_shards: list[torch.Tensor] = []
+        with torch.cuda.stream(bcast_stream):
+            with dist._coalescing_manager(group=None, device=self.device):
+                for p in work:
+                    shard_dim = p.shard_dim if p.shard_dim is not None else 0
+                    recv_shard = torch.empty_like(p._owned_data)
+                    if p.is_tp_owner:
+                        assert p._tp_full_delta is not None, (
+                            f"{p.param_name}: TP owner has _tp_full_delta=None "
+                            "— Muon._step_muon did not populate it."
+                        )
+                        splits = [
+                            s.contiguous()
+                            for s in p._tp_full_delta.split(
+                                p._orig_size[shard_dim], dim=shard_dim,
+                            )
+                        ]
+                        dist.scatter(
+                            recv_shard,
+                            scatter_list=splits,
+                            src=p._tp_owner_global_rank,
+                            group=p.tp_group,
+                        )
+                    else:
+                        dist.scatter(
+                            recv_shard,
+                            scatter_list=None,
+                            src=p._tp_owner_global_rank,
+                            group=p.tp_group,
+                        )
+                    p._owned_data.mul_(p._tp_wd_factor).add_(recv_shard)
+                    recv_shard.record_stream(bcast_stream)
+                    recv_shards.append(recv_shard)
+                    p._tp_full_grad = None
+                    p._tp_full_delta = None
+                    p._reduced_grad = None
+        return recv_shards
+
+    def tp_scatter_delta(self) -> None:
+        """Fan the full-matrix NS update back to each DP-owner TP shard.
+
+        **Sync variant** (§2.3 阶段 ⑤): dispatch + join to compute stream
+        before returning so the caller can immediately read ``_owned_data``.
+
+        Pre-conditions (set by ``Muon._step_muon``):
+          * TP owner: ``p._tp_full_delta`` is the pre-scaled update
+            (``-lr * scale * NS_output``), shape ``p.full_shape``.
+          * Every DP-owner TP rank: ``p._tp_wd_factor = 1 - lr * wd``.
+          * ``p._owned_data`` still holds the old weight shard.
+
+        Post: each DP-owner rank's ``p._owned_data`` is updated in place
+        via ``owned.mul_(wd_factor).add_(shard)`` — Moonlight's
+        ``new = (1 - lr*wd) * old - lr*scale * NS`` per shard.
+        """
+        if self._tp_scatter_dispatch() is None:
+            return
+        # Sync contract: compute stream waits for the scatter to land
+        # before the caller can read ``_owned_data`` (the next unshard
+        # broadcast reads it).
+        torch.cuda.current_stream().wait_stream(
+            self.comm_ctx.replicate_broadcast_stream
+        )
+
+    def tp_scatter_delta_async(self) -> None:
+        """T2d async variant of :meth:`tp_scatter_delta`.
+
+        Dispatches the scatter on ``replicate_broadcast_stream`` and
+        returns immediately; records an event + pins the ``recv_shard``
+        buffers in :attr:`_tp_scatter_state` so the caching allocator
+        cannot reclaim them before the NCCL kernel observes the writes.
+        The event is consumed by the NEXT iteration's
+        :meth:`_pre_forward_wait` — mirrors the replicate-broadcast
+        cross-call event chain.
+
+        Gate semantics:
+          * ``_tp_sync_fallback=True`` → degrade to sync; state stays IDLE.
+          * Double-dispatch (state still PENDING) → ``RuntimeError``.
+        """
+        if self._tp_sync_fallback:
+            self.tp_scatter_delta()
+            return
+        if self._tp_scatter_state is not None:
+            raise RuntimeError(
+                "tp_scatter_delta_async: previous event still pending — "
+                "pre_forward_wait was not consumed before the next dispatch"
+            )
+        if self._tp_scatter_dispatch() is None:
+            return
+        event = self.comm_ctx.replicate_broadcast_stream.record_event()
+        # Intentionally DO NOT pin recv_shards (see TPScatterState
+        # docstring): the allocator is already kept honest by
+        # ``record_stream`` inside ``_tp_scatter_dispatch``.  Pinning
+        # across iterations causes sync/async loss divergence.
+        self._tp_scatter_state = TPScatterState(
+            recv_shards=[], event=event
+        )
+
     # ---- replicate-dim post-step broadcast (Phase B.2) -------------------
 
     def replicate_broadcast_sync(self):
@@ -674,6 +914,33 @@ class DedicatedParamGroup:
         round-trip per group per step and is NOT safe to leave on in
         production; it is meant for fallback monitoring + profiling.
         """
+        # T2d: drain the async TP scatter state first.  The scatter is
+        # what writes ``_owned_data`` on every DP-owner TP rank; the
+        # replicate broadcast fans that value out.  In pure-DP mode (no
+        # replicate_group) the scatter state is the only thing to wait
+        # on; in HSDP mode both fire on the same stream and waiting the
+        # replicate broadcast event implicitly covers the scatter, but
+        # we still wait the scatter event explicitly so the state tuple
+        # (and its pinned recv_shards) can be released.
+        tp_state = self._tp_scatter_state
+        if tp_state is not None:
+            profile_enabled = bool(
+                int(os.environ.get("DMUON_REPLICATE_PROFILE", "0") or 0)
+            )
+            if profile_enabled:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                torch.cuda.current_stream().wait_event(tp_state.event)
+                end.record()
+                end.synchronize()
+                self._last_tp_scatter_wait_us = (
+                    start.elapsed_time(end) * 1000.0
+                )
+            else:
+                torch.cuda.current_stream().wait_event(tp_state.event)
+            self._tp_scatter_state = None
+
         state = self._replicate_broadcast_state
         if state is None:
             return
@@ -690,7 +957,7 @@ class DedicatedParamGroup:
             # (only waits on the two timing events on the default stream).
             end.synchronize()
             self._last_replicate_wait_us = start.elapsed_time(end) * 1000.0  # ms→μs
-            from . import _replicate_profile
+            from dmuon import _replicate_profile
             _replicate_profile.record_wait_from_group(
                 self, self._last_replicate_wait_us
             )
@@ -726,12 +993,35 @@ class DedicatedParamGroup:
         # the last value.
         self._last_replicate_wait_us = 0.0
 
+    def _update_tp_scatter_fallback(self) -> None:
+        """T2e: tracks async TP scatter wait-time and flips
+        ``_tp_sync_fallback`` after ``REPLICATE_FALLBACK_CONSECUTIVE_STEPS``
+        consecutive slow waits (same thresholds as the replicate broadcast
+        fallback; tp_design.md §5)."""
+        if self._tp_sync_fallback:
+            return
+        if self._last_tp_scatter_wait_us <= 0.0:
+            return
+        if self._last_tp_scatter_wait_us > REPLICATE_WAIT_THRESHOLD_US:
+            self._tp_scatter_slow_wait_count += 1
+        else:
+            self._tp_scatter_slow_wait_count = 0
+        if self._tp_scatter_slow_wait_count >= REPLICATE_FALLBACK_CONSECUTIVE_STEPS:
+            self._tp_sync_fallback = True
+        self._last_tp_scatter_wait_us = 0.0
+
     def reset_replicate_fallback(self) -> None:
         """Manually clear the fallback flag.  Intended for user code that
         wants to re-enable async after fixing the slow-IB condition."""
         self._replicate_sync_fallback = False
         self._replicate_slow_wait_count = 0
         self._last_replicate_wait_us = 0.0
+
+    def reset_tp_scatter_fallback(self) -> None:
+        """Manually clear the async TP scatter fallback flag."""
+        self._tp_sync_fallback = False
+        self._tp_scatter_slow_wait_count = 0
+        self._last_tp_scatter_wait_us = 0.0
 
     # ---- backward prefetch ----
 

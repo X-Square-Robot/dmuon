@@ -5,8 +5,14 @@ Backend selection (auto-detected at import time):
 - **Fallback**: ``@torch.compile`` pure PyTorch
 
 Two NS modes:
-- ``newton_schulz(G)``: Standard NS on full matrix (non-TP)
-- ``gram_newton_schulz(G_shard, tp_group)``: Gram NS with TP SYRK decomposition
+- :func:`newton_schulz`: Gram-space NS on a full matrix (default public entry).
+- :func:`direct_newton_schulz`: classic parameter-space NS.
+
+TP support lives entirely in the runtime layer (``dmuon._backends.fsdp2``):
+for TP-sharded parameters the runtime does an All-to-All gather so the TP
+owner sees the full matrix, then calls one of the functions above — the
+NS algorithms themselves are TP-agnostic.  See
+``docs/internal/research/tp_design.md``.
 
 Gram NS iteration logic is adapted from Dao-AILab/gram-newton-schulz, including
 per-step coefficients, restart mechanism, and mixed-precision pipeline.
@@ -18,7 +24,6 @@ import logging
 from typing import Optional
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
 
 from dmuon.optim.syrk_dispatch import (
@@ -77,36 +82,49 @@ DEFAULT_RESTART_ITERATIONS = [2]  # optimal for POLAR_EXPRESS per autotune
 class NewtonSchulz:
     """Configurable Newton-Schulz backend.
 
-    Encapsulates the algorithm variant and coefficients so they can be
-    passed as a single object to :class:`~dmuon.Muon`.
+    Encapsulates the algorithm variant, coefficients, and SYRK kernel
+    backend so they can be passed as a single object to :class:`~dmuon.Muon`.
 
     Args:
         backend: ``"gram"`` (default) for Gram-space NS with SYRK
             acceleration and restarts, or ``"direct"`` for classic
             parameter-space NS (Muon/Moonlight formulation).
+        kernel: SYRK kernel backend to use inside Gram NS:
+
+            * ``"auto"`` (default) — pick the best available on this GPU.
+              SM80/87 → ``cute_sm80``, SM90+ with quack installed →
+              ``quack``, otherwise ``cublas``.
+            * ``"quack"`` — Tri Dao quack SYRK (SM90+, soft dep). Raises
+              at construction if unavailable.
+            * ``"cute_sm80"`` — DMuon-internal CuteDSL kernel (SM80/87).
+            * ``"cublas"`` — universal fallback; bit-exact across runs.
+
+            Env var override: ``DMUON_NS_KERNEL`` takes precedence only
+            when this argument is left at ``"auto"``.
         coefficients: Per-step ``(a, b, c)`` coefficients.  ``None``
             uses :data:`POLAR_EXPRESS_COEFFICIENTS`.
         restart_iterations: Restart positions for Gram-space NS.
             ``None`` uses ``[2]``.  Ignored when *backend* is
             ``"direct"``.
-        deterministic: If ``True``, force all Gram-space matrix ops
-            through cuBLAS instead of the custom SYRK kernel.  This
-            guarantees bit-exact reproducibility across runs at the
-            cost of losing SYRK's symmetry-based acceleration (~1.5x).
-            Default ``False``.
+        deterministic: Back-compat alias for ``kernel="cublas"``.  When
+            ``True`` and ``kernel`` is still ``"auto"``, the kernel is
+            forced to ``cublas`` (bit-exact reproducibility).  Explicit
+            ``kernel=`` wins over ``deterministic`` — if both are given
+            and they disagree, a warning is emitted and ``kernel`` wins.
 
     Example::
 
         import dmuon
 
-        # Default (Gram-space, Polar Express coefficients)
+        # Default (Gram-space, auto-selected kernel)
         ns = dmuon.NewtonSchulz()
 
-        # Bit-exact reproducible
-        ns = dmuon.NewtonSchulz(deterministic=True)
+        # Force cuBLAS (reproducible across runs)
+        ns = dmuon.NewtonSchulz(kernel="cublas")
+        ns = dmuon.NewtonSchulz(deterministic=True)  # equivalent
 
-        # Classic Muon with You coefficients
-        ns = dmuon.NewtonSchulz("direct", coefficients=dmuon.YOU_COEFFICIENTS)
+        # SM90+ explicit quack
+        ns = dmuon.NewtonSchulz(kernel="quack")
 
         optimizer = dmuon.Muon(model, lr=0.02, ns_backend=ns)
     """
@@ -114,24 +132,70 @@ class NewtonSchulz:
     def __init__(
         self,
         backend: str = "gram",
+        kernel: str = "auto",
         coefficients: Optional[list[list[float]]] = None,
         restart_iterations: Optional[list[int]] = None,
         deterministic: bool = False,
     ):
         if backend not in ("gram", "direct"):
             raise ValueError(f"backend must be 'gram' or 'direct', got '{backend}'")
+        # Lazy import to avoid a cycle with syrk_backends on cold start.
+        from dmuon.kernels.syrk_backends import (
+            SyrkBackend,
+            resolve_backend,
+            resolve_env_kernel,
+        )
+
+        # Resolve kernel choice in priority order:
+        #   1. explicit kernel= kwarg (non-auto) ─ highest
+        #   2. DMUON_NS_KERNEL env var ─ consulted only when kernel='auto'
+        #   3. deterministic=True ─ legacy alias; maps to 'cublas' when
+        #      kernel is still 'auto' after env resolution
+        try:
+            chosen = SyrkBackend(kernel)
+        except ValueError:
+            valid = ", ".join(b.value for b in SyrkBackend)
+            raise ValueError(
+                f"kernel={kernel!r} is not a valid SYRK backend; "
+                f"choose one of: {valid}"
+            )
+        if chosen == SyrkBackend.AUTO:
+            env_choice = resolve_env_kernel()
+            if env_choice is not None:
+                chosen = env_choice
+            elif deterministic:
+                chosen = SyrkBackend.CUBLAS
+        elif deterministic and chosen != SyrkBackend.CUBLAS:
+            logger.warning(
+                "NewtonSchulz: kernel=%r conflicts with deterministic=True; "
+                "honouring explicit kernel.  Pass kernel='cublas' for bit-exact.",
+                chosen.value,
+            )
+
+        # Validate availability early so the failure is at construction
+        # time, not buried inside the first SYRK call.
+        chosen = resolve_backend(chosen)
+
         self.backend = backend
+        self.kernel = chosen
         self.coefficients = coefficients
         self.restart_iterations = restart_iterations
-        self.deterministic = deterministic
+        # deterministic becomes a derived flag: True iff the resolved
+        # kernel is cublas.  Existing call sites that check
+        # ``self.deterministic`` keep working unchanged.
+        self.deterministic = chosen == SyrkBackend.CUBLAS
 
     def local(self, G: Tensor, steps: int) -> Tensor:
-        """Run NS on a local (non-TP-decomposed) matrix.
+        """Run NS on a full (un-sharded) matrix.
 
-        Used for pure-DP params and TP per-head params.
+        The runtime guarantees the matrix handed in here is the full
+        logical gradient: for pure-DP params the owner already holds
+        the full tensor; for TP-sharded params the All-to-All gather
+        step (``dmuon._backends.fsdp2.group.tp_gather_grads``) has
+        reassembled the full matrix on the TP owner before this call.
         """
         if self.backend == "gram":
-            return gram_newton_schulz_local(
+            return gram_newton_schulz(
                 G, steps=steps,
                 coefficients=self.coefficients,
                 restart_iterations=self.restart_iterations,
@@ -141,32 +205,12 @@ class NewtonSchulz:
             G, steps=steps, coefficients=self.coefficients,
         )
 
-    def tp(
-        self,
-        G_shard: Tensor,
-        tp_group: "dist.ProcessGroup",
-        steps: int,
-        shard_dim: Optional[int],
-        block_diagonal: bool = False,
-    ) -> Tensor:
-        """Run Gram NS with TP decomposition.
-
-        Always uses :func:`gram_newton_schulz` regardless of *backend*,
-        since TP Gram decomposition requires Gram-space iteration.
-        """
-        return gram_newton_schulz(
-            G_shard, tp_group, steps=steps,
-            coefficients=self.coefficients,
-            restart_iterations=self.restart_iterations,
-            shard_dim=shard_dim,
-            block_diagonal=block_diagonal,
-            deterministic=self.deterministic,
-        )
-
     def __repr__(self) -> str:
         coeff = "default" if self.coefficients is None else f"{len(self.coefficients)}-step custom"
-        det = ", deterministic=True" if self.deterministic else ""
-        return f"NewtonSchulz(backend={self.backend!r}, coefficients={coeff}{det})"
+        return (
+            f"NewtonSchulz(backend={self.backend!r}, "
+            f"kernel={self.kernel.value!r}, coefficients={coeff})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +228,7 @@ def direct_newton_schulz(
     ``X_{k+1} = a_k X + b_k (X X^T) X + c_k (X X^T)^2 X``
 
     This is the classic formulation used by Muon/Moonlight. Compared to
-    :func:`gram_newton_schulz_local` (Gram-space), direct NS is simpler but:
+    :func:`gram_newton_schulz` (Gram-space), direct NS is simpler but:
 
     - Does not benefit from SYRK symmetry acceleration
     - Does not support the restart mechanism
@@ -255,8 +299,8 @@ def newton_schulz(
 ) -> Tensor:
     """Newton-Schulz orthogonalization (default: Gram-space backend).
 
-    Routes to :func:`gram_newton_schulz_local` by default for better
-    precision (per-step coefficients, restart mechanism, SYRK acceleration).
+    Routes to :func:`gram_newton_schulz` by default for better precision
+    (per-step coefficients, restart mechanism, SYRK acceleration).
 
     For the standard direct-space algorithm, use :func:`direct_newton_schulz`.
 
@@ -270,7 +314,7 @@ def newton_schulz(
     Returns:
         Orthogonalized update.
     """
-    return gram_newton_schulz_local(
+    return gram_newton_schulz(
         G, steps=steps, eps=eps,
         coefficients=coefficients,
         restart_iterations=restart_iterations,
@@ -278,155 +322,9 @@ def newton_schulz(
 
 
 # ---------------------------------------------------------------------------
-# Gram NS — TP-correct, adapted from Dao-AILab/gram-newton-schulz
+# Gram NS — full-matrix Gram-space NS (TP-agnostic)
 # ---------------------------------------------------------------------------
 def gram_newton_schulz(
-    G_shard: Tensor,
-    tp_group: dist.ProcessGroup,
-    steps: int = 5,
-    eps: float = 1e-7,
-    coefficients: Optional[list[list[float]]] = None,
-    restart_iterations: Optional[list[int]] = None,
-    shard_dim: Optional[int] = None,
-    block_diagonal: bool = False,
-    deterministic: bool = False,
-) -> Tensor:
-    """Gram Newton-Schulz with TP SYRK decomposition.
-
-    Adapted from Dao-AILab/gram-newton-schulz. Iterates on the Gram matrix
-    instead of the full gradient. Uses per-step coefficients and restart
-    mechanism for numerical stability.
-
-    The ``shard_dim`` parameter controls which Gram is used:
-
-    - **Shard(0)** (row-sharded): transpose to use R-side ``G^TG`` which
-      decomposes as ``Σ G_i^T G_i`` → all-reduce gives exact Gram.
-    - **Shard(1)** (col-sharded): use L-side ``GG^T`` which decomposes
-      as ``Σ G_i G_i^T`` → all-reduce gives exact Gram.
-
-    When ``block_diagonal=True``, the all-reduce is skipped and only the
-    local Gram is used (block-diagonal approximation, zero TP communication).
-
-    Args:
-        G_shard: TP-sharded gradient on this rank.
-        tp_group: TP process group for all-reduce.
-        steps: Ignored (determined by len(coefficients)).
-        eps: Normalization epsilon.
-        coefficients: Per-step coefficients. Defaults to POLAR_EXPRESS_COEFFICIENTS.
-        restart_iterations: Iteration indices for restart. Defaults to [2].
-        shard_dim: TP shard dimension (0 or 1). Determines transpose direction.
-            If None, falls back to shape-based heuristic.
-        block_diagonal: If True, skip TP all-reduce (zero communication).
-        deterministic: If True, use cuBLAS for all ops (no SYRK kernel).
-
-    Returns:
-        Orthogonalized update shard, same shape as input.
-    """
-    if coefficients is None:
-        coefficients = DEFAULT_COEFFICIENTS
-    if restart_iterations is None:
-        restart_iterations = DEFAULT_RESTART_ITERATIONS
-
-    original_dtype = G_shard.dtype
-
-    # --- fp32 normalization (Dao-AILab precision strategy) ---
-    X = G_shard.float()
-    if block_diagonal:
-        # Block-diagonal: use smaller local Gram (shape-based, no all-reduce)
-        transposed = X.shape[0] > X.shape[1]
-    elif shard_dim is not None:
-        # Shard(0) row-sharded: transpose → R-side G^TG decomposes
-        # Shard(1) col-sharded: don't transpose → L-side GG^T decomposes
-        transposed = (shard_dim == 0)
-    else:
-        transposed = X.shape[0] > X.shape[1]
-    if transposed:
-        X = X.T
-    X = X / (X.norm() + eps)
-    X = X.half()
-    # SYRK kernel requires K-contiguous input; transpose above makes X a
-    # stride-swapped view, so force a row-major copy here once instead of
-    # paying for an implicit .contiguous() inside every SYRK call.
-    X = X.contiguous()
-
-    # --- Initial SYRK: R = X @ X^T ---
-    m = X.shape[0]
-    _use_syrk = _HAS_SYRK and X.is_cuda and not deterministic
-    if _use_syrk:
-        R = torch.empty(m, m, device=X.device, dtype=X.dtype)
-        _syrk_or_cublas(X, R)
-    else:
-        R = X @ X.T
-
-    # --- TP all-reduce: exact Gram = Σ G_i @ G_i^T ---
-    if not block_diagonal:
-        dist.all_reduce(R, group=tp_group)
-
-    # --- Gram NS iterations with restarts (Dao-AILab algorithm) ---
-    I = torch.eye(m, device=X.device, dtype=X.dtype) if not _use_syrk else None
-    Q: Optional[Tensor] = None
-    Z = torch.empty_like(R) if _use_syrk else None
-    Q_bufs = [torch.empty_like(R), torch.empty_like(R)] if _use_syrk else [None, None]
-    q_idx = 0
-    RZ_buf = torch.empty_like(R) if _use_syrk else None
-    R_new = torch.empty_like(R) if _use_syrk else None
-
-    for i, (a, b, c) in enumerate(coefficients):
-        if i in restart_iterations and i != 0:
-            X = Q @ X
-            if _use_syrk:
-                _syrk_or_cublas(X, R)
-            else:
-                R = X @ X.T
-            if not block_diagonal:
-                dist.all_reduce(R, group=tp_group)
-            Q = None
-
-        if _use_syrk:
-            # Op 2: Z = c*R@R^T + b*R  (B==A, symmetric)
-            _syrk_or_cublas(R, Z, C=R, alpha=c, beta=b)
-
-            if Q is None:
-                # Op 3: Q = Z + a*I  (first iter, B==A, symmetric)
-                need_R_evolve = i < len(coefficients) - 1 and (i + 1) not in restart_iterations
-                if not need_R_evolve:
-                    _syrk_or_cublas(R, Q_bufs[q_idx], C=R, alpha=c, beta=b, diag_add=a)
-                else:
-                    Q_bufs[q_idx].copy_(Z)
-                    Q_bufs[q_idx].diagonal().add_(a)
-                Q = Q_bufs[q_idx]
-            else:
-                # Op 4: Q_new = Z@Q^T + a*Q  (B!=A, NOT symmetric → cuBLAS)
-                q_next = 1 - q_idx
-                torch.addmm(Q, Z, Q.T, alpha=1.0, beta=a, out=Q_bufs[q_next])
-                Q = Q_bufs[q_next]
-                q_idx = q_next
-
-            if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:
-                # Ops 5,6: B!=A, symmetric (Z,R,RZ are polynomials of same
-                # symmetric matrix → commute → result symmetric). SYRK OK.
-                _syrk_or_cublas(R, RZ_buf, B=Z, C=R, alpha=1.0, beta=a)
-                _syrk_or_cublas(RZ_buf, R_new, B=Z, C=RZ_buf, alpha=1.0, beta=a)
-                R = R_new
-        else:
-            Z_t = torch.addmm(R, R, R, alpha=c, beta=b)
-            if Q is None:
-                Q = Z_t + a * I
-            else:
-                Q = torch.addmm(Q, Z_t, Q, beta=a)
-            if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:
-                RZ_t = torch.addmm(R, R, Z_t, beta=a)
-                R = torch.addmm(RZ_t, Z_t, RZ_t, beta=a)
-
-    # --- Project back ---
-    X = Q @ X
-
-    if transposed:
-        X = X.T
-    return X.to(original_dtype)
-
-
-def gram_newton_schulz_local(
     G: Tensor,
     steps: int = 5,
     eps: float = 1e-7,
@@ -434,19 +332,28 @@ def gram_newton_schulz_local(
     restart_iterations: Optional[list[int]] = None,
     deterministic: bool = False,
 ) -> Tensor:
-    """Gram NS without TP (single-rank). Uses Gram iteration for its precision
-    benefits (restarts, per-step coefficients) even without TP sharding.
+    """Gram-space Newton-Schulz on a full (un-sharded) matrix.
+
+    Adapted from Dao-AILab/gram-newton-schulz.  Iterates on the Gram matrix
+    instead of the full gradient; uses per-step coefficients and restart
+    mechanism for numerical stability.
+
+    **TP handling**: this function is TP-agnostic.  For TP-sharded
+    parameters the runtime gathers the full matrix to a designated TP
+    owner via an All-to-All before calling this function (see
+    ``tp_design.md`` and ``dmuon._backends.fsdp2.group.tp_gather_grads``).
+    There is no in-function TP all-reduce.
 
     Args:
-        G: Full gradient matrix (m, n).
+        G: Full gradient matrix (m, n), any dtype.
         steps: Ignored (determined by len(coefficients)).
         eps: Normalization epsilon.
-        coefficients: Per-step coefficients.
-        restart_iterations: Iteration indices for restart.
+        coefficients: Per-step coefficients. Defaults to POLAR_EXPRESS_COEFFICIENTS.
+        restart_iterations: Iteration indices for restart. Defaults to [2].
         deterministic: If True, use cuBLAS for all ops (no SYRK kernel).
 
     Returns:
-        Orthogonalized update (m, n).
+        Orthogonalized update, same shape as G.
     """
     if coefficients is None:
         coefficients = DEFAULT_COEFFICIENTS
@@ -461,8 +368,8 @@ def gram_newton_schulz_local(
         X = X.T
     X = X / (X.norm() + eps)
     X = X.half()
-    # See gram_newton_schulz: force row-major once so SYRK doesn't have to
-    # silently re-copy a stride-swapped view on every call.
+    # Force row-major once so SYRK doesn't have to silently re-copy a
+    # stride-swapped view on every call.
     X = X.contiguous()
 
     # Initial SYRK: R = X @ X^T
@@ -533,3 +440,8 @@ def gram_newton_schulz_local(
     if transposed:
         X = X.T
     return X.to(original_dtype)
+
+
+# Backward-compat alias: pre-refactor code paths referenced the "_local"
+# variant to distinguish it from the (now removed) TP-aware variant.
+gram_newton_schulz_local = gram_newton_schulz

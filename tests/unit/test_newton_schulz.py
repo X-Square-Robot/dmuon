@@ -7,7 +7,7 @@ import torch
 
 from dmuon.optim.newton_schulz import (
     gram_newton_schulz_local,
-    _compiled_newton_schulz,
+    _compiled_direct_newton_schulz as _compiled_newton_schulz,
     DEFAULT_COEFFICIENTS,
     YOU_COEFFICIENTS,
     POLAR_EXPRESS_COEFFICIENTS,

@@ -14,14 +14,20 @@ object across both forward and the subsequent re-unshard, so nothing has to
 be transferred.
 """
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
 
 from .comm import DedicatedCommContext
-from .group import DedicatedParamGroup
+
+if TYPE_CHECKING:
+    # DedicatedState is backend-agnostic — it operates on the shared
+    # duck-typed interface (``unshard`` / ``reshard`` / ``reduce_grads`` /
+    # ``_pre_forward_wait`` / ``_post_backward_fired``). We alias the
+    # FSDP2-variant name here purely for the type checker.
+    from dmuon._backends.fsdp2.group import DedicatedParamGroup  # noqa: F401
 
 try:
     from torch.distributed.tensor import DTensor as _DTensor
@@ -93,7 +99,7 @@ class DedicatedState:
     def __init__(
         self,
         module: nn.Module,
-        group: DedicatedParamGroup,
+        group: "DedicatedParamGroup",
         comm_ctx: DedicatedCommContext,
         reshard_after_forward: bool = True,
     ):
@@ -102,7 +108,7 @@ class DedicatedState:
         self.comm_ctx = comm_ctx
         self.reshard_after_forward = reshard_after_forward
         # Linked by api.py for forward prefetch (next layer's group)
-        self._next_group: Optional[DedicatedParamGroup] = None
+        self._next_group: Optional["DedicatedParamGroup"] = None
 
         # Register self so the autograd-engine root callback can iterate all
         # states and fire post_backward on any group whose fast path missed.

@@ -23,7 +23,7 @@ sys.path.insert(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
 )
 
-from dmuon._owner_rank import normalize_owner_rank as _normalize_owner_rank
+from dmuon._core.owner_rank import normalize_owner_rank as _normalize_owner_rank
 
 
 def test_int_is_promoted_to_2d():

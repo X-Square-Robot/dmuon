@@ -19,9 +19,30 @@ syrk = [
     "apache-tvm-ffi>=0.1.6,<0.2",
     "torch-c-dlpack-ext",
 ]
+# quack-kernels ships its own pinned cutlass-dsl / tvm-ffi / torch-c-dlpack-ext,
+# so this extras deliberately does NOT re-list them.  SM90+ users pick up the
+# full Tri Dao SYRK stack via `pip install dmuon[quack]`.
+quack = [
+    "quack-kernels>=0.3,<0.4",
+]
 dev = [
     "pytest",
     "ruff",
+]
+
+[tool.setuptools.packages.find]
+# Flat repo layout: the Python package is just ``dmuon/`` at the repo root.
+# Setuptools ≥ 70 refuses to auto-discover when peers like ``benchmarks/`` or
+# ``tests/`` look like additional top-level packages, so we pin the include
+# list explicitly here.
+include = ["dmuon*"]
+exclude = [
+    "benchmarks*",
+    "tests*",
+    "docs*",
+    "examples*",
+    "assets*",
+    "site*",
 ]
 
 [tool.ruff]

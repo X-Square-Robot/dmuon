@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import pytest
 import torch.nn as nn
 
-from dmuon.partition import (
+from dmuon._core.partition import (
     SMALL_PARAM_THRESHOLD,
     _extract_layer_id,
     compute_balanced_assignment,
@@ -15,6 +15,8 @@ from dmuon.partition import (
 
 class FakeDeviceMesh:
     """Minimal mock for DeviceMesh to test partition logic without distributed."""
+
+    mesh_dim_names = None
 
     def __init__(self, world_size: int):
         self._world_size = world_size
@@ -97,7 +99,8 @@ def model():
 def test_assignment_covers_all_proj(model):
     """All proj params should be assigned."""
     mesh = FakeDeviceMesh(8)
-    assignment = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    assignment = result.dp_owners
     proj_params = [p for n, p in model.named_parameters() if "proj" in n]
     assert len(assignment) == len(proj_params)
     for p in proj_params:
@@ -107,7 +110,8 @@ def test_assignment_covers_all_proj(model):
 def test_assignment_excludes_non_proj(model):
     """Non-proj params (embed, layernorm) should NOT be assigned."""
     mesh = FakeDeviceMesh(8)
-    assignment = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    assignment = result.dp_owners
     for n, p in model.named_parameters():
         if "proj" not in n:
             assert p not in assignment
@@ -116,7 +120,8 @@ def test_assignment_excludes_non_proj(model):
 def test_balance(model):
     """Rank loads should be balanced within 5%."""
     mesh = FakeDeviceMesh(8)
-    assignment = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    assignment = result.dp_owners
     rank_loads = [0] * 8
     for param, rank in assignment.items():
         rank_loads[rank] += param.numel()
@@ -130,7 +135,8 @@ def test_balance(model):
 def test_same_layer_different_ranks(model):
     """Large params in the same layer should go to different ranks."""
     mesh = FakeDeviceMesh(8)
-    assignment = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    assignment = result.dp_owners
     # Check layer 0
     layer0_large = {}
     for n, p in model.named_parameters():
@@ -147,7 +153,8 @@ def test_same_layer_different_ranks(model):
 def test_small_params_merged(model):
     """Small params (k_proj, v_proj) in the same layer should share owner."""
     mesh = FakeDeviceMesh(8)
-    assignment = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    assignment = result.dp_owners
     for layer_idx in range(4):
         k_params = [
             (n, p)

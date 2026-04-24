@@ -17,7 +17,7 @@ protocol without touching the optimizer constructor.  Import and mutate before
 training starts:
 
 ```python
-import dmuon.group as g
+import dmuon._backends.fsdp2.group as g
 
 g.REPLICATE_WAIT_THRESHOLD_US = 250   # default: 100 μs; raise on fast IB networks
 g.REPLICATE_FALLBACK_CONSECUTIVE_STEPS = 5  # default: 3; steps before flipping to sync
@@ -98,9 +98,21 @@ TP-aware Gram NS with SYRK decomposition.  See
 
 ### get_ns_backend
 
-Inspect which hardware backend is active (`"syrk_sm80"` or `"compiled"`).
+Inspect which NS kernel is active.  Returns a one-line summary string
+(e.g. `"Gram NS · kernel=cute_sm80 (SM80, DMuon internal)"`, `"Gram NS · kernel=quack (SM90, Tri Dao quack)"`, or `"Gram NS · kernel=cublas (SM70, universal fallback)"`).  See
+[Backend dispatch](newton-schulz.md#backend-dispatch).
 
 ::: dmuon.get_ns_backend
+
+---
+
+### get_backend_status
+
+Full diagnostic dict of the NS kernel dispatch layer — `sm_version`,
+`auto_choice`, and per-backend availability flags.  Useful for
+programmatic checks and bug reports.
+
+::: dmuon.get_backend_status
 
 ---
 

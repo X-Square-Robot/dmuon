@@ -1,6 +1,10 @@
 """Tensor Parallel + Data Parallel training with DMuon.
 
-Demonstrates 2D mesh (DP x TP) with Gram Newton-Schulz for TP params.
+2D mesh (DP x TP) example.  DMuon detects TP-sharded parameters from
+their ``DTensor`` structure automatically — no TP-specific API needed.
+For each TP-sharded parameter DMuon runs an All-to-All gather →
+full-matrix Newton-Schulz on the TP owner → scatter back, preserving
+Muon's exact math while every rank keeps only its TP shard in memory.
 
 Run with: torchrun --nproc_per_node=4 examples/tp_dp.py
 Requires at least 4 GPUs (2 DP x 2 TP).
@@ -138,11 +142,14 @@ def main():
         fully_shard(layer, mesh=dp_mesh)
     fully_shard(model, mesh=dp_mesh)
 
-    # Optimizer — per-head NS enabled by default for GQA k/v_proj
+    # Optimizer — no TP-specific flags.  DMuon's TP path (All-to-All
+    # gather → full-matrix NS on the TP owner → scatter back) activates
+    # automatically for any DTensor parameter sharded on a non-DP mesh
+    # dim.  ``replicate_async`` toggles whether the post-step scatter
+    # completes inside ``step()`` (False) or overlaps with the next
+    # forward (True, default).
     optimizer = dmuon.Muon(
         model, lr=0.02, momentum=0.95,
-        per_head_ns=True,           # default: zero TP comm for k/v_proj
-        block_diagonal_ns=False,    # set True for zero TP comm everywhere
         adamw_lr=1e-3,
     )
 
@@ -151,10 +158,14 @@ def main():
         print(f"\nNS backend: {dmuon.get_ns_backend()}")
         print(f"\nDedicated params owned by rank 0:")
         for dp in dmuon.get_owned_params(model, rank=0):
+            tp_info = (
+                f"tp_size={dp.tp_group.size()}, is_tp_owner={dp.is_tp_owner}"
+                if dp.tp_group is not None else "no TP"
+            )
             print(
                 f"  {dp.param_name}: local={tuple(dp._orig_size)}, "
                 f"full={tuple(dp.full_shape)}, "
-                f"shard_dim={dp.shard_dim}"
+                f"shard_dim={dp.shard_dim}, {tp_info}"
             )
         print()
 

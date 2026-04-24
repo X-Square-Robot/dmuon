@@ -130,7 +130,7 @@ dmuon.reset_replicate_fallback(model)
 Python 里可以调阈值：
 
 ```python
-import dmuon.group as g
+import dmuon._backends.fsdp2.group as g
 g.REPLICATE_WAIT_THRESHOLD_US = 250.0      # 默认 100.0
 g.REPLICATE_FALLBACK_CONSECUTIVE_STEPS = 5 # 默认 3
 ```

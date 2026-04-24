@@ -29,8 +29,8 @@ sys.path.insert(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
 )
 
-from dmuon.param import DedicatedParam
-import dmuon.param as param_module
+from dmuon._backends.fsdp2.param import DedicatedParam
+import dmuon._backends.fsdp2.param as param_module
 
 
 class _StubGroup:

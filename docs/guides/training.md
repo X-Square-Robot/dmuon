@@ -194,9 +194,15 @@ for step, batch in enumerate(dataloader):
 
 ```python
 print(f"NS backend: {dmuon.get_ns_backend()}")
-# "syrk_sm80" = CuteDSL SYRK kernel (fastest)
-# "compiled"  = @torch.compile fallback
+# "Gram NS · kernel=cute_sm80 (SM80, DMuon internal)"    — A100/A800 fast path
+# "Gram NS · kernel=quack    (SM90, Tri Dao quack)"      — H100/B200/B300 fast path
+# "Gram NS · kernel=cublas   (SM80, universal fallback)" — cuBLAS everywhere else
 ```
+
+Use `dmuon.get_backend_status()` for the full dict of per-backend
+availability flags.  See [Backend dispatch](../reference/newton-schulz.md#backend-dispatch)
+for the auto-detection ladder and the `kernel=` / `DMUON_NS_KERNEL`
+overrides.
 
 ### Verify Parameter Assignment
 
