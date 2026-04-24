@@ -299,8 +299,8 @@ TP scatter（dist.scatter on replicate_broadcast_stream）→
   overlap。
 * **非 TP 参数行为不变**。
 
-具体配置见 [TP 支持指南](../guides/tp-support.md)；完整 lifecycle +
-sync / async 语义见 [`tp_design.md`](../../internal/research/tp_design.md)。
+具体配置、完整 lifecycle 以及 sync / async 语义见
+[TP 支持指南](../guides/tp-support.md)。
 
 ---
 

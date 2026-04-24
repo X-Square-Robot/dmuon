@@ -318,9 +318,8 @@ Practical consequences:
   backward compute on 8-GPU 3D HSDP×TP toy.
 * No change to non-TP param behaviour.
 
-See the [TP support guide](../guides/tp-support.md) for setup and
-[`tp_design.md`](../../internal/research/tp_design.md) for the full
-lifecycle + sync / async semantics.
+See the [TP support guide](../guides/tp-support.md) for setup, the
+full lifecycle, and the sync / async semantics.
 
 ---
 
