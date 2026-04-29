@@ -158,7 +158,7 @@ class DedicatedParam:
         # Ranks outside the owner's shard column never need this buffer.
         is_in_owner_shard_column = dp_group.rank() == self.owner_shard
         if is_in_owner_shard_column:
-            self._owned_data = local_data.detach().clone()
+            self._owned_data = local_data.detach().clone().to(device)
         else:
             self._owned_data = None
 
