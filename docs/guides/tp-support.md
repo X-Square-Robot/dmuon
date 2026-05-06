@@ -2,8 +2,8 @@
 
 DMuon composes with PyTorch's native tensor parallelism (TP) via
 `DTensor`.  You apply TP the way you always would — DMuon detects
-TP-sharded parameters automatically and routes them through an
-All-to-All gather → full-matrix Newton-Schulz → scatter pipeline, so
+TP-sharded parameters automatically and routes them through a
+TP gather → full-matrix Newton-Schulz → TP scatter pipeline, so
 Muon's exact mathematical definition is preserved even when each rank
 holds only a slice of each weight matrix.
 
@@ -23,7 +23,9 @@ For each parameter the user marked for dedicated ownership:
   broadcast).  No change from the non-TP case.
 * **`DTensor` sharded only on DP mesh dim(s)** — same as above.
 * **`DTensor` sharded on a non-DP mesh dim (TP)** — DMuon appoints one
-  rank in the TP group as "TP owner".  At each optimizer step:
+  rank in the TP group as "TP owner" for each parameter.  TP owners are
+  chosen by per-DP-owner-bucket LPT so full-matrix Newton-Schulz work is
+  spread across TP ranks.  At each optimizer step:
   1. Every DP-owner rank in the TP group runs a `dist.gather` on
      `reduce_stream`, reassembling the full `(m, n)` gradient at the TP
      owner.  (This piggybacks on the DP reduce stream, so gather
@@ -33,13 +35,16 @@ For each parameter the user marked for dedicated ownership:
      path as non-TP).
   3. `dist.scatter` on `replicate_broadcast_stream` sends each DP-owner
      rank its shard of the update.
-  4. The standard HSDP replicate broadcast fans the update out to
-     replicate peers.
+  4. For HSDP, the standard replicate broadcast fans the TP-correct
+     update out to replicate peers.  For 2D DP×TP there is no replicate
+     axis; the next forward's shard broadcast reads the updated owner
+     shard.
 
 Sync (`replicate_async=False`) and async (default `replicate_async=True`)
-post-step paths produce **bit-identical** weight trajectories on 3D
-HSDP×TP — async only changes WHEN the final scatter completes, not the
-numerical result.
+post-step paths are designed to preserve the same numerical trajectory;
+async only changes WHEN the final scatter completes, not the mathematical
+result.  The distributed loss matrix below checks this across the supported
+TP topologies.
 
 ---
 
@@ -168,11 +173,12 @@ optimizer = dmuon.Muon(model, lr=0.02, replicate_async=True)  # explicit
 optimizer = dmuon.Muon(model, lr=0.02, replicate_async=False)
 ```
 
-Both modes produce **bit-identical loss trajectories** on 3D HSDP×TP
-(verified 2026-04-24).  Async's benefit is purely that the scatter
-NCCL kernels run concurrently with the next iteration's forward
-compute — step time is up to ~3% lower on toy 3D meshes, larger on
-slow inter-node links.
+Both modes produce the same loss trajectory on the supported TP
+topologies (verified on 2026-04-30 across TP2, TP4, DP×TP2, DP×TP4,
+and HSDP×TP2).  Async's benefit is purely that the scatter NCCL kernels
+run concurrently with the next iteration's forward compute.  On the
+seq512 Llama3B benchmark, async improved p50 step time by roughly
+`1.05x` to `1.14x` depending on topology.
 
 ---
 
@@ -195,8 +201,9 @@ for dp in dmuon.get_owned_params(model, rank=dist.get_rank()):
 
 A TP-sharded parameter reports `tp_group_size > 1`, a populated
 `shard_dim`, and `is_tp_owner=True` on exactly one rank per TP group
-(currently TP rank 0 — the MVP policy; LPT-balanced TP ownership is a
-post-MVP follow-up).
+for that parameter.  Different TP-sharded parameters may have different
+TP owners; this is expected and is how DMuon balances NS work across the
+TP group.
 
 ---
 
@@ -205,14 +212,18 @@ post-MVP follow-up).
 * **1D TP only** for the MVP.  A multi-dim TP axis (e.g. 2D tensor
   parallel) raises in the detection helper; extend `get_tp_mesh` when
   it's needed.
-* **Single-owner NS per TP group.**  The TP owner runs Newton-Schulz
-  alone; the other `T-1` ranks wait in `dist.gather` / `dist.scatter`.
-  Canzona-style fused All-to-All + micro-group batching that parallelises
-  NS across the TP group is listed as future work.
+* **Single-owner NS per parameter.**  Each TP-sharded parameter has one
+  TP owner for its full-matrix Newton-Schulz call, but owners vary across
+  parameters via LPT.  Canzona-style fused All-to-All + micro-group
+  batching that parallelises a single group of NS calls more tightly is
+  listed as future work.
 * **Small TP-sharded params do NOT participate in the DMuon small-param
   merge** (`SMALL_PARAM_THRESHOLD`).  Each TP-sharded parameter makes
   its own gather/scatter round-trip even when < 5M numel; in practice
   these are rare.
+* **DDP backend × TP-sharded dedicated params is not supported.**
+  `dedicate_params_ddp()` rejects this combination.  Use the FSDP2/HSDP
+  path described above for TP-sharded parameters.
 
 ---
 
@@ -220,8 +231,8 @@ post-MVP follow-up).
 
 * [HSDP guide](hsdp.md) — replicate × shard setup; composes with TP
 * [`dedicate_params` API](../reference/api.md) — full signature
-* `docs/internal/research/tp_design.md` — full design with
-  lifecycle diagrams, overlap / fallback semantics, and change log
+* `docs/internal/research/tp_design.md` — final implementation design,
+  lifecycle ordering, correctness gates, and benchmark summary
 * `docs/internal/research/tp_overlap_profile.md` — NSight-style
   overlap measurement (100% on 8-GPU 3D mesh toy)
 * `docs/internal/research/tp_alignment_report.md` — sync/async

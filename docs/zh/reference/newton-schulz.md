@@ -276,8 +276,8 @@ ns = dmuon.NewtonSchulz(kernel="cute_sm80")
 
 NS 核函数（`newton_schulz`、`gram_newton_schulz`、`direct_newton_schulz`）
 是**TP 无感**的：它们总是对完整（未分片）矩阵做运算，不接受 `tp_group`
-参数。对于 TP-sharded 参数，DMuon runtime 在调用 NS 之前通过 All-to-All
-gather 把完整矩阵汇聚到指定的 TP owner，NS 运行完后再 scatter 回去：
+参数。对于 TP-sharded 参数，DMuon runtime 在调用 NS 之前通过 TP gather
+把完整矩阵汇聚到指定的 TP owner，NS 运行完后再 scatter 回去：
 
 ```
 DP reduce → TP gather（dist.gather on reduce_stream）→
@@ -287,8 +287,9 @@ TP scatter（dist.scatter on replicate_broadcast_stream）→
 ```
 
 对于任何 `device_mesh` 含有非 DP 轴的 `DTensor` 参数，这套流程会**自动
-触发**——`dmuon.Muon` 不需要任何显式 TP 开关。TP owner 由 `assign_tp_owner`
-选定（MVP 策略 `"rank0"`）。
+触发**——`dmuon.Muon` 不需要任何显式 TP 开关。TP owner 由
+`compute_balanced_assignment` 内部的确定性 LPT 策略选定，在保持 loss 轨迹
+一致的同时，把 TP-sharded 的完整矩阵计算分散到本地 TP ranks。
 
 实际影响：
 

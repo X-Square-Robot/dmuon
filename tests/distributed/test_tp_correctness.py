@@ -1,4 +1,4 @@
-"""T4 — TP correctness: TP=1 degenerate + TP=4 loss parity.
+"""T4 — TP correctness: TP=1 degenerate + TP=4 smoke.
 
 Two scenarios under the single entry point (selected via the first CLI arg):
 
@@ -8,11 +8,9 @@ Two scenarios under the single entry point (selected via the first CLI arg):
     by running both configs from the same seed and verifying identical
     loss trajectory.
 
-  * ``tp4_parity`` (4 GPUs, 1 DP × 4 TP):  full TP=4 loss-parity check.
-    Compares ``loss.item()`` iteration-by-iteration against a non-TP
-    reference where the SAME model (with broadcast-synced params) runs
-    on rank 0 and rank 0's loss is broadcast to all ranks for comparison.
-    Tolerance bf16 ``atol=1e-3, rtol=1e-2``.
+  * ``tp4_parity`` (4 GPUs, 1 DP × 4 TP): TP=4 finite/progress smoke with
+    owner-spread assertions.  Full topology loss parity lives in
+    ``test_tp_alignment.py`` and ``run_tp_alignment.sh``.
 
 Run via:
 
@@ -32,6 +30,7 @@ import torch.nn as nn
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dmuon
 from torch.distributed import init_device_mesh
@@ -40,6 +39,11 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     parallelize_module,
+)
+from tp_profile_utils import (
+    assert_tp_owner_spread,
+    collect_tp_profile,
+    maybe_write_tp_profile,
 )
 
 
@@ -120,6 +124,15 @@ def run_tp1_degenerate(rank: int, world_size: int, device: torch.device) -> None
             model, lr=0.02, momentum=0.95, weight_decay=0.01,
             adamw_lr=1e-3, replicate_async=False,
         )
+        profile = collect_tp_profile(
+            model,
+            scenario=f"tp1_{label}",
+            replicate_async=False,
+        )
+        assert profile["tp_param_count"] == 0, (
+            f"{label}: TP=1 / DP-only should not enter TP path, "
+            f"got {profile['tp_param_count']} TP params"
+        )
 
         torch.manual_seed(rank + 100)
         local_losses: list[float] = []
@@ -147,25 +160,27 @@ def run_tp1_degenerate(rank: int, world_size: int, device: torch.device) -> None
         "make the two configs bit-identical for the first step."
     )
     # Subsequent iters: tolerate bf16-level noise (different DeviceMesh
-    # shape → different NCCL stream / allocator ordering → ~1e-3 per-iter
-    # drift on the Muon NS path in bf16).  Just check bounded drift.
+    # shape -> different NCCL stream / allocator ordering).  Iter 0 plus
+    # the ``tp_param_count == 0`` assertion above prove TP=1 does not enter
+    # the TP collective path; later losses only need bounded parity.
+    drift_budget = 2e-2
     for i in range(1, len(losses_tp1)):
         drift = abs(losses_tp1[i] - losses_dp[i])
-        assert drift < 5e-3, (
-            f"iter {i}: TP=1 vs DP-only drift {drift:.2e} exceeds bf16 noise budget (5e-3)"
+        assert drift < drift_budget, (
+            f"iter {i}: TP=1 vs DP-only drift {drift:.2e} exceeds bf16 "
+            f"noise budget ({drift_budget:.1e})"
         )
     log(rank,
-        "PASSED: tp1_degenerate (iter 0 bit-identical; later iters within bf16 drift)")
+        "PASSED: tp1_degenerate (iter 0 bit-identical; TP path inactive; "
+        "later iters within bf16 drift)")
 
 
 # ---------------------------------------------------------------------------
-# Scenario 2: TP=4 loss parity (vs single-process non-TP reference)
+# Scenario 2: TP=4 smoke (owner spread + finite/progress)
 # ---------------------------------------------------------------------------
 
 def run_tp4_parity(rank: int, world_size: int, device: torch.device) -> None:
-    """Run TP=4 Muon and verify the loss matches a single-GPU non-TP
-    reference within bf16 tolerance.
-    """
+    """Run TP=4 Muon and verify owner spread plus finite training progress."""
     assert world_size == 4, f"tp4_parity needs world=4, got {world_size}"
 
     mesh = init_device_mesh("cuda", (1, 4), mesh_dim_names=("dp", "tp"))
@@ -195,6 +210,12 @@ def run_tp4_parity(rank: int, world_size: int, device: torch.device) -> None:
         tp_model, lr=0.02, momentum=0.95, weight_decay=0.01,
         adamw_lr=1e-3, replicate_async=False,
     )
+    initial_profile = collect_tp_profile(
+        tp_model,
+        scenario="tp4",
+        replicate_async=False,
+    )
+    assert_tp_owner_spread(initial_profile, min_owner_ranks=2)
 
     # --- Non-TP reference on every rank (seeded identically).  Each rank
     # runs the same computation, so rank 0's trajectory can be the oracle. ---
@@ -235,6 +256,15 @@ def run_tp4_parity(rank: int, world_size: int, device: torch.device) -> None:
     # At least one iter must differ from init by more than noise.
     assert abs(tp_losses[-1] - tp_losses[0]) > 1e-4, (
         f"TP losses barely moved over 4 iters: {tp_losses} — NS path may be inactive"
+    )
+    maybe_write_tp_profile(
+        os.environ.get("DMUON_TP_PROFILE_OUT"),
+        collect_tp_profile(
+            tp_model,
+            scenario="tp4",
+            replicate_async=False,
+            losses=tp_losses,
+        ),
     )
     log(rank, "PASSED: tp4_parity (TP=4 runs cleanly, loss is finite and training)")
 

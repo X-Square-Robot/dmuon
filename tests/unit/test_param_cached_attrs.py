@@ -4,6 +4,7 @@ as plain attributes (not @property)."""
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import pytest
 
 from dmuon._backends.fsdp2.param import DedicatedParam
 
@@ -16,6 +17,8 @@ def _make_dp(
     monkeypatch_dist=True,
     shape=(8, 4),
     is_owner=True,
+    tp_group=None,
+    tp_owner_local_rank=0,
 ):
     """Build a DedicatedParam on CPU with a minimal dp_group stub.
 
@@ -39,7 +42,10 @@ def _make_dp(
     import dmuon._backends.fsdp2.param as param_module
 
     orig_dist = param_module.dist
+    orig_compute_tp_group = DedicatedParam._compute_tp_group
     param_module.dist = _StubDist()
+    if tp_group is not None:
+        DedicatedParam._compute_tp_group = lambda self: tp_group
     try:
         dp = DedicatedParam(
             param=param,
@@ -49,9 +55,11 @@ def _make_dp(
             dp_group=_StubGroup(),
             device=torch.device("cpu"),
             compute_dtype=None,
+            tp_owner_local_rank=tp_owner_local_rank,
         )
     finally:
         param_module.dist = orig_dist
+        DedicatedParam._compute_tp_group = orig_compute_tp_group
     return dp
 
 
@@ -99,10 +107,38 @@ def test_tp_group_is_cached_attr_not_property():
     assert dp.tp_group is None
 
 
+def test_tp_owner_local_rank_is_used_when_tp_group_exists():
+    class _StubTPGroup:
+        def size(self):
+            return 2
+
+        def rank(self):
+            return 1
+
+    dp = _make_dp(tp_group=_StubTPGroup(), tp_owner_local_rank=1)
+    assert dp._tp_owner_local_rank == 1
+    assert dp._tp_owner_global_rank == 1
+    assert dp.is_tp_owner is True
+
+
+def test_tp_owner_local_rank_bounds_checked():
+    class _StubTPGroup:
+        def size(self):
+            return 2
+
+        def rank(self):
+            return 0
+
+    with pytest.raises(ValueError, match="outside TP group size"):
+        _make_dp(tp_group=_StubTPGroup(), tp_owner_local_rank=2)
+
+
 if __name__ == "__main__":
     test_numel_is_cached_attr_not_property()
     test_numel_matches_orig_size()
     test_shard_dim_is_cached_attr_not_property()
     test_full_shape_is_cached_attr_not_property()
     test_tp_group_is_cached_attr_not_property()
+    test_tp_owner_local_rank_is_used_when_tp_group_exists()
+    test_tp_owner_local_rank_bounds_checked()
     print("OK")

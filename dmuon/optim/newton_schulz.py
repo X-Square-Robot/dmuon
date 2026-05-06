@@ -9,8 +9,8 @@ Two NS modes:
 - :func:`direct_newton_schulz`: classic parameter-space NS.
 
 TP support lives entirely in the runtime layer (``dmuon._backends.fsdp2``):
-for TP-sharded parameters the runtime does an All-to-All gather so the TP
-owner sees the full matrix, then calls one of the functions above — the
+for TP-sharded parameters the runtime does a TP gather so the TP owner
+sees the full matrix, then calls one of the functions above — the
 NS algorithms themselves are TP-agnostic.  See
 ``docs/internal/research/tp_design.md``.
 
@@ -190,7 +190,7 @@ class NewtonSchulz:
 
         The runtime guarantees the matrix handed in here is the full
         logical gradient: for pure-DP params the owner already holds
-        the full tensor; for TP-sharded params the All-to-All gather
+        the full tensor; for TP-sharded params the TP gather
         step (``dmuon._backends.fsdp2.group.tp_gather_grads``) has
         reassembled the full matrix on the TP owner before this call.
         """

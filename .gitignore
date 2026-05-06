@@ -41,6 +41,8 @@ dmuon_kernel_cache/
 # Internal docs — never in public repo
 # Only llm_benchmark.md and syrk_benchmark.md are tracked from within docs/internal/.
 docs/internal/*.md
+docs/internal/assets/
+docs/internal/report/
 docs/internal/research/
 docs/internal/fsdp2/
 docs/internal/weekly/

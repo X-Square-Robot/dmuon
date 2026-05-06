@@ -8,7 +8,6 @@ module provides only:
     * ``is_tp_sharded``    — boolean detection
     * ``get_tp_mesh``      — TP sub-mesh lookup
     * ``get_tp_shard_dim`` — tensor dim sharded on TP axis
-    * ``assign_tp_owner``  — pick a single TP rank to own the full matrix
 
 FSDP2 alignment (see ``docs/internal/research/tp_design.md`` §5):
 ``dedicate_params`` never receives a ``tp_mesh`` argument.  The TP
@@ -109,23 +108,3 @@ def get_tp_shard_dim(
         f"Expected Shard placement on TP dim, got {placement}"
     )
     return placement.dim
-
-
-def assign_tp_owner(
-    param: nn.Parameter,
-    dp_mesh_dim_names: frozenset[str],
-    strategy: str = "rank0",
-) -> int:
-    """Select a single TP rank within the TP group to own ``param``.
-
-    Strategies:
-        * ``"rank0"`` — always TP rank 0 (MVP default; simplest).
-        * ``"lpt"``   — LPT across TP group by numel; deferred to post-MVP.
-    """
-    if strategy == "rank0":
-        return 0
-    if strategy == "lpt":
-        raise NotImplementedError(
-            "LPT TP-owner strategy deferred to post-MVP"
-        )
-    raise ValueError(f"Unknown tp_owner_strategy: {strategy!r}")

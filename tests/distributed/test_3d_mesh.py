@@ -3,7 +3,7 @@
 8-GPU mesh ``(R=2, G=2, T=2)`` exercises every axis:
   * ``replicate`` — HSDP replicate (Stage-2 reduce + post-step broadcast)
   * ``shard``    — FSDP2 shard (Stage-1 reduce + unshard broadcast)
-  * ``tp``       — DMuon TP (All-to-All gather/scatter)
+  * ``tp``       — DMuon TP (gather/scatter)
 
 Asserts after 2 Muon.step iterations:
   1. No NaN / inf in any ``_owned_data``.
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import torch
 import torch.distributed as dist
@@ -30,6 +31,7 @@ import torch.nn as nn
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dmuon
 from torch.distributed import init_device_mesh
@@ -38,6 +40,11 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     parallelize_module,
+)
+from tp_profile_utils import (
+    assert_tp_owner_spread,
+    collect_tp_profile,
+    maybe_write_tp_profile,
 )
 
 
@@ -135,6 +142,17 @@ def main() -> int:
         model, lr=0.02, momentum=0.95, weight_decay=0.01,
         adamw_lr=1e-3, replicate_async=use_async,
     )
+    tp_profile = collect_tp_profile(
+        model,
+        scenario="hsdp_tp",
+        replicate_async=use_async,
+    )
+    assert_tp_owner_spread(tp_profile, min_owner_ranks=2)
+    tp_owner_set = set(tp_profile["owner_coverage"])
+    assert tp_owner_set == {0, 1}, (
+        f"rank {rank}: 3D HSDP×TP should distribute TP owners across "
+        f"both TP ranks, got {sorted(tp_owner_set)}"
+    )
     log(rank, f"replicate_async={use_async}, "
               f"dedicated={len(optimizer._dedicated_params)} (rank {rank})")
 
@@ -145,12 +163,20 @@ def main() -> int:
 
     torch.manual_seed(rank)
     losses: list[float] = []
+    profile_out = os.environ.get("DMUON_TP_PROFILE_OUT")
+    step_times_ms: list[float] = []
     for it in range(3):
+        if profile_out:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
         optimizer.zero_grad()
         x = torch.randn(4, 16, 256, device=device)
         loss = model(x)
         loss.backward()
         optimizer.step()
+        if profile_out:
+            torch.cuda.synchronize()
+            step_times_ms.append((time.perf_counter() - t0) * 1000.0)
         losses.append(loss.item())
         if rank == 0:
             print(f"iter {it}: loss={loss.item():.4f}", flush=True)
@@ -211,6 +237,17 @@ def main() -> int:
 
     # --- Assertion 4: loss sanity ---
     assert all(l == l for l in losses), f"rank {rank}: NaN in losses {losses}"
+
+    maybe_write_tp_profile(
+        profile_out,
+        collect_tp_profile(
+            model,
+            scenario="hsdp_tp",
+            replicate_async=use_async,
+            losses=losses,
+            step_times_ms=step_times_ms,
+        ),
+    )
 
     log(rank, f"PASSED: 3D HSDP x TP integration test (async={use_async})")
     dist.destroy_process_group()

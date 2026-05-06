@@ -55,6 +55,7 @@ class DedicatedParam:
         device: torch.device,
         compute_dtype: torch.dtype = None,
         replicate_group: Optional[dist.ProcessGroup] = None,
+        tp_owner_local_rank: int = 0,
     ):
         self.module = module
         self.param_name = param_name
@@ -114,14 +115,19 @@ class DedicatedParam:
         self.shard_dim: Optional[int] = self._compute_shard_dim()
         self.full_shape: torch.Size = self._compute_full_shape()
         self.tp_group: Optional[dist.ProcessGroup] = self._compute_tp_group()
-        # T2: TP owner selection (MVP = rank 0 in the TP process group; see
-        # ``tp_design.md`` §8.2).  ``is_tp_owner`` is True on exactly one
-        # rank per (DP-owner × TP group) combo — that rank runs NS on the
-        # full matrix gathered by ``tp_gather_grads``.
+        # T2: TP owner selection.  The partitioner assigns a per-parameter
+        # TP owner via LPT and API plumbing passes it here.  ``is_tp_owner``
+        # is True on exactly one rank per (DP-owner × TP group) combo — that
+        # rank runs NS on the full matrix gathered by ``tp_gather_grads``.
         # ``_tp_owner_global_rank`` is the global rank to pass to
         # ``dist.gather(dst=...)`` / ``dist.scatter(src=...)``.
         if self.tp_group is not None:
-            self._tp_owner_local_rank: int = 0
+            if not 0 <= tp_owner_local_rank < self.tp_group.size():
+                raise ValueError(
+                    f"{param_name}: tp_owner_local_rank={tp_owner_local_rank} "
+                    f"outside TP group size {self.tp_group.size()}"
+                )
+            self._tp_owner_local_rank: int = tp_owner_local_rank
             self._tp_owner_global_rank: Optional[int] = dist.get_global_rank(
                 self.tp_group, self._tp_owner_local_rank
             )

@@ -1,8 +1,8 @@
 # 张量并行
 
 DMuon 通过 `DTensor` 原生支持 PyTorch 张量并行（TP）。你按照惯常方式应用
-TP——DMuon 会**自动检测** TP 分片的参数，并将其导向 All-to-All gather →
-完整矩阵 Newton-Schulz → scatter 流水线；在每个 rank 只持有权重分片的
+TP——DMuon 会**自动检测** TP 分片的参数，并将其导向 TP gather →
+完整矩阵 Newton-Schulz → TP scatter 流水线；在每个 rank 只持有权重分片的
 情形下仍然保持 Muon 的数学定义不变。
 
 **关键特性**：TP 路径对用户完全透明。`dedicate_params` **不接受** `tp_mesh`
@@ -18,8 +18,10 @@ TP——DMuon 会**自动检测** TP 分片的参数，并将其导向 All-to-Al
 * **普通 `torch.Tensor`** — DMuon 标准 DP 路径（reduce→owner、broadcast）。
   与非 TP 场景完全一致。
 * **仅在 DP 维度上分片的 `DTensor`** — 同上。
-* **在非 DP mesh 维度（即 TP 轴）上分片的 `DTensor`** — DMuon 在 TP group
-  内选定一个 rank 作为 "TP owner"。每个 optimizer step：
+* **在非 DP mesh 维度（即 TP 轴）上分片的 `DTensor`** — DMuon 为每个参数在
+  TP group 内选定一个 rank 作为 "TP owner"。TP owner 由每个 DP owner
+  bucket 内的 LPT 选择，从而把完整矩阵 Newton-Schulz 计算分散到多个 TP
+  rank。每个 optimizer step：
   1. 该 TP group 内所有 DP-owner rank 走 `dist.gather` on
      `reduce_stream`，把完整 `(m, n)` 梯度汇聚到 TP owner。
      （gather 借用 DP reduce 的 comm stream，所以和 backward compute 天然
@@ -28,11 +30,14 @@ TP——DMuon 会**自动检测** TP 分片的参数，并将其导向 All-to-Al
      kernel）。
   3. `dist.scatter` on `replicate_broadcast_stream`，把 update 的每一片
      发回各 DP-owner rank。
-  4. 标准 HSDP replicate broadcast 把 update 扩散到 replicate peer。
+  4. HSDP 下，标准 replicate broadcast 会把 TP-correct update 扩散到
+     replicate peer；2D DP×TP 没有 replicate 轴，下一次 forward 的 shard
+     broadcast 直接读取已经更新好的 owner shard。
 
 Sync（`replicate_async=False`）和 async（默认 `replicate_async=True`）两路
-的 post-step 通信在 3D HSDP×TP 下产生**bit-identical** 权重轨迹——async
-只改变 scatter 完成的**时间**，不改变数值结果。
+的 post-step 通信设计目标是保持相同数值轨迹；async 只改变 scatter 完成的
+**时间**，不改变数学结果。下面的分布式 loss matrix 会在已支持 TP 拓扑上
+检查这一点。
 
 ---
 
@@ -152,10 +157,11 @@ optimizer = dmuon.Muon(model, lr=0.02, replicate_async=True)  # 显式
 optimizer = dmuon.Muon(model, lr=0.02, replicate_async=False)
 ```
 
-两种模式在 3D HSDP×TP 上产生**bit-identical loss 轨迹**（2026-04-24
-验证）。async 的好处纯粹是 scatter NCCL kernel 能和下一个 iter 的
-forward compute 并发——toy 3D mesh 下 step time 大约低 3%，跨节点慢链路
-（IB）场景下会更明显。
+两种模式在已支持的 TP 拓扑上产生一致 loss 轨迹（2026-04-30 已覆盖
+TP2、TP4、DP×TP2、DP×TP4、HSDP×TP2）。async 的好处纯粹是 scatter
+NCCL kernel 能和下一个 iter 的 forward compute 并发。seq512 Llama3B
+benchmark 中，async 相对 sync 的 p50 step time 提升约 `1.05x` 到
+`1.14x`，具体取决于拓扑。
 
 ---
 
@@ -177,8 +183,9 @@ for dp in dmuon.get_owned_params(model, rank=dist.get_rank()):
 ```
 
 一个 TP-sharded 参数会显示 `tp_group_size > 1`、非 None 的 `shard_dim`，
-并且 `is_tp_owner=True` 仅出现在 TP group 内的一个 rank 上（MVP 固定为
-TP rank 0；post-MVP 再做 LPT-balanced TP ownership）。
+并且 `is_tp_owner=True` 仅出现在该参数 TP group 内的一个 rank 上。不同
+TP-sharded 参数可以有不同 TP owner；这是 DMuon 用 LPT 均衡 NS 计算负载的
+预期行为。
 
 ---
 
@@ -186,13 +193,16 @@ TP rank 0；post-MVP 再做 LPT-balanced TP ownership）。
 
 * **MVP 只支持 1D TP 轴。** 2D TP 会在 `get_tp_mesh` 抛 assert；有需求
   时再扩。
-* **每个 TP group 单 owner 跑 NS。** TP owner 独家执行 Newton-Schulz，
-  其余 `T-1` 个 rank 在 `dist.gather` / `dist.scatter` 期间等待。
-  Canzona 风格的 fused All-to-All + micro-group batching（把 NS
-  并行化到整个 TP group）列为 future work。
+* **每个参数单 owner 跑 NS。** 每个 TP-sharded 参数有一个 TP owner 执行
+  完整矩阵 Newton-Schulz，但 owner 会通过 LPT 在不同参数之间变化。
+  Canzona 风格的 fused All-to-All + micro-group batching（更紧密地并行化
+  一组 NS 调用）列为 future work。
 * **TP-sharded 小参数不参与 DMuon 的 small-param 合并**
   （`SMALL_PARAM_THRESHOLD`）。每个 TP-sharded 参数独立跑一次 gather
   / scatter，即使 numel < 5M。实际训练里这种小 TP-sharded 参数很少见。
+* **DDP backend × TP-sharded dedicated params 不支持。**
+  `dedicate_params_ddp()` 会拒绝这个组合。TP-sharded 参数请使用上面的
+  FSDP2/HSDP 路径。
 
 ---
 
@@ -200,8 +210,8 @@ TP rank 0；post-MVP 再做 LPT-balanced TP ownership）。
 
 * [HSDP 指南](hsdp.md) — replicate × shard 配置；和 TP 叠加使用
 * [`dedicate_params` API](../reference/api.md) — 完整签名
-* `docs/internal/research/tp_design.md` — 设计文档（lifecycle 图、overlap
-  策略、fallback 语义、change log）
+* `docs/internal/research/tp_design.md` — 最终实现设计、生命周期顺序、
+  correctness gates 和 benchmark 摘要
 * `docs/internal/research/tp_overlap_profile.md` — NSight 风格
   overlap 测量（8-GPU 3D mesh toy 下 100%）
 * `docs/internal/research/tp_alignment_report.md` — sync / async
