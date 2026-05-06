@@ -68,8 +68,8 @@ class DedicatedParamDDP:
         self._owner_global_rank: int = dist.get_global_rank(dp_group, self.owner_shard)
         self._owner_replicate_global_rank: Optional[int] = None  # unused in 1D
 
-        # DDP path does not support DTensor on dedicated params yet (TP + DDP
-        # is out of P1 scope). Keep the attribute for interface parity with
+        # DDP path does not support DTensor on dedicated params (TP + DDP is
+        # out of scope). Keep the attribute for interface parity with
         # DedicatedParam so downstream code (Muon, checkpoint) does not
         # special-case.
         self.is_dtensor: bool = False

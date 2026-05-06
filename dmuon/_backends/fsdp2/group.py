@@ -50,25 +50,18 @@ class TPScatterState(NamedTuple):
     T2d analogue of :class:`ReplicateBroadcastState`: the scatter is
     dispatched on ``replicate_broadcast_stream`` and the caller returns
     without waiting; the event is consumed on the next iteration's
-    :meth:`_pre_forward_wait` hook (cross-call event-chain pattern, same
-    as FSDP2's ``AllGatherState``).
+    :meth:`_pre_forward_wait` hook.
 
-    **Do NOT pin ``recv_shards`` Python-refs across iterations.**  The
-    dispatch body already calls ``recv_shard.record_stream(bcast_stream)``
-    which is the correct allocator-safety primitive — the caching
-    allocator keeps the memory reserved until the scatter kernel
-    completes on ``bcast_stream``.  Holding Python refs in a state tuple
-    on top of that is NOT belt-and-suspenders: it changes the allocator's
-    free-block pattern across iterations, which shifts the addresses of
-    subsequent NCCL transport buffers and produces a different (but
-    self-consistent) floating-point reduction trajectory than the sync
-    path.  The ``recv_shards`` field therefore always carries an EMPTY
-    list — we keep it for schema symmetry with ``ReplicateBroadcastState``.
-    See ``docs/internal/research/tp_alignment_report.md`` (Phase B/C,
-    2026-04-24) for the diagnostic trail.
+    The state pins TP-owner send shards until the scatter event is visible.
+    This is required because the owner builds transient contiguous split
+    tensors for ``scatter_list`` and ``Muon._step_muon`` clears
+    ``_tp_full_delta`` before async communication has necessarily consumed
+    those tensors.  Recv shards are not pinned here: the dispatch body calls
+    ``recv_shard.record_stream(bcast_stream)``, which is the correct
+    allocator-safety primitive for receive buffers.
     """
 
-    recv_shards: list[torch.Tensor]
+    refs: list[torch.Tensor]
     event: torch.cuda.Event
 
 
@@ -159,11 +152,12 @@ class DedicatedParamGroup:
         # Fallback state machine — count of consecutive slow waits.
         self._replicate_slow_wait_count: int = 0
 
-        # T2d: async TP scatter state — mirrors ``_replicate_broadcast_state``
-        # but covers the per-TP-group ``dist.scatter`` dispatched by
-        # ``tp_scatter_delta_async``.  Consumed together with the replicate
-        # broadcast state in ``_pre_forward_wait``.  See ``tp_design.md``
-        # §4.2 (O2) + §5 fallback.
+        # T2d: TP scatter state — mirrors ``_replicate_broadcast_state``
+        # and pins transient TP-owner send shards until the scatter event is
+        # visible. Async uses it for lifetime + deferred waiting; sync uses it
+        # for lifetime, since the current stream already waits on the event.
+        # Consumed together with the replicate broadcast state in
+        # ``_pre_forward_wait``. See ``tp_design.md`` §4.2 (O2) + §5 fallback.
         self._tp_scatter_state: Optional[TPScatterState] = None
         self._tp_sync_fallback: bool = False
         self._last_tp_scatter_wait_us: float = 0.0
@@ -651,11 +645,10 @@ class DedicatedParamGroup:
         """Shared dispatch body for sync + async TP scatter.
 
         Queues the scatter + ``_owned_data.mul_(wd).add_(shard)`` fuse on
-        ``replicate_broadcast_stream`` and returns the list of transient
-        ``recv_shard`` buffers.  Callers:
-          * sync  (``tp_scatter_delta``) — ``wait_stream`` joins back.
-          * async (``tp_scatter_delta_async``) — records event + stores
-            the recv-shard list in :attr:`_tp_scatter_state`.
+        ``replicate_broadcast_stream`` and returns transient TP-owner
+        ``scatter_list`` refs.  Callers record an event and store those refs
+        in :attr:`_tp_scatter_state` until the scatter stream has consumed
+        them.
 
         Returns ``None`` when the group has no TP-sharded params with
         pending updates (no dispatch happened).
@@ -670,7 +663,8 @@ class DedicatedParamGroup:
         bcast_stream = self.comm_ctx.replicate_broadcast_stream
         bcast_stream.wait_stream(torch.cuda.current_stream())
 
-        recv_shards: list[torch.Tensor] = []
+        refs: list[torch.Tensor] = []
+        updates: list[tuple[DedicatedParam, torch.Tensor]] = []
         with torch.cuda.stream(bcast_stream):
             with dist._coalescing_manager(group=None, device=self.device):
                 for p in work:
@@ -687,6 +681,7 @@ class DedicatedParamGroup:
                                 p._orig_size[shard_dim], dim=shard_dim,
                             )
                         ]
+                        refs.extend(splits)
                         dist.scatter(
                             recv_shard,
                             scatter_list=splits,
@@ -700,13 +695,18 @@ class DedicatedParamGroup:
                             src=p._tp_owner_global_rank,
                             group=p.tp_group,
                         )
-                    p._owned_data.mul_(p._tp_wd_factor).add_(recv_shard)
-                    recv_shard.record_stream(bcast_stream)
-                    recv_shards.append(recv_shard)
-                    p._tp_full_grad = None
-                    p._tp_full_delta = None
-                    p._reduced_grad = None
-        return recv_shards
+                    updates.append((p, recv_shard))
+
+            # Keep the local weight update explicitly after the coalesced
+            # scatter dispatch.  This avoids relying on private
+            # _coalescing_manager launch timing for recv_shard readiness.
+            for p, recv_shard in updates:
+                p._owned_data.mul_(p._tp_wd_factor).add_(recv_shard)
+                recv_shard.record_stream(bcast_stream)
+                p._tp_full_grad = None
+                p._tp_full_delta = None
+                p._reduced_grad = None
+        return refs
 
     def tp_scatter_delta(self) -> None:
         """Fan the full-matrix NS update back to each DP-owner TP shard.
@@ -724,25 +724,28 @@ class DedicatedParamGroup:
         via ``owned.mul_(wd_factor).add_(shard)`` — Moonlight's
         ``new = (1 - lr*wd) * old - lr*scale * NS`` per shard.
         """
-        if self._tp_scatter_dispatch() is None:
+        refs = self._tp_scatter_dispatch()
+        if refs is None:
             return
-        # Sync contract: compute stream waits for the scatter to land
-        # before the caller can read ``_owned_data`` (the next unshard
-        # broadcast reads it).
-        torch.cuda.current_stream().wait_stream(
-            self.comm_ctx.replicate_broadcast_stream
+        event = self.comm_ctx.replicate_broadcast_stream.record_event()
+        # Sync contract: compute stream waits for the scatter to land before
+        # the caller can read ``_owned_data``. This is a GPU-side wait, not a
+        # CPU block, so keep TP-owner split tensors alive until the event is
+        # consumed by the next pre-forward/wait_all drain.
+        torch.cuda.current_stream().wait_event(event)
+        self._tp_scatter_state = TPScatterState(
+            refs=refs, event=event
         )
 
     def tp_scatter_delta_async(self) -> None:
         """T2d async variant of :meth:`tp_scatter_delta`.
 
         Dispatches the scatter on ``replicate_broadcast_stream`` and
-        returns immediately; records an event + pins the ``recv_shard``
-        buffers in :attr:`_tp_scatter_state` so the caching allocator
-        cannot reclaim them before the NCCL kernel observes the writes.
-        The event is consumed by the NEXT iteration's
-        :meth:`_pre_forward_wait` — mirrors the replicate-broadcast
-        cross-call event chain.
+        returns immediately; records an event + pins transient TP-owner send
+        split tensors in :attr:`_tp_scatter_state` so Python cannot release
+        them before NCCL consumes ``scatter_list``. The event is consumed by
+        the NEXT iteration's :meth:`_pre_forward_wait` — mirrors the
+        replicate-broadcast cross-call event chain.
 
         Gate semantics:
           * ``_tp_sync_fallback=True`` → degrade to sync; state stays IDLE.
@@ -756,15 +759,12 @@ class DedicatedParamGroup:
                 "tp_scatter_delta_async: previous event still pending — "
                 "pre_forward_wait was not consumed before the next dispatch"
             )
-        if self._tp_scatter_dispatch() is None:
+        refs = self._tp_scatter_dispatch()
+        if refs is None:
             return
         event = self.comm_ctx.replicate_broadcast_stream.record_event()
-        # Intentionally DO NOT pin recv_shards (see TPScatterState
-        # docstring): the allocator is already kept honest by
-        # ``record_stream`` inside ``_tp_scatter_dispatch``.  Pinning
-        # across iterations causes sync/async loss divergence.
         self._tp_scatter_state = TPScatterState(
-            recv_shards=[], event=event
+            refs=refs, event=event
         )
 
     # ---- replicate-dim post-step broadcast (Phase B.2) -------------------
@@ -921,7 +921,7 @@ class DedicatedParamGroup:
         # on; in HSDP mode both fire on the same stream and waiting the
         # replicate broadcast event implicitly covers the scatter, but
         # we still wait the scatter event explicitly so the state tuple
-        # (and its pinned recv_shards) can be released.
+        # (and its pinned TP-owner send refs) can be released.
         tp_state = self._tp_scatter_state
         if tp_state is not None:
             profile_enabled = bool(

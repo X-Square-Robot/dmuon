@@ -14,6 +14,7 @@ from ._core.comm import DedicatedCommContext
 from ._core.owner_rank import normalize_owner_rank
 from ._core.partition import _extract_layer_id, compute_balanced_assignment
 from ._core.state import DedicatedState
+from ._core.tp import is_tp_sharded
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,6 @@ def dedicate_params(
     replicate_mesh: Optional[DeviceMesh] = None,
     hook_boundary_predicate: Optional[Callable[[nn.Module], bool]] = None,
     hook_boundary_strict: bool = True,
-    tp_owner_strategy: str = "rank0",
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -151,8 +151,8 @@ def dedicate_params(
     **Tensor parallelism** is supported transparently: if a parameter is a
     ``DTensor`` sharded on a mesh dim that is NOT named in ``mesh`` or
     ``replicate_mesh`` (i.e. the TP axis), DMuon will — at optimizer step
-    time — All-to-All gather the full matrix at a designated TP owner,
-    run Newton-Schulz locally, and scatter the per-shard update back to
+    time — gather the full matrix at a designated TP owner, run
+    Newton-Schulz locally, and scatter the per-shard update back to
     the TP group.  No TP-specific API is required; simply pass the DP
     slice of your 3D mesh as ``mesh`` / ``replicate_mesh``, matching the
     FSDP2 convention (``fully_shard(mesh=mesh["replicate","shard"])``).
@@ -202,10 +202,6 @@ def dedicate_params(
             is given, raise if a dedicated param has no ancestor matching the
             predicate. When False, fall back to the param's direct parent
             module. Strict is recommended to avoid silent per-sub-module hooks.
-        tp_owner_strategy: Strategy for picking the single TP rank that
-            reassembles each TP-sharded parameter.  ``"rank0"`` (default,
-            MVP) always selects TP rank 0; ``"lpt"`` is reserved for a
-            future post-MVP balance pass.  Ignored when no TP is present.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its DP owner
@@ -221,12 +217,18 @@ def dedicate_params(
     result = compute_balanced_assignment(
         model, mesh, predicate,
         replicate_mesh=replicate_mesh,
-        tp_owner_strategy=tp_owner_strategy,
     )
     assignment = result.dp_owners
     if not assignment:
         logger.warning("dedicate_params: no parameters matched the predicate")
         return assignment
+
+    dp_names: set[str] = set()
+    if mesh.mesh_dim_names:
+        dp_names |= set(mesh.mesh_dim_names)
+    if replicate_mesh is not None and replicate_mesh.mesh_dim_names:
+        dp_names |= set(replicate_mesh.mesh_dim_names)
+    dp_mesh_dim_names = frozenset(dp_names)
 
     # Normalize every assignment value to a 2D ``(shard, replicate)`` coord.
     # In shard-only mode (``replicate_mesh is None``) partition.py returns
@@ -288,6 +290,14 @@ def dedicate_params(
             # Default heuristic: infer layer module from `layers.N` / `blocks.N`
             # in the FQN; fall back to parent module if neither matches.
             layer_module, parent_module, param_name = _find_layer_module(model, param)
+        if (
+            is_tp_sharded(param, dp_mesh_dim_names)
+            and param not in result.tp_owners
+        ):
+            raise RuntimeError(
+                f"{param_name}: TP-sharded dedicated parameter is missing "
+                "from AssignmentResult.tp_owners"
+            )
         d_param = DedicatedParam(
             param=param,
             module=parent_module,
@@ -297,6 +307,9 @@ def dedicate_params(
             device=device,
             compute_dtype=compute_dtype,
             replicate_group=replicate_group,
+            tp_owner_local_rank=(
+                result.tp_owners[param] if param in result.tp_owners else 0
+            ),
         )
         layer_to_dparams[layer_module].append(d_param)
 
@@ -371,6 +384,12 @@ def dedicate_params_ddp(
     if not assignment:
         logger.warning("dedicate_params_ddp: no parameters matched the predicate")
         return assignment
+    if result.tp_owners:
+        raise NotImplementedError(
+            "dedicate_params_ddp does not support TP-sharded DTensor "
+            "dedicated parameters; use dedicate_params(..., mesh=DP, "
+            "replicate_mesh=...) for the FSDP2/HSDP TP path."
+        )
 
     normalized: dict[nn.Parameter, tuple[int, int]] = {
         param: normalize_owner_rank(owner) for param, owner in assignment.items()

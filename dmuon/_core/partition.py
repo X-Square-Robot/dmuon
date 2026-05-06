@@ -21,7 +21,7 @@ import torch.nn as nn
 from torch.distributed import DeviceMesh
 
 from .. import _balance_profile
-from .tp import assign_tp_owner, is_tp_sharded
+from .tp import get_tp_mesh, is_tp_sharded
 
 try:
     from torch.distributed.tensor import DTensor
@@ -115,12 +115,21 @@ def _param_numel(param: nn.Parameter) -> int:
     return param.numel()
 
 
+def _param_logical_numel(param: nn.Parameter) -> int:
+    """Get the logical full numel of a parameter.
+
+    DTensor.numel() reports the full logical tensor size, which matches the
+    TP owner's full-matrix Newton-Schulz input after TP gather.
+    """
+    return param.numel()
+
+
 def compute_balanced_assignment(
     model: nn.Module,
     mesh: DeviceMesh,
     predicate: Callable[[str, nn.Parameter], bool],
     replicate_mesh: Optional[DeviceMesh] = None,
-    tp_owner_strategy: str = "rank0",
+    tp_owner_strategy: str = "lpt",
 ) -> AssignmentResult:
     """Compute a globally balanced dedicated ownership assignment.
 
@@ -148,8 +157,9 @@ def compute_balanced_assignment(
             dp_owners map each param to a ``(shard, replicate)`` tuple.
             When ``None``, dp_owners uses plain ``int`` as before.
         tp_owner_strategy: Strategy for picking a TP rank as owner of each
-            TP-sharded parameter.  ``"rank0"`` (default, MVP) always picks
-            TP rank 0; ``"lpt"`` is deferred to post-MVP.
+            TP-sharded parameter.  Only ``"lpt"`` is supported publicly.
+            Legacy ``"rank0"`` is intentionally rejected to avoid silently
+            concentrating all TP-sharded NS compute on one TP rank.
 
     Returns:
         ``AssignmentResult`` with ``dp_owners`` (shape matches pre-TP
@@ -163,20 +173,55 @@ def compute_balanced_assignment(
         (s, r) for s in range(shard_size) for r in range(replicate_size)
     ]
 
+    if tp_owner_strategy != "lpt":
+        raise ValueError(
+            f"Unsupported tp_owner_strategy: {tp_owner_strategy!r}; "
+            "DMuon publicly supports only 'lpt'."
+        )
+
+    dp_names: set[str] = set()
+    if mesh.mesh_dim_names:
+        dp_names |= set(mesh.mesh_dim_names)
+    if replicate_mesh is not None and replicate_mesh.mesh_dim_names:
+        dp_names |= set(replicate_mesh.mesh_dim_names)
+    dp_mesh_dim_names = frozenset(dp_names)
+
     # Collect candidates grouped by layer
     layer_params: dict[Optional[str], list[tuple[nn.Parameter, str, int]]] = defaultdict(list)
     for name, param in model.named_parameters():
         if predicate(name, param):
             layer_id = _extract_layer_id(name)
-            numel = _param_numel(param)
+            tp_sharded = is_tp_sharded(param, dp_mesh_dim_names)
+            numel = (
+                _param_logical_numel(param) if tp_sharded else _param_numel(param)
+            )
             layer_params[layer_id].append((param, name, numel))
 
     # Build allocation units: large params standalone, small params merged per-layer
     alloc_units: list[tuple[list[nn.Parameter], Optional[str], int]] = []
 
     for layer_id, params in layer_params.items():
-        small = [(p, n, s) for p, n, s in params if s < SMALL_PARAM_THRESHOLD]
-        large = [(p, n, s) for p, n, s in params if s >= SMALL_PARAM_THRESHOLD]
+        tp_params = [
+            (p, n, s) for p, n, s in params
+            if is_tp_sharded(p, dp_mesh_dim_names)
+        ]
+        non_tp_params = [
+            (p, n, s) for p, n, s in params
+            if not is_tp_sharded(p, dp_mesh_dim_names)
+        ]
+        small = [
+            (p, n, s) for p, n, s in non_tp_params
+            if s < SMALL_PARAM_THRESHOLD
+        ]
+        large = [
+            (p, n, s) for p, n, s in non_tp_params
+            if s >= SMALL_PARAM_THRESHOLD
+        ]
+
+        for p, _n, s in tp_params:
+            # TP-sharded params stay standalone.  A mixed packed allocation
+            # cannot be reconstructed/scattered by the TP collective path.
+            alloc_units.append(([p], layer_id, s))
 
         for p, _n, s in large:
             alloc_units.append(([p], layer_id, s))
@@ -224,22 +269,35 @@ def compute_balanced_assignment(
     else:
         dp_owners = dict(assignment)
 
-    # Phase 3: TP owner assignment.  Build the set of DP mesh dim names
-    # from the named DP mesh + replicate mesh; every DTensor mesh dim
-    # outside this set is treated as a TP dim.  Purely-DP parameters and
-    # non-DTensor parameters are skipped (is_tp_sharded returns False).
-    dp_names: set[str] = set()
-    if mesh.mesh_dim_names:
-        dp_names |= set(mesh.mesh_dim_names)
-    if replicate_mesh is not None and replicate_mesh.mesh_dim_names:
-        dp_names |= set(replicate_mesh.mesh_dim_names)
-    dp_mesh_dim_names = frozenset(dp_names)
-
+    # Phase 3: TP owner assignment.  LPT runs independently inside each DP
+    # owner bucket: TP ranks only balance the full-matrix NS workload for the
+    # parameters whose DP owner coord is already fixed by the DP pass above.
+    # Tie-breaks are rotated by the DP/HSDP owner slot so multiple buckets
+    # with identical shapes do not all leave the same TP rank idle.
     tp_owners: dict[nn.Parameter, int] = {}
-    for p in dp_owners:
+    tp_buckets: dict[OwnerValue, list[nn.Parameter]] = defaultdict(list)
+    for p, dp_owner in dp_owners.items():
         if is_tp_sharded(p, dp_mesh_dim_names):
-            tp_owners[p] = assign_tp_owner(
-                p, dp_mesh_dim_names, strategy=tp_owner_strategy
+            tp_buckets[dp_owner].append(p)
+
+    def _tp_tie_offset(dp_owner: OwnerValue, tp_size: int) -> int:
+        if isinstance(dp_owner, tuple):
+            shard, replicate = dp_owner
+            return (int(shard) * replicate_size + int(replicate)) % tp_size
+        return int(dp_owner) % tp_size
+
+    for dp_owner, params in tp_buckets.items():
+        if not params:
+            continue
+        tp_size = get_tp_mesh(params[0], dp_mesh_dim_names).size()
+        tp_loads = [0] * tp_size
+        tie_offset = _tp_tie_offset(dp_owner, tp_size)
+        for p in sorted(params, key=_param_logical_numel, reverse=True):
+            owner = min(
+                range(tp_size),
+                key=lambda idx: (tp_loads[idx], (idx - tie_offset) % tp_size),
             )
+            tp_owners[p] = owner
+            tp_loads[owner] += _param_logical_numel(p)
 
     return AssignmentResult(dp_owners=dp_owners, tp_owners=tp_owners)

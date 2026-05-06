@@ -293,7 +293,7 @@ The NS kernels (`newton_schulz`, `gram_newton_schulz`,
 `direct_newton_schulz`) are **TP-agnostic**: they operate on a full
 (un-sharded) matrix and have no `tp_group` argument.  For TP-sharded
 parameters the DMuon runtime reassembles the full matrix at a
-designated TP owner via All-to-All gather before invoking NS, then
+designated TP owner via TP gather before invoking NS, then
 scatters the update back to each DP-owner rank:
 
 ```
@@ -305,8 +305,9 @@ TP scatter (dist.scatter on replicate_broadcast_stream)  →
 
 This is automatic for any `DTensor` parameter whose `device_mesh`
 contains a mesh dim outside the DP dim names — no explicit TP flag on
-`dmuon.Muon`.  TP ownership is picked by `assign_tp_owner` (MVP policy
-`"rank0"`).
+`dmuon.Muon`.  TP ownership is picked by the deterministic LPT assignment
+inside `compute_balanced_assignment`, so TP-sharded full-matrix work is
+spread across local TP ranks while preserving the same loss trajectory.
 
 Practical consequences:
 

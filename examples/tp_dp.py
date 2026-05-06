@@ -2,7 +2,7 @@
 
 2D mesh (DP x TP) example.  DMuon detects TP-sharded parameters from
 their ``DTensor`` structure automatically — no TP-specific API needed.
-For each TP-sharded parameter DMuon runs an All-to-All gather →
+For each TP-sharded parameter DMuon runs a TP gather →
 full-matrix Newton-Schulz on the TP owner → scatter back, preserving
 Muon's exact math while every rank keeps only its TP shard in memory.
 

@@ -92,8 +92,8 @@ def _make_mixed_model(
 
 
 def test_partition_1d_dp_plus_tp_auto_detect():
-    """1D DP shard × TP: every proj DTensor ends up in tp_owners with rank 0;
-    non-TP params stay out of tp_owners."""
+    """1D DP shard × TP: every proj DTensor ends up in tp_owners with a
+    legal LPT-selected rank; non-TP params stay out of tp_owners."""
     mesh = init_device_mesh("cpu", (4, 2), mesh_dim_names=("shard", "tp"))
     dp_mesh, tp_mesh = mesh["shard"], mesh["tp"]
 
@@ -104,11 +104,12 @@ def test_partition_1d_dp_plus_tp_auto_detect():
     )
     assert isinstance(result, AssignmentResult)
 
-    # Every TP-sharded proj param: in dp_owners (int) and tp_owners (0)
+    # Every TP-sharded proj param: in dp_owners (int) and tp_owners.
     for p in tp_params:
         assert p in result.dp_owners
         assert isinstance(result.dp_owners[p], int)
-        assert result.tp_owners[p] == 0  # strategy="rank0"
+        assert 0 <= result.tp_owners[p] < 2
+    assert set(result.tp_owners[p] for p in tp_params) == {0, 1}
 
     # Non-TP params (ln, embed): in dp_owners, NOT in tp_owners
     for p in non_tp_params:
@@ -135,19 +136,43 @@ def test_partition_hsdp_plus_tp_auto_detect():
     )
     assert isinstance(result, AssignmentResult)
 
-    # TP-sharded params: dp_owners value is a (shard, replicate) tuple, tp_owners=0
+    # TP-sharded params: dp_owners value is a (shard, replicate) tuple and
+    # TP owners are valid LPT-selected local TP ranks.
     for p in tp_params:
         coord = result.dp_owners[p]
         assert isinstance(coord, tuple) and len(coord) == 2
         s, r = coord
         assert 0 <= s < 4 and 0 <= r < 2
-        assert result.tp_owners[p] == 0
+        assert 0 <= result.tp_owners[p] < 2
 
     # Non-TP params: dp_owners tuple-shaped, absent from tp_owners
     for p in non_tp_params:
         if p in result.dp_owners:
             assert isinstance(result.dp_owners[p], tuple)
             assert p not in result.tp_owners
+
+
+def test_tp_sharded_small_params_do_not_merge():
+    """TP-sharded params stay standalone even when below SMALL_PARAM_THRESHOLD.
+
+    If they were merged into one allocation unit, all params in the same layer
+    would receive the same DP owner.  Keeping them standalone lets the existing
+    same-layer constraint spread them across owner slots.
+    """
+    mesh = init_device_mesh("cpu", (4, 2), mesh_dim_names=("shard", "tp"))
+    model, tp_params, _non_tp_params = _make_mixed_model(
+        mesh["tp"], hidden=64, intermediate=128, num_layers=1
+    )
+
+    result = compute_balanced_assignment(
+        model,
+        mesh["shard"],
+        predicate=lambda name, _p: "proj" in name,
+    )
+
+    assert len(tp_params) == 3
+    assert len({result.dp_owners[p] for p in tp_params}) == 3
+    assert all(p in result.tp_owners for p in tp_params)
 
 
 def test_partition_tp_owners_empty_when_no_dtensor():

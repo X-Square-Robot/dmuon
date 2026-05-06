@@ -18,6 +18,7 @@ Run:
 
 import os
 import sys
+import time
 
 import torch
 import torch.distributed as dist
@@ -26,6 +27,7 @@ import torch.nn as nn
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dmuon
 from torch.distributed import init_device_mesh
@@ -34,6 +36,11 @@ from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     RowwiseParallel,
     parallelize_module,
+)
+from tp_profile_utils import (
+    assert_tp_owner_spread,
+    collect_tp_profile,
+    maybe_write_tp_profile,
 )
 
 
@@ -128,6 +135,17 @@ def main() -> int:
               if dp.is_dtensor and dp.tp_group is not None]
     log(rank, f"rank {rank}: dedicated params owned = {len(optimizer._dedicated_params)}, "
               f"TP-sharded = {len(tp_dps)}")
+    tp_profile = collect_tp_profile(
+        model,
+        scenario="dp_tp",
+        replicate_async=use_async,
+    )
+    assert_tp_owner_spread(tp_profile, min_owner_ranks=2)
+    tp_owner_set = set(tp_profile["owner_coverage"])
+    assert tp_owner_set == {0, 1}, (
+        f"rank {rank}: TP-owner LPT should distribute owners across TP ranks, "
+        f"got {sorted(tp_owner_set)}"
+    )
 
     # Snapshot weights pre-step for every owned param.
     pre: list[tuple[str, torch.Tensor]] = [
@@ -140,12 +158,22 @@ def main() -> int:
     # actually complete + write _owned_data?" is only observable after
     # the next forward triggers ``_pre_forward_wait``.
     torch.manual_seed(rank)
+    profile_out = os.environ.get("DMUON_TP_PROFILE_OUT")
+    losses: list[float] = []
+    step_times_ms: list[float] = []
     for it in range(2):
+        if profile_out:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
         optimizer.zero_grad()
         x = torch.randn(4, 16, 512, device=device)
         loss = model(x)
         loss.backward()
         optimizer.step()
+        if profile_out:
+            torch.cuda.synchronize()
+            step_times_ms.append((time.perf_counter() - t0) * 1000.0)
+        losses.append(loss.item())
         if rank == 0:
             print(f"iter {it}: loss={loss.item():.4f}", flush=True)
     torch.cuda.synchronize()
@@ -173,8 +201,19 @@ def main() -> int:
     # ``_owned_data`` is NOT meaningful here; it would be meaningful
     # in the HSDP 3D mesh integration test (deferred to T5).
 
+    maybe_write_tp_profile(
+        profile_out,
+        collect_tp_profile(
+            model,
+            scenario="dp_tp",
+            replicate_async=use_async,
+            losses=losses,
+            step_times_ms=step_times_ms,
+        ),
+    )
+
     if rank == 0:
-        print("PASSED: test_tp_muon_step (sync All-to-All)")
+        print(f"PASSED: test_tp_muon_step (async={use_async})")
     dist.destroy_process_group()
     return 0
 

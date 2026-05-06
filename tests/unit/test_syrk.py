@@ -157,7 +157,8 @@ def test_syrk_B_not_A():
 
     D_ref = torch.mm(R, Z.T)  # R @ Z^T = R @ Z (since Z is symmetric)
     D_syrk = torch.empty(M, M, device=DEVICE, dtype=DTYPE)
-    syrk_sm80(R, D_syrk, B=Z, tile_m=128, tile_k=32, num_stages=4)
+    syrk_sm80(R, D_syrk, B=Z, _symmetric=True,
+              tile_m=128, tile_k=32, num_stages=4)
 
     diff = (D_ref.float() - D_syrk.float()).abs().max().item()
     scale = D_ref.float().abs().max().item()
