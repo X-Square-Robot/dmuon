@@ -86,7 +86,7 @@ def _setup_model_and_optim(seed=42):
 
 def test_forward_backward_numerics():
     """Train 5 steps; loss should decrease monotonically on rank 0."""
-    model, optimizer, mesh, rank = _setup_model_and_optim()
+    model, optimizer, _mesh, rank = _setup_model_and_optim()
     losses = []
     torch.manual_seed(123)  # same input on every rank; DDP averages same grad
     for step in range(5):
@@ -105,7 +105,7 @@ def test_forward_backward_numerics():
 
 def test_post_step_broadcast_syncs_all_ranks():
     """After ``optimizer.step``, every rank's dedicated param must be identical."""
-    model, optimizer, mesh, rank = _setup_model_and_optim()
+    model, optimizer, _mesh, rank = _setup_model_and_optim()
     optimizer.zero_grad()
     x = torch.randn(4, 128, device="cuda")
     loss = model(x)
@@ -123,7 +123,14 @@ def test_post_step_broadcast_syncs_all_ranks():
             errors.append(name)
     if rank == 0:
         assert not errors, f"Dedicated params diverged across ranks: {errors}"
-        print(f"[post_step_broadcast] all {sum(1 for n, p in model.named_parameters() if hasattr(p, '_dedicated_owner_rank'))} dedicated params bit-identical across ranks")
+        dedicated_count = sum(
+            1 for _name, p in model.named_parameters()
+            if hasattr(p, "_dedicated_owner_rank")
+        )
+        print(
+            f"[post_step_broadcast] all {dedicated_count} dedicated params "
+            "bit-identical across ranks"
+        )
 
 
 def test_reduce_to_owner_only():
@@ -147,7 +154,9 @@ def test_reduce_to_owner_only():
             if dp.is_owner and not has_grad:
                 errors.append(f"{dp.param_name}: owner rank {rank} missing _reduced_grad")
             if (not dp.is_owner) and has_grad:
-                errors.append(f"{dp.param_name}: non-owner rank {rank} unexpectedly has _reduced_grad")
+                errors.append(
+                    f"{dp.param_name}: non-owner rank {rank} unexpectedly has _reduced_grad"
+                )
     assert not errors, f"reduce_to_owner violations on rank {rank}: {errors}"
     if rank == 0:
         print("[reduce_to_owner] owners have _reduced_grad, non-owners cleared")
@@ -172,7 +181,33 @@ def test_replicate_avgs_non_dedicated_grads():
             errors.append(name)
     if rank == 0:
         assert not errors, f"Non-dedicated grads diverged: {errors}"
-        print(f"[replicate] all non-dedicated grads bit-identical across ranks")
+        print("[replicate] all non-dedicated grads bit-identical across ranks")
+
+
+def test_muon_grad_clip_scales_dedicated_owner_grads():
+    """DMuon clip only scales dedicated/Muon gradients and step still works."""
+
+    model, optimizer, _mesh, rank = _setup_model_and_optim()
+    optimizer.zero_grad()
+    x = torch.randn(4, 128, device="cuda")
+    loss = model(x)
+    loss.backward()
+
+    stats = dmuon.clip_grad_norm_(optimizer, max_norm=1e-3)
+    local_sq = torch.zeros((), device="cuda")
+    for dp in optimizer._dedicated_params:
+        if dp._reduced_grad is not None:
+            local_sq += dp._reduced_grad.float().pow(2).sum()
+    local_norm = local_sq.sqrt()
+    assert local_norm.item() <= 1e-3 + 1e-7
+    assert stats.param_count >= 0
+    assert optimizer._grads_ready
+
+    optimizer.step()
+    for dp in optimizer._dedicated_params:
+        assert dp._reduced_grad is None
+    if rank == 0:
+        print("[muon_grad_clip] dedicated grads clipped and optimizer.step completed")
 
 
 def test_checkpoint_roundtrip():
@@ -234,6 +269,7 @@ def main():
         test_post_step_broadcast_syncs_all_ranks,
         test_reduce_to_owner_only,
         test_replicate_avgs_non_dedicated_grads,
+        test_muon_grad_clip_scales_dedicated_owner_grads,
         test_checkpoint_roundtrip,
     ]
 

@@ -172,21 +172,38 @@ The training loop is identical to standard PyTorch. No special hooks or context 
 
 ### Gradient Clipping
 
-Use PyTorch's native `clip_grad_norm_` — it works with DMuon out of the box:
+Use PyTorch's native `clip_grad_norm_` for ordinary `param.grad` tensors, and
+add DMuon's Muon-only clip when you want dedicated parameters covered too:
 
 ```python
 for step, batch in enumerate(dataloader):
     optimizer.zero_grad()
     loss = model(batch).loss
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    # Non-dedicated / AdamW parameters: handled by the training framework.
+    torch.nn.utils.clip_grad_norm_(adamw_params, max_norm=1.0)
+
+    # DMuon dedicated / Muon parameters: gradients live on DedicatedParam.
+    dmuon.clip_grad_norm_(optimizer, max_norm=1.0)
+
     optimizer.step()
 ```
 
-!!! info "Why does this work?"
-    Dedicated params store their gradients in `_reduced_grad`, not `param.grad`. So `clip_grad_norm_` naturally sees only symmetric params (LayerNorm, embeddings) — which are the ones that actually need clipping.
+!!! info "What is clipped?"
+    `dmuon.clip_grad_norm_` only clips DMuon dedicated parameters. It does not
+    touch AdamW parameters, so existing training frameworks can keep their
+    standard PyTorch clipping path unchanged.
 
-    Dedicated params don't need clipping because Newton-Schulz orthogonalization projects the gradient onto an orthogonal matrix with bounded spectral norm, regardless of the input gradient magnitude.
+    Muon clipping happens after DMuon's async reduce / TP gather and before
+    momentum + Newton-Schulz. Newton-Schulz bounds the final matrix update
+    scale, so this clip is mainly a safety guard for anomalous gradients,
+    momentum-buffer contamination, and non-finite checks rather than the main
+    learning-rate control mechanism.
+
+The default strategy is global p-norm clipping over Muon gradients. Custom
+strategies can be registered with `dmuon.register_muon_grad_clip_strategy(...)`
+for future schemes such as MuonClip or projection-specific clipping.
 
 ## Logging and Debugging
 

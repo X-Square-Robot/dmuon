@@ -4,17 +4,21 @@ Combines Newton-Schulz orthogonalization on dedicated parameters with
 AdamW on symmetric (FSDP2-managed) parameters in a single optimizer.
 """
 
+import os
+from typing import Optional, Union
+
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 
-from typing import Union
-
 from .. import _balance_profile
+from ..grad_clip import (
+    MuonGradClipStats,
+    _clip_ready_muon_grad_norm_,
+)
 from ..utils import (
     broadcast_all_updates,
     broadcast_all_updates_async,
-    get_owned_params,
     update_replicate_fallback,
     wait_all_reduces,
 )
@@ -105,6 +109,8 @@ class Muon(Optimizer):
         self._ns_steps = ns_steps
         self._ns = ns_backend
         self._nesterov = nesterov
+        self._grads_ready = False
+        self._last_muon_grad_clip_stats: Optional[MuonGradClipStats] = None
         # Phase C: toggle between async (default, hides broadcast inside
         # the next forward) and Phase B sync (simpler, always-correct).
         # When True, each group's pending event is consumed by its own
@@ -200,6 +206,104 @@ class Muon(Optimizer):
 
         self._profile_step_idx = 0
         self._profile_param_timer: _balance_profile.ParamTimer = _balance_profile.ParamTimer()
+        self._step_profile_enabled = False
+        self._last_step_profile: dict[str, object] = {}
+        self._last_step_profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+
+    @property
+    def last_muon_grad_clip_stats(self) -> Optional[MuonGradClipStats]:
+        """Stats from the most recent Muon gradient clipping call."""
+
+        return self._last_muon_grad_clip_stats
+
+    def _profile_requested(self) -> bool:
+        return bool(int(os.environ.get("DMUON_STEP_PROFILE", "0") or 0))
+
+    def _profile_begin_step(self) -> None:
+        self._step_profile_enabled = self._profile_requested() and torch.cuda.is_available()
+        self._last_step_profile_events = []
+        self._last_step_profile = {
+            "enabled": self._step_profile_enabled,
+            "ns_matrix_count": 0,
+            "ns_input_numel": 0,
+        }
+
+    def _profile_event_start(self, name: str):
+        if not self._step_profile_enabled:
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return name, start, end
+
+    def _profile_event_end(self, token) -> None:
+        if token is None:
+            return
+        _name, _start, end = token
+        end.record()
+        self._last_step_profile_events.append(token)
+
+    def _profile_add(self, key: str, value: int | float) -> None:
+        if not self._step_profile_enabled:
+            return
+        current = self._last_step_profile.get(key, 0)
+        self._last_step_profile[key] = current + value
+
+    def consume_last_step_profile(self) -> dict[str, object]:
+        """Return the last step's CUDA event timings after the caller synced."""
+
+        profile = dict(self._last_step_profile)
+        if not profile:
+            return {}
+        if not profile.get("enabled"):
+            self._last_step_profile_events = []
+            return profile
+        event_totals: dict[str, float] = {}
+        for name, start, end in self._last_step_profile_events:
+            event_totals[name] = event_totals.get(name, 0.0) + float(
+                start.elapsed_time(end)
+            )
+        for name, value in event_totals.items():
+            profile[f"{name}_ms"] = round(value, 6)
+        profile["ns_compute_ms"] = round(event_totals.get("ns_compute", 0.0), 6)
+        self._last_step_profile_events = []
+        return profile
+
+    def _ensure_grads_ready(self) -> None:
+        """Wait for DMuon reduce/gather once before clipping or stepping."""
+
+        if self._grads_ready:
+            return
+        wait_all_reduces(self.model)
+        self._grads_ready = True
+
+    @torch.no_grad()
+    def clip_grad_norm_(
+        self,
+        max_norm: Optional[float],
+        *,
+        norm_type: Optional[float] = None,
+        error_if_nonfinite: Optional[bool] = None,
+        foreach: Optional[bool] = None,
+        strategy: Optional[object] = None,
+    ) -> MuonGradClipStats:
+        """Clip DMuon dedicated/Muon gradients only.
+
+        Ordinary AdamW parameters are intentionally excluded.  Use
+        ``torch.nn.utils.clip_grad_norm_`` for those ``param.grad`` tensors and
+        call this method as the DMuon-specific extra line.
+        """
+
+        self._ensure_grads_ready()
+        stats = _clip_ready_muon_grad_norm_(
+            self,
+            max_norm,
+            norm_type=2.0 if norm_type is None else norm_type,
+            error_if_nonfinite=False if error_if_nonfinite is None else error_if_nonfinite,
+            foreach=foreach,
+            strategy="global_norm" if strategy is None else strategy,
+        )
+        return stats
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -218,6 +322,7 @@ class Muon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        self._profile_begin_step()
         broadcast_fn = (
             broadcast_all_updates_async
             if self._replicate_async
@@ -227,16 +332,32 @@ class Muon(Optimizer):
         if _balance_profile.enabled():
             timer = _balance_profile.StepTimer()
             with timer.phase("wait_reduces"):
-                wait_all_reduces(self.model)
+                profile_token = self._profile_event_start("wait_reduces")
+                try:
+                    self._ensure_grads_ready()
+                finally:
+                    self._profile_event_end(profile_token)
             with timer.phase("muon"):
-                self._step_muon()
+                profile_token = self._profile_event_start("muon")
+                try:
+                    self._step_muon()
+                finally:
+                    self._profile_event_end(profile_token)
             with timer.phase("adamw"):
-                self._step_adamw()
+                profile_token = self._profile_event_start("adamw")
+                try:
+                    self._step_adamw()
+                finally:
+                    self._profile_event_end(profile_token)
             # Phase C.4: flip any slow group to sync BEFORE dispatching the
             # next broadcast so the new decision takes effect immediately.
             update_replicate_fallback(self.model)
             with timer.phase("replicate_broadcast"):
-                broadcast_fn(self.model)
+                profile_token = self._profile_event_start("replicate_broadcast")
+                try:
+                    broadcast_fn(self.model)
+                finally:
+                    self._profile_event_end(profile_token)
 
             owned_numel = sum(
                 dp._owned_data.numel() for dp in self._dedicated_params
@@ -252,16 +373,29 @@ class Muon(Optimizer):
                 self._profile_param_timer.report(self._profile_step_idx)
                 self._profile_param_timer = _balance_profile.ParamTimer()
             self._profile_step_idx += 1
+            self._grads_ready = False
             return loss
 
         # 1. Wait for all pending async reduces from backward
-        wait_all_reduces(self.model)
+        profile_token = self._profile_event_start("wait_reduces")
+        try:
+            self._ensure_grads_ready()
+        finally:
+            self._profile_event_end(profile_token)
 
         # 2. Muon update on dedicated params
-        self._step_muon()
+        profile_token = self._profile_event_start("muon")
+        try:
+            self._step_muon()
+        finally:
+            self._profile_event_end(profile_token)
 
         # 3. AdamW update on FSDP2 params
-        self._step_adamw()
+        profile_token = self._profile_event_start("adamw")
+        try:
+            self._step_adamw()
+        finally:
+            self._profile_event_end(profile_token)
 
         # 4. Advance the per-group async→sync fallback state machine
         # (Phase C.4).  Reads ``_last_replicate_wait_us`` populated during
@@ -275,8 +409,13 @@ class Muon(Optimizer):
         # consume the event at the start of the next forward; set
         # ``replicate_async=False`` on Muon construction to fall back to the
         # Phase B sync path.  No-op in 1D shard-only mode either way.
-        broadcast_fn(self.model)
+        profile_token = self._profile_event_start("replicate_broadcast")
+        try:
+            broadcast_fn(self.model)
+        finally:
+            self._profile_event_end(profile_token)
 
+        self._grads_ready = False
         return loss
 
     def _step_muon(self):
@@ -358,7 +497,13 @@ class Muon(Optimizer):
             ns_input = grad.add(buf, alpha=mu) if self._nesterov else buf
 
             # Newton-Schulz on the full (un-sharded) matrix.
-            update = self._ns.local(ns_input, self._ns_steps)
+            profile_token = self._profile_event_start("ns_compute")
+            try:
+                update = self._ns.local(ns_input, self._ns_steps)
+            finally:
+                self._profile_event_end(profile_token)
+            self._profile_add("ns_matrix_count", 1)
+            self._profile_add("ns_input_numel", int(ns_input.numel()))
 
             if is_tp:
                 # Produce the **pre-scaled** full-matrix update that
@@ -372,7 +517,10 @@ class Muon(Optimizer):
                     dp.full_shape[1] if len(dp.full_shape) > 1 else m_full
                 )
                 scale = 0.2 * (max(m_full, n_full) ** 0.5)
-                update_full = update.view(dp.full_shape).to(dp._owned_data.dtype)
+                update_full = update.view(dp.full_shape).to(
+                    device=dp._owned_data.device,
+                    dtype=dp._owned_data.dtype,
+                )
                 update_full.mul_(-lr * scale)
                 dp._tp_full_delta = update_full
                 dp._tp_wd_factor = (1.0 - lr * wd) if wd > 0 else 1.0
@@ -387,7 +535,8 @@ class Muon(Optimizer):
                 if wd > 0:
                     owned.mul_(1.0 - lr * wd)
                 owned.add_(
-                    update.view(owned.shape).to(owned.dtype), alpha=-lr * scale
+                    update.view(owned.shape).to(device=owned.device, dtype=owned.dtype),
+                    alpha=-lr * scale,
                 )
 
             # Non-TP params: clear now.  TP params defer the clear to
@@ -451,6 +600,8 @@ class Muon(Optimizer):
         gradients (from gradient accumulation).  Dedicated params' _reduced_grad
         is normally cleared in step(), but is also cleared here for safety.
         """
+        self._grads_ready = False
+        self._last_muon_grad_clip_stats = None
         for p in self._fsdp_params:
             if set_to_none:
                 p.grad = None

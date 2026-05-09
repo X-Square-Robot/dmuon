@@ -172,21 +172,37 @@ for step, batch in enumerate(dataloader):
 
 ### 梯度裁剪
 
-直接使用 PyTorch 原生的 `clip_grad_norm_`——与 DMuon 天然兼容：
+普通 `param.grad` 仍然使用 PyTorch 原生 `clip_grad_norm_`；如果希望
+DMuon 专属参数也被覆盖，再额外补一行 DMuon 的 Muon-only clip：
 
 ```python
 for step, batch in enumerate(dataloader):
     optimizer.zero_grad()
     loss = model(batch).loss
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    # 非专属 / AdamW 参数：继续交给训练框架原有逻辑。
+    torch.nn.utils.clip_grad_norm_(adamw_params, max_norm=1.0)
+
+    # DMuon 专属 / Muon 参数：梯度不在 param.grad 上，需要 DMuon 入口。
+    dmuon.clip_grad_norm_(optimizer, max_norm=1.0)
+
     optimizer.step()
 ```
 
-!!! info "为什么直接可用？"
-    专属参数的梯度存储在 `_reduced_grad` 中，不在 `param.grad` 上。因此 `clip_grad_norm_` 天然只看到对称参数（LayerNorm、embedding）——恰好是真正需要裁剪的那些。
+!!! info "这里裁剪了什么？"
+    `dmuon.clip_grad_norm_` 只裁剪 DMuon 专属参数，不会触碰 AdamW 参数。
+    因此现有训练框架可以继续使用标准 PyTorch clip 处理普通
+    `param.grad`，DMuon 只补齐 Muon 参数这一部分。
 
-    专属参数不需要裁剪，因为 Newton-Schulz 正交化会将梯度投影到正交矩阵上，输出的谱范数有界，与输入梯度大小无关。
+    Muon clip 发生在 DMuon 异步 reduce / TP gather 之后、momentum +
+    Newton-Schulz 之前。Newton-Schulz 会约束最终矩阵 update 的尺度，
+    所以这里的 clip 更像异常梯度、momentum buffer 污染和 non-finite
+    检查的保护，而不是主要的学习率控制机制。
+
+默认策略是对 Muon 梯度做 global p-norm clipping。后续如果需要接入
+MuonClip、QK/投影层专用 clip 等方案，可以通过
+`dmuon.register_muon_grad_clip_strategy(...)` 注册自定义策略。
 
 ## 日志与调试
 
