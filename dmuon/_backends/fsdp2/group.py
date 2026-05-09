@@ -607,34 +607,45 @@ class DedicatedParamGroup:
         # mid-flight from an unrelated reduce).
         reduce_stream.wait_stream(torch.cuda.current_stream())
 
+        grouped_work = []
+        for item in work:
+            tp_group = item[0].tp_group
+            for group, items in grouped_work:
+                if group is tp_group:
+                    items.append(item)
+                    break
+            else:
+                grouped_work.append((tp_group, [item]))
+
         with torch.cuda.stream(reduce_stream):
-            with dist._coalescing_manager(group=None, device=self.device):
-                for p, local_grad in work:
-                    tp_size = p.tp_group.size()
-                    if p.is_tp_owner:
-                        # Allocate the full (M, N) buffer fresh every step
-                        # (MVP — see tp_design.md §6.7 note on pre-alloc
-                        # deferral).  gather_list entries must be separate
-                        # tensors; we cat them post-gather along shard_dim.
-                        shard_dim = p.shard_dim if p.shard_dim is not None else 0
-                        recv_bufs = [
-                            torch.empty_like(local_grad) for _ in range(tp_size)
-                        ]
-                        dist.gather(
-                            local_grad,
-                            gather_list=recv_bufs,
-                            dst=p._tp_owner_global_rank,
-                            group=p.tp_group,
-                        )
-                        p._tp_full_grad = torch.cat(recv_bufs, dim=shard_dim)
-                    else:
-                        dist.gather(
-                            local_grad,
-                            gather_list=None,
-                            dst=p._tp_owner_global_rank,
-                            group=p.tp_group,
-                        )
-                        p._tp_full_grad = None
+            for tp_group, group_work in grouped_work:
+                with dist._coalescing_manager(group=tp_group, device=self.device):
+                    for p, local_grad in group_work:
+                        tp_size = p.tp_group.size()
+                        if p.is_tp_owner:
+                            # Allocate the full (M, N) buffer fresh every step
+                            # (MVP — see tp_design.md §6.7 note on pre-alloc
+                            # deferral).  gather_list entries must be separate
+                            # tensors; we cat them post-gather along shard_dim.
+                            shard_dim = p.shard_dim if p.shard_dim is not None else 0
+                            recv_bufs = [
+                                torch.empty_like(local_grad) for _ in range(tp_size)
+                            ]
+                            dist.gather(
+                                local_grad,
+                                gather_list=recv_bufs,
+                                dst=p._tp_owner_global_rank,
+                                group=p.tp_group,
+                            )
+                            p._tp_full_grad = torch.cat(recv_bufs, dim=shard_dim)
+                        else:
+                            dist.gather(
+                                local_grad,
+                                gather_list=None,
+                                dst=p._tp_owner_global_rank,
+                                group=p.tp_group,
+                            )
+                            p._tp_full_grad = None
         # No event record: the TP owner consumes ``_tp_full_grad`` on the
         # default (compute) stream in optimizer.step, which will
         # ``wait_stream(reduce_stream)`` just before reading.
@@ -665,37 +676,47 @@ class DedicatedParamGroup:
 
         refs: list[torch.Tensor] = []
         updates: list[tuple[DedicatedParam, torch.Tensor]] = []
+        grouped_work = []
+        for p in work:
+            for group, items in grouped_work:
+                if group is p.tp_group:
+                    items.append(p)
+                    break
+            else:
+                grouped_work.append((p.tp_group, [p]))
+
         with torch.cuda.stream(bcast_stream):
-            with dist._coalescing_manager(group=None, device=self.device):
-                for p in work:
-                    shard_dim = p.shard_dim if p.shard_dim is not None else 0
-                    recv_shard = torch.empty_like(p._owned_data)
-                    if p.is_tp_owner:
-                        assert p._tp_full_delta is not None, (
-                            f"{p.param_name}: TP owner has _tp_full_delta=None "
-                            "— Muon._step_muon did not populate it."
-                        )
-                        splits = [
-                            s.contiguous()
-                            for s in p._tp_full_delta.split(
-                                p._orig_size[shard_dim], dim=shard_dim,
+            for tp_group, group_work in grouped_work:
+                with dist._coalescing_manager(group=tp_group, device=self.device):
+                    for p in group_work:
+                        shard_dim = p.shard_dim if p.shard_dim is not None else 0
+                        recv_shard = torch.empty_like(p._owned_data)
+                        if p.is_tp_owner:
+                            assert p._tp_full_delta is not None, (
+                                f"{p.param_name}: TP owner has _tp_full_delta=None "
+                                "— Muon._step_muon did not populate it."
                             )
-                        ]
-                        refs.extend(splits)
-                        dist.scatter(
-                            recv_shard,
-                            scatter_list=splits,
-                            src=p._tp_owner_global_rank,
-                            group=p.tp_group,
-                        )
-                    else:
-                        dist.scatter(
-                            recv_shard,
-                            scatter_list=None,
-                            src=p._tp_owner_global_rank,
-                            group=p.tp_group,
-                        )
-                    updates.append((p, recv_shard))
+                            splits = [
+                                s.contiguous()
+                                for s in p._tp_full_delta.split(
+                                    p._orig_size[shard_dim], dim=shard_dim,
+                                )
+                            ]
+                            refs.extend(splits)
+                            dist.scatter(
+                                recv_shard,
+                                scatter_list=splits,
+                                src=p._tp_owner_global_rank,
+                                group=p.tp_group,
+                            )
+                        else:
+                            dist.scatter(
+                                recv_shard,
+                                scatter_list=None,
+                                src=p._tp_owner_global_rank,
+                                group=p.tp_group,
+                            )
+                        updates.append((p, recv_shard))
 
             # Keep the local weight update explicitly after the coalesced
             # scatter dispatch.  This avoids relying on private
