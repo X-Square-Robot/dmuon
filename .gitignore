@@ -60,3 +60,9 @@ tests/precision/artifacts/
 
 # torch.profiler trace artifacts — regenerate, don't commit
 tests/distributed/*.pt.trace.json
+
+# 256GPU experiment pipeline and generated outputs — keep local only for now
+/benchmarks/experiment_256gpu/
+/tests/experiment_256gpu/
+/benchmarks/__init__.py
+/.experiment_256gpu*/
