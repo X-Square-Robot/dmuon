@@ -142,6 +142,56 @@ optimizer = dmuon.Muon(
 - **Group 0** (dedicated params): Muon — momentum + NS + update, owner only
 - **Group 1** (symmetric params): AdamW — standard, all ranks
 
+### Semantic Param Groups
+
+Use `param_groups` when a training framework needs business-level learning
+rate groups, such as a VLA action expert with a higher LR. Build the groups
+from the same wrapped model object that you pass to `dmuon.Muon`; with FSDP2,
+this means after `dedicate_params()` and after wrapping. DMuon lowers each user
+group into two optimizer subgroups: `<name>/muon` for dedicated parameters and
+`<name>/adamw` for symmetric parameters.
+
+```python
+base_params = []
+action_params = []
+for name, param in model.named_parameters():
+    if not param.requires_grad:
+        continue
+    if "action_transformer" in name:
+        action_params.append(param)
+    else:
+        base_params.append(param)
+
+optimizer = dmuon.Muon(
+    model,
+    lr=5e-5,
+    adamw_lr=5e-5,
+    param_groups=[
+        {"params": base_params, "lr": 5e-5, "group_name": "base"},
+        {"params": action_params, "lr": 1e-4, "group_name": "action"},
+    ],
+)
+```
+
+`lr` applies to both Muon and AdamW subgroups for that semantic group. Advanced
+callers can override route-specific values with `muon_lr`, `adamw_lr`,
+`muon_weight_decay`, `adamw_weight_decay`, `momentum`, `adamw_betas`, and
+`adamw_eps`. Every trainable parameter must appear in exactly one user group;
+stale pre-wrapping parameters, duplicate parameters, and missing parameters
+raise during optimizer construction.
+
+Schedulers and checkpoints work through `optimizer.param_groups` as usual. The
+visible group names become `base/muon`, `base/adamw`, `action/muon`, and
+`action/adamw`.
+
+Use the diagnostics helper to audit the actual split:
+
+```python
+summary = dmuon.summarize_param_groups(model, optimizer, max_rows=80)
+if dist.get_rank() == 0:
+    print(dmuon.format_param_group_summary(summary))
+```
+
 ### Hyperparameter Guide
 
 | Parameter | Default | Notes |
@@ -152,6 +202,7 @@ optimizer = dmuon.Muon(
 | `ns_backend` | `"gram"` | `"gram"` or `"direct"` string, or a `dmuon.NewtonSchulz(...)` object for custom coefficients. |
 | `nesterov` | True | Nesterov lookahead: `ns_input = grad + mu * buf`. Recommended. |
 | `adamw_lr` | 1e-3 | Separate learning rate for non-matrix parameters. |
+| `param_groups` | None | Optional semantic PyTorch-style parameter groups, lowered into Muon and AdamW subgroups. |
 
 ## Step 5: Training Loop
 

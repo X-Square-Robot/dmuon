@@ -16,8 +16,10 @@ Current worktree status:
   and HSDP*TP2 different-LR delta behavior on TP-sharded dedicated parameters;
   HSDP*TP2 sync/async loss consistency with semantic param groups; local
   diagnostics summaries for DDP/FSDP2/TP/HSDP*TP.
-- Not finished: public API docs, Wall-X/VLA smoke, and a focused stale
-  pre-wrapping parameter validation test.
+- Completed after implementation commit: public training docs now cover semantic
+  `param_groups` and diagnostics; Wall-X side reported its adapter smoke as
+  passing with the DMuon diagnostics path wired.
+- Not finished: a focused stale pre-wrapping parameter validation test.
 
 Owner: DMuon optimizer runtime
 
@@ -522,8 +524,8 @@ Status: implemented in worktree.
    `max_rows`.
 5. Done: add distributed assertions in DDP, FSDP2, DP2*TP2, and HSDP*TP2 tests
    that the diagnostics expose action groups and TP-sharded Muon groups.
-6. Remaining: public docs / Wall-X training-log example once the real Wall-X
-   smoke is wired.
+6. Done: public docs explain semantic `param_groups` and diagnostics; Wall-X
+   side reports the real adapter smoke as passing with startup diagnostics wired.
 
 ### Phase E: Distributed Validation
 
@@ -577,7 +579,8 @@ Run CPU/unit tests first, then distributed tests on remote GPU:
 
 ### Wall-X Smoke
 
-Status: not started.
+Status: completed by Wall-X side; DMuon-side diagnostics and public usage docs
+are wired.
 
 Run one short Wall-X/VLA job with DMuon param groups and verify:
 
@@ -586,6 +589,10 @@ Run one short Wall-X/VLA job with DMuon param groups and verify:
 3. action encoder/decoder projection weights are in Muon groups.
 4. ViT/modulation/non-dedicated weights are in AdamW groups.
 5. checkpoint save/load preserves group metadata.
+
+Wall-X owns the concrete training config and smoke run. DMuon exposes
+`summarize_param_groups()` / `format_param_group_summary()` so the startup log
+can audit the final Muon/AdamW split without framework-specific DMuon internals.
 
 ## 17. Acceptance Criteria
 
@@ -596,5 +603,5 @@ The feature is ready when:
    internals.
 3. DDP/FSDP2/HSDP/TP communication ordering is unchanged.
 4. Scheduler and checkpoint behavior are deterministic across ranks.
-5. A real Wall-X 1-step smoke shows expected LR group logs and no parameter
-   coverage gaps.
+5. Wall-X side confirms its adapter smoke shows expected LR group logs and no
+   parameter coverage gaps.
