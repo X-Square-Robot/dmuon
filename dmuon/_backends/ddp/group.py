@@ -22,9 +22,7 @@ Lifecycle per step on a DDP group:
 
 The async variant (``post_step_broadcast_async`` +
 ``_pre_forward_wait``) mirrors the FSDP2-path HSDP scheduler so the
-broadcast can hide inside the next forward's compute. Reserved for
-phase P2 — in P1 the async method is a thin wrapper that just calls
-the sync path.
+broadcast can hide inside the next forward's compute.
 """
 
 from collections import defaultdict
@@ -264,13 +262,20 @@ class DedicatedParamGroupDDP:
         torch.cuda.current_stream().wait_event(self._post_step_broadcast_event)
         self._post_step_broadcast_event = None
 
-    # ---- async post-step broadcast (P2 placeholder) -------------------------
+    # ---- async post-step broadcast -----------------------------------------
 
     def post_step_broadcast_async(self) -> None:
-        """Async variant. P1 just calls the sync path to keep numerics
-        identical; P2 will wire cross-step event chaining so the broadcast
-        hides inside the next forward's compute.
+        """Async variant used by group-pipelined post-step scheduling.
+
+        The optimizer may call this immediately after the group's owner-side
+        Muon update.  The event is consumed by this group's next
+        ``_pre_forward_wait`` before the live parameter is read.
         """
+        if self._post_step_broadcast_state is not None:
+            raise RuntimeError(
+                "post_step_broadcast_async: previous event still pending; "
+                "pre_forward_wait was not consumed before the next dispatch"
+            )
         self.post_step_broadcast_sync()
         # Move event ownership to the async-state slot so
         # _pre_forward_wait is the consumer (matches FSDP2-path contract).

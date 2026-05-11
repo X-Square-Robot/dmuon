@@ -66,6 +66,31 @@ def _iter_groups(model: nn.Module):
             yield module._dedicated_state.group
 
 
+def _ordered_post_step_groups(model: nn.Module) -> list:
+    """Return post-step groups in next-forward priority order.
+
+    The order follows ``comm_ctx.post_forward_order`` when available and
+    falls back to model-walk order for the first iteration or skipped modules.
+    Every rank must use the same deterministic order because these groups
+    enqueue NCCL collectives.
+    """
+    comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
+    order: list = []
+    seen: set = set()
+    if comm_ctx is not None:
+        for g in comm_ctx.post_forward_order:
+            gid = id(g)
+            if gid not in seen:
+                seen.add(gid)
+                order.append(g)
+    for g in _iter_groups(model):
+        gid = id(g)
+        if gid not in seen:
+            seen.add(gid)
+            order.append(g)
+    return order
+
+
 def _dispatch_post_step_sync(g) -> None:
     """Dispatch the post-step broadcast for one group (sync variant).
 
@@ -90,6 +115,13 @@ def _dispatch_post_step_sync(g) -> None:
 
 
 def _dispatch_post_step_async(g) -> None:
+    """Dispatch the post-step publish path for one group (async variant).
+
+    FSDP2/HSDP+TP groups run TP scatter before replicate broadcast on the
+    same stream, so replicate peers only see TP-correct ``_owned_data``.
+    DDP groups fan owner data across the DP group and leave the event for
+    the next pre-forward wait.
+    """
     if isinstance(g, DedicatedParamGroupDDP):
         g.post_step_broadcast_async()
     else:
@@ -143,22 +175,7 @@ def broadcast_all_updates_async(model: nn.Module) -> None:
     ``replicate_broadcast_async`` (dispatch + wait inline); the caller
     sees no pending state for it.
     """
-    comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
-    order: list = []
-    seen: set = set()
-    if comm_ctx is not None:
-        for g in comm_ctx.post_forward_order:
-            gid = id(g)
-            if gid not in seen:
-                seen.add(gid)
-                order.append(g)
-    # Append groups not observed in post-forward order (first-epoch, or
-    # groups whose layer did not run in the last forward).
-    for g in _iter_groups(model):
-        if id(g) not in seen:
-            seen.add(id(g))
-            order.append(g)
-    for g in order:
+    for g in _ordered_post_step_groups(model):
         _dispatch_post_step_async(g)
 
 

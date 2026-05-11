@@ -64,7 +64,7 @@ def _all_ranks_equal(t: torch.Tensor) -> bool:
     return True
 
 
-def _setup_model_and_optim(seed=42):
+def _setup_model_and_optim(seed=42, *, replicate_async=False):
     torch.manual_seed(seed)
     model = TinyModel().cuda()
     rank = dist.get_rank()
@@ -79,9 +79,21 @@ def _setup_model_and_optim(seed=42):
     optimizer = dmuon.Muon(
         model, lr=0.02, momentum=0.95, ns_steps=3,
         adamw_lr=1e-3, adamw_weight_decay=0.0,
-        replicate_async=False,  # P1: sync post-step broadcast
+        replicate_async=replicate_async,
     )
     return model, optimizer, mesh, rank
+
+
+def _pending_post_step_states(model) -> int:
+    pending = 0
+    for module in model.modules():
+        state = getattr(module, "_dedicated_state", None)
+        if state is None:
+            continue
+        group = state.group
+        if getattr(group, "_post_step_broadcast_state", None) is not None:
+            pending += 1
+    return pending
 
 
 def test_forward_backward_numerics():
@@ -210,6 +222,67 @@ def test_muon_grad_clip_scales_dedicated_owner_grads():
         print("[muon_grad_clip] dedicated grads clipped and optimizer.step completed")
 
 
+def test_async_post_step_broadcast_leaves_pending_state_until_drain():
+    """DDP async path should dispatch group states and drain them explicitly."""
+
+    model, optimizer, _mesh, rank = _setup_model_and_optim(replicate_async=True)
+    optimizer.zero_grad()
+    x = torch.randn(4, 128, device="cuda")
+    loss = model(x)
+    loss.backward()
+    optimizer.step()
+
+    pending = _pending_post_step_states(model)
+    assert pending > 0, f"rank {rank}: expected pending async post-step state"
+
+    dmuon.wait_all_post_step_broadcasts(model)
+    assert _pending_post_step_states(model) == 0
+
+    errors = []
+    for name, p in model.named_parameters():
+        if hasattr(p, "_dedicated_owner_rank") and not _all_ranks_equal(p.data):
+            errors.append(name)
+    if rank == 0:
+        assert not errors, f"Async DDP dedicated params diverged: {errors}"
+        print("[async_post_step] pending states drain and params sync")
+
+
+def test_async_matches_sync_loss_trajectory():
+    """Group-pipelined async DDP should match the sync post-step path."""
+
+    batches = []
+    for step in range(3):
+        torch.manual_seed(7000 + step)
+        batches.append(torch.randn(4, 128, device="cuda"))
+
+    def run(*, replicate_async: bool) -> torch.Tensor:
+        model, optimizer, _mesh, _rank = _setup_model_and_optim(
+            seed=777, replicate_async=replicate_async
+        )
+        losses = []
+        for x in batches:
+            optimizer.zero_grad()
+            loss = model(x)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach().item()))
+        dmuon.wait_all_post_step_broadcasts(model)
+        return torch.tensor(losses, device="cuda")
+
+    sync_losses = run(replicate_async=False)
+    dist.barrier()
+    async_losses = run(replicate_async=True)
+    dist.barrier()
+
+    if not torch.allclose(sync_losses, async_losses, rtol=0, atol=1e-6):
+        raise AssertionError(
+            f"async losses diverged from sync: sync={sync_losses.tolist()} "
+            f"async={async_losses.tolist()}"
+        )
+    if dist.get_rank() == 0:
+        print("[async_vs_sync] loss trajectories match")
+
+
 def test_checkpoint_roundtrip():
     """Save → load → verify every rank holds identical parameters."""
     model, optimizer, _, rank = _setup_model_and_optim()
@@ -270,6 +343,8 @@ def main():
         test_reduce_to_owner_only,
         test_replicate_avgs_non_dedicated_grads,
         test_muon_grad_clip_scales_dedicated_owner_grads,
+        test_async_post_step_broadcast_leaves_pending_state_until_drain,
+        test_async_matches_sync_loss_trajectory,
         test_checkpoint_roundtrip,
     ]
 

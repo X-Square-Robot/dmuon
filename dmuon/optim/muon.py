@@ -17,8 +17,9 @@ from ..grad_clip import (
     _clip_ready_muon_grad_norm_,
 )
 from ..utils import (
+    _dispatch_post_step_async,
+    _ordered_post_step_groups,
     broadcast_all_updates,
-    broadcast_all_updates_async,
     update_replicate_fallback,
     wait_all_reduces,
 )
@@ -314,8 +315,10 @@ class Muon(Optimizer):
            in HSDP mode).
         2. Runs Muon (momentum + NS + update) on owned dedicated params.
         3. Runs AdamW on FSDP2 symmetric params.
-        4. In HSDP mode, broadcasts the updated ``_owned_data`` from the
-           global owner to the replicate peers; no-op in 1D shard-only mode.
+        4. Publishes updated dedicated params. In sync mode this happens as
+           one post-step phase; in async mode each group dispatches its
+           scatter/broadcast immediately after that group's Muon update, and
+           the next forward consumes the pending event before reading it.
         """
         loss = None
         if closure is not None:
@@ -323,12 +326,6 @@ class Muon(Optimizer):
                 loss = closure()
 
         self._profile_begin_step()
-        broadcast_fn = (
-            broadcast_all_updates_async
-            if self._replicate_async
-            else broadcast_all_updates
-        )
-
         if _balance_profile.enabled():
             timer = _balance_profile.StepTimer()
             with timer.phase("wait_reduces"):
@@ -337,27 +334,37 @@ class Muon(Optimizer):
                     self._ensure_grads_ready()
                 finally:
                     self._profile_event_end(profile_token)
-            with timer.phase("muon"):
-                profile_token = self._profile_event_start("muon")
-                try:
-                    self._step_muon()
-                finally:
-                    self._profile_event_end(profile_token)
+            if self._replicate_async:
+                update_replicate_fallback(self.model)
+                with timer.phase("muon"):
+                    profile_token = self._profile_event_start("muon")
+                    try:
+                        self._step_muon_and_dispatch_groups_async()
+                    finally:
+                        self._profile_event_end(profile_token)
+            else:
+                with timer.phase("muon"):
+                    profile_token = self._profile_event_start("muon")
+                    try:
+                        self._step_muon()
+                    finally:
+                        self._profile_event_end(profile_token)
             with timer.phase("adamw"):
                 profile_token = self._profile_event_start("adamw")
                 try:
                     self._step_adamw()
                 finally:
                     self._profile_event_end(profile_token)
-            # Phase C.4: flip any slow group to sync BEFORE dispatching the
-            # next broadcast so the new decision takes effect immediately.
-            update_replicate_fallback(self.model)
-            with timer.phase("replicate_broadcast"):
-                profile_token = self._profile_event_start("replicate_broadcast")
-                try:
-                    broadcast_fn(self.model)
-                finally:
-                    self._profile_event_end(profile_token)
+            if not self._replicate_async:
+                # Phase C.4: flip any slow group to sync BEFORE dispatching the
+                # next broadcast so the new decision takes effect immediately.
+                update_replicate_fallback(self.model)
+                with timer.phase("replicate_broadcast"):
+                    profile_token = self._profile_event_start("replicate_broadcast")
+                    try:
+                        broadcast_all_updates(self.model)
+                    finally:
+                        self._profile_event_end(profile_token)
 
             owned_numel = sum(
                 dp._owned_data.numel() for dp in self._dedicated_params
@@ -383,12 +390,24 @@ class Muon(Optimizer):
         finally:
             self._profile_event_end(profile_token)
 
-        # 2. Muon update on dedicated params
-        profile_token = self._profile_event_start("muon")
-        try:
-            self._step_muon()
-        finally:
-            self._profile_event_end(profile_token)
+        if self._replicate_async:
+            # Phase C.4 fallback must be advanced before dispatching this
+            # step's post-update collectives so a tripped group degrades
+            # immediately.  Then pipeline each group: update it, enqueue its
+            # post-step scatter/broadcast, and continue with later groups.
+            update_replicate_fallback(self.model)
+            profile_token = self._profile_event_start("muon")
+            try:
+                self._step_muon_and_dispatch_groups_async()
+            finally:
+                self._profile_event_end(profile_token)
+        else:
+            # 2. Muon update on dedicated params
+            profile_token = self._profile_event_start("muon")
+            try:
+                self._step_muon()
+            finally:
+                self._profile_event_end(profile_token)
 
         # 3. AdamW update on FSDP2 params
         profile_token = self._profile_event_start("adamw")
@@ -397,33 +416,53 @@ class Muon(Optimizer):
         finally:
             self._profile_event_end(profile_token)
 
-        # 4. Advance the per-group async→sync fallback state machine
-        # (Phase C.4).  Reads ``_last_replicate_wait_us`` populated during
-        # the previous forward's ``_pre_forward_wait`` (only when
-        # ``DMUON_REPLICATE_PROFILE`` is set).  Must run BEFORE dispatch so
-        # a just-tripped flag affects this iteration.
-        update_replicate_fallback(self.model)
+        if not self._replicate_async:
+            # 4. Advance the per-group async→sync fallback state machine
+            # (Phase C.4).  Reads ``_last_replicate_wait_us`` populated during
+            # the previous forward's ``_pre_forward_wait`` (only when
+            # ``DMUON_REPLICATE_PROFILE`` is set).  Must run BEFORE dispatch so
+            # a just-tripped flag affects this iteration.
+            update_replicate_fallback(self.model)
 
-        # 5. Fan updated _owned_data from global owner to replicate peers.
-        # Phase C: by default dispatch async and let ``_pre_forward_wait``
-        # consume the event at the start of the next forward; set
-        # ``replicate_async=False`` on Muon construction to fall back to the
-        # Phase B sync path.  No-op in 1D shard-only mode either way.
-        profile_token = self._profile_event_start("replicate_broadcast")
-        try:
-            broadcast_fn(self.model)
-        finally:
-            self._profile_event_end(profile_token)
+            # 5. Fan updated _owned_data from global owner to replicate peers.
+            # Sync mode preserves the old full-step dispatch+wait contract.
+            profile_token = self._profile_event_start("replicate_broadcast")
+            try:
+                broadcast_all_updates(self.model)
+            finally:
+                self._profile_event_end(profile_token)
 
         self._grads_ready = False
         return loss
 
-    def _step_muon(self):
+    def _step_muon_and_dispatch_groups_async(self) -> None:
+        """Pipeline group-local Muon updates with post-step communication.
+
+        Group order follows the previous forward order.  Every rank dispatches
+        every group in the same order, while only the owner ranks do the local
+        Newton-Schulz work before their group's collective is enqueued.
+        """
+        for group in _ordered_post_step_groups(self.model):
+            owned_params = [
+                dp for dp in getattr(group, "params", ())
+                if getattr(dp, "is_owner", False)
+            ]
+            if owned_params:
+                self._step_muon(owned_params)
+
+            profile_token = self._profile_event_start("replicate_broadcast")
+            try:
+                _dispatch_post_step_async(group)
+            finally:
+                self._profile_event_end(profile_token)
+
+    def _step_muon(self, params=None):
         """Newton-Schulz orthogonalization with momentum on dedicated params."""
         group = self.param_groups[0]
         lr = group["lr"]
         mu = group["momentum"]
         wd = group["weight_decay"]
+        dedicated_params = self._dedicated_params if params is None else list(params)
 
         pt = self._profile_param_timer
         per_param = _balance_profile.per_param_enabled()
@@ -433,10 +472,10 @@ class Muon(Optimizer):
         # Synchronise the compute stream once before the loop so the NS
         # read below sees that buffer.  No-op when no TP path is live
         # (reduce_stream is idle or already drained).
-        if any(dp.tp_group is not None for dp in self._dedicated_params):
+        if any(dp.tp_group is not None for dp in dedicated_params):
             torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
 
-        for dp in self._dedicated_params:
+        for dp in dedicated_params:
             if dp._reduced_grad is None:
                 continue
 
