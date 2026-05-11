@@ -36,6 +36,7 @@ from .checkpoint import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
+from .diagnostics import format_param_group_summary, summarize_param_groups
 from .grad_clip import (
     MuonGradClipStats,
     clip_grad_norm_,
@@ -96,6 +97,8 @@ __all__ = [
     "set_model_state_dict",
     "get_optimizer_state_dict",
     "set_optimizer_state_dict",
+    "summarize_param_groups",
+    "format_param_group_summary",
     "YOU_COEFFICIENTS",
     "POLAR_EXPRESS_COEFFICIENTS",
 ]

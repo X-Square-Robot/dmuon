@@ -24,6 +24,7 @@ Usage::
 """
 
 from typing import Any
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -580,7 +581,39 @@ def set_optimizer_state_dict(
 
     # 3. Load param group hyperparameters.
     if "param_groups" in state_dict:
-        for saved_pg, current_pg in zip(state_dict["param_groups"], optimizer.param_groups):
+        saved_groups = state_dict["param_groups"]
+        current_groups = optimizer.param_groups
+        if len(saved_groups) != len(current_groups):
+            warnings.warn(
+                "DMuon optimizer param group count mismatch while loading "
+                f"checkpoint: saved={len(saved_groups)} current={len(current_groups)}. "
+                "Only the matching prefix will be restored.",
+                stacklevel=2,
+            )
+        for idx, (saved_pg, current_pg) in enumerate(zip(saved_groups, current_groups)):
+            for structural_key in ("use_muon", "subgroup_type"):
+                if (
+                    structural_key in saved_pg
+                    and structural_key in current_pg
+                    and saved_pg[structural_key] != current_pg[structural_key]
+                ):
+                    raise RuntimeError(
+                        "DMuon optimizer param group structure mismatch at "
+                        f"index {idx}: {structural_key} saved="
+                        f"{saved_pg[structural_key]!r} current="
+                        f"{current_pg[structural_key]!r}"
+                    )
+            if (
+                "group_name" in saved_pg
+                and "group_name" in current_pg
+                and saved_pg["group_name"] != current_pg["group_name"]
+            ):
+                warnings.warn(
+                    "DMuon optimizer param group name mismatch while loading "
+                    f"checkpoint at index {idx}: saved={saved_pg['group_name']!r} "
+                    f"current={current_pg['group_name']!r}",
+                    stacklevel=2,
+                )
             for k, v in saved_pg.items():
                 if k != "params":
                     current_pg[k] = v

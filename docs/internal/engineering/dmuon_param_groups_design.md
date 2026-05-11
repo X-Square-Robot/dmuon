@@ -1,6 +1,23 @@
 # DMuon Param Groups Engineering Design
 
-Status: draft
+Status: implementation in progress
+
+Last updated: 2026-05-11
+
+Current worktree status:
+
+- Implemented: constructor lowering, subgroup sidecar mappings, Muon/AdamW
+  subgroup update loops, async communication-order preservation, checkpoint
+  structural validation, explicit checkpoint metadata tests, and DDP/FSDP2/TP2
+  plus HSDP*TP2 tests.
+- Verified: default API compatibility on DDP/FSDP2/HSDP paths; DDP semantic
+  param groups; FSDP2 semantic param groups; scheduler LR mutation over
+  lowered subgroups; checkpoint metadata roundtrip/mismatch behavior; TP2
+  and HSDP*TP2 different-LR delta behavior on TP-sharded dedicated parameters;
+  HSDP*TP2 sync/async loss consistency with semantic param groups; local
+  diagnostics summaries for DDP/FSDP2/TP/HSDP*TP.
+- Not finished: public API docs, Wall-X/VLA smoke, and a focused stale
+  pre-wrapping parameter validation test.
 
 Owner: DMuon optimizer runtime
 
@@ -451,68 +468,116 @@ Warn on:
 
 ### Phase A: Constructor Lowering
 
-1. Add `param_groups: Optional[list[dict]] = None` to `Muon.__init__`.
-2. Split current dedicated discovery into all-dedicated vs owned-dedicated.
-3. Build object-id maps for dedicated placeholders/original params and AdamW
+Status: implemented in worktree.
+
+1. Done: add `param_groups: Optional[list[dict]] = None` to `Muon.__init__`.
+2. Done: split dedicated discovery into all-dedicated vs owned-dedicated.
+3. Done: build object-id maps for dedicated placeholders/original params and AdamW
    params.
-4. Normalize user groups and validate duplicate/missing coverage.
-5. Lower semantic groups into stable `/muon` and `/adamw` optimizer groups.
-6. Preserve current two-group behavior when `param_groups is None`.
+4. Done: normalize user groups and validate duplicate/missing coverage.
+5. Done: lower semantic groups into stable `/muon` and `/adamw` optimizer
+   groups.
+6. Done: preserve current two-group behavior when `param_groups is None`.
 
 ### Phase B: Update Loops
 
-1. Refactor `_step_muon(params=None)` into a lower-level
+Status: implemented in worktree.
+
+1. Done: refactor `_step_muon(params=None)` into a lower-level
    `_step_muon_params(params, group)`.
-2. Refactor `_step_adamw()` to iterate AdamW subgroups.
-3. Update sync path to iterate Muon subgroups.
-4. Update async path to keep `_ordered_post_step_groups(model)` as the outer
+2. Done: refactor `_step_adamw()` to iterate AdamW subgroups.
+3. Done: update sync path to iterate Muon subgroups.
+4. Done: update async path to keep `_ordered_post_step_groups(model)` as the outer
    loop and look up per-param Muon subgroup metadata inside the communication
    group.
 
 ### Phase C: Checkpoint and Scheduler
 
-1. Store subgroup metadata in `param_groups`.
-2. Add mismatch validation in `set_optimizer_state_dict()`.
-3. Add scheduler unit tests using `LambdaLR`.
+Status: implemented in worktree.
+
+1. Done: store subgroup metadata in `param_groups`.
+2. Done: add mismatch validation in `set_optimizer_state_dict()` for
+   `use_muon` and `subgroup_type`, with warning-only behavior for group-name
+   mismatch and group-count mismatch.
+3. Done: add scheduler coverage using `LambdaLR` in the DDP distributed
+   correctness test.
+4. Done: add explicit param-group checkpoint roundtrip coverage.
+5. Done: add explicit checkpoint mismatch tests for `use_muon`,
+   `subgroup_type`, and `group_name`.
 
 ### Phase D: Diagnostics
 
-1. Add initialization summary logging.
-2. Add `summarize_param_groups(model, optimizer, max_rows=...)`.
-3. Add docs/examples for Wall-X-style action LR groups.
+Status: implemented in worktree.
+
+1. Done: add `summarize_param_groups(model, optimizer, max_rows=...)`.
+   The helper is local-rank only and performs no collective communication.
+2. Done: add `format_param_group_summary(summary)` for compact human-readable
+   logs.
+3. Done: include subgroup-level fields: group name, semantic group name,
+   subgroup type, LR/WD/momentum/betas/eps, local parameter count, dummy count,
+   dedicated count, owned dedicated count, TP-sharded dedicated count, and
+   AdamW local parameter count.
+4. Done: include parameter-detail rows with FQN, route (`muon` or `adamw`),
+   group, local/full shapes, owner metadata, and TP metadata, bounded by
+   `max_rows`.
+5. Done: add distributed assertions in DDP, FSDP2, DP2*TP2, and HSDP*TP2 tests
+   that the diagnostics expose action groups and TP-sharded Muon groups.
+6. Remaining: public docs / Wall-X training-log example once the real Wall-X
+   smoke is wired.
 
 ### Phase E: Distributed Validation
 
+Status: partially complete.
+
 Run CPU/unit tests first, then distributed tests on remote GPU:
 
-1. 2-GPU DDP param group split.
-2. 2-GPU FSDP2 param group split.
-3. 4-GPU HSDP async vs sync loss consistency.
-4. TP2 or HSDP*TP2 different-LR delta check.
-5. Existing DDP/FSDP2/HSDP/TP regression suite.
+1. Done: 2-GPU DDP param group split and full DDP P1 suite.
+2. Done: 2-GPU FSDP2 param group split.
+3. Done: 4-GPU HSDP async vs sync loss consistency.
+4. Done: 4-GPU DP2*TP2 different-LR delta check for TP-sharded dedicated
+   parameters.
+5. Done: 8-GPU HSDP2*Shard2*TP2 param-group regression, including different-LR
+   delta and sync/async loss consistency.
 
 ## 16. Test Plan
 
 ### Unit Tests
 
-1. `param_groups=None` preserves two groups and current step behavior.
-2. User semantic groups lower to stable `/muon` and `/adamw` subgroups.
-3. Duplicate parameter raises.
-4. Missing trainable parameter raises.
-5. Stale/unmanaged parameter raises.
-6. Scheduler scales all subgroup LR values while preserving ratios.
-7. Checkpoint restores subgroup hyperparameters.
-8. Checkpoint raises on `use_muon`/`subgroup_type` mismatch.
+1. Covered by distributed regression: `param_groups=None` preserves two groups
+   and current step behavior.
+2. Covered by distributed tests: user semantic groups lower to stable `/muon`
+   and `/adamw` subgroups.
+3. Covered by DDP test: duplicate parameter raises.
+4. Covered by DDP test: missing trainable parameter raises.
+5. Covered by constructor validation path; needs a focused test for stale
+   pre-wrapping params.
+6. Covered by DDP test: scheduler scales all subgroup LR values while
+   preserving ratios.
+7. Covered by DDP test: checkpoint restores subgroup hyperparameters.
+8. Covered by DDP test: checkpoint raises on `use_muon`/`subgroup_type`
+   mismatch and warns on same-structure `group_name` mismatch.
+9. Covered by DDP/FSDP2/TP/HSDP*TP tests: diagnostics expose lowered action
+   groups, route metadata, and TP-sharded dedicated counts.
 
 ### Distributed Tests
 
-1. DDP: action Muon subgroup and action AdamW subgroup both use 2x LR.
-2. FSDP2: same split and scheduler behavior under sharded AdamW params.
-3. HSDP async: loss matches sync within existing tolerance.
-4. TP2: `update_full.mul_(-lr * scale)` uses per-param group LR.
-5. HSDP*TP2: replicate broadcast remains ordered and loss consistent.
+1. Done: DDP action Muon subgroup and action AdamW subgroup both use 2x LR.
+2. Partial: FSDP2 split is covered; FSDP2 scheduler behavior is indirectly
+   covered by standard PyTorch optimizer group mutation and still needs a
+   direct FSDP2 assertion if required.
+3. Done: HSDP async loss matches sync bit-for-bit in the existing 4-GPU test.
+4. Done: TP2 `update_full.mul_(-lr * scale)` uses per-param group LR. The
+   `tests/distributed/test_tp_muon_step.py param_groups_lr` scenario compares
+   identical initial weights/input with action LR 1x vs 2x and checks that
+   action TP-sharded dedicated deltas scale by 2 while base deltas stay 1x.
+5. Done: HSDP*TP2 replicate broadcast remains ordered and loss consistent with
+   param groups. The `tests/distributed/test_tp_muon_step.py
+   hsdp_tp_param_groups` scenario runs on an HSDP2*Shard2*TP2 mesh, checks
+   action/base delta ratios, then compares sync vs async loss trajectories.
 
 ### Wall-X Smoke
+
+Status: not started.
 
 Run one short Wall-X/VLA job with DMuon param groups and verify:
 

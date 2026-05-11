@@ -253,7 +253,95 @@ def test_muon_nesterov(rank, world_size, device, mesh):
 
 
 # ---------------------------------------------------------------------------
-# Test 4: TP params — pre-T2 guard.
+# Test 4: PyTorch-style param_groups on FSDP2-wrapped model
+# ---------------------------------------------------------------------------
+
+def test_muon_param_groups_fsdp2(rank, world_size, device, mesh):
+    torch.manual_seed(0)
+    model = TinyModel().to(device)
+
+    dmuon.dedicate_params(
+        model, mesh,
+        predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    )
+
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh)
+    fully_shard(model, mesh=mesh)
+
+    base_params = []
+    action_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("layers.0."):
+            action_params.append(param)
+        else:
+            base_params.append(param)
+
+    optimizer = dmuon.Muon(
+        model,
+        lr=0.01,
+        ns_steps=5,
+        adamw_lr=0.001,
+        param_groups=[
+            {
+                "params": base_params,
+                "group_name": "base",
+                "muon_lr": 0.01,
+                "adamw_lr": 0.001,
+                "adamw_weight_decay": 0.0,
+            },
+            {
+                "params": action_params,
+                "group_name": "action",
+                "muon_lr": 0.02,
+                "adamw_lr": 0.002,
+                "adamw_weight_decay": 0.0,
+            },
+        ],
+    )
+
+    expected = [
+        ("base/muon", True, "muon", 0.01),
+        ("base/adamw", False, "adamw", 0.001),
+        ("action/muon", True, "muon", 0.02),
+        ("action/adamw", False, "adamw", 0.002),
+    ]
+    actual = [
+        (
+            group["group_name"],
+            group["use_muon"],
+            group["subgroup_type"],
+            group["lr"],
+        )
+        for group in optimizer.param_groups
+    ]
+    assert actual == expected
+    summary = dmuon.summarize_param_groups(model, optimizer, max_rows=20)
+    groups = {group["group_name"]: group for group in summary["groups"]}
+    assert summary["num_groups"] == 4
+    assert groups["action/muon"]["lr"] == 0.02
+    assert groups["action/muon"]["dedicated_param_count"] > 0
+    assert groups["action/adamw"]["adamw_param_count"] > 0
+    assert any(
+        row["route"] == "muon" and row["group_name"] == "action/muon"
+        for row in summary["parameters"]
+    )
+    assert "action/muon" in dmuon.format_param_group_summary(summary)
+
+    optimizer.zero_grad()
+    x = torch.randn(4, 256, device=device)
+    loss = model(x)
+    loss.backward()
+    optimizer.step()
+
+    torch.cuda.synchronize()
+    log(rank, "PASSED: test_muon_param_groups_fsdp2")
+
+
+# ---------------------------------------------------------------------------
+# Test 5: TP params — pre-T2 guard.
 #
 # The Gram-AR TP path was removed; the All-to-All path lands in T2.  Until
 # T2 ships, ``muon.step()`` must trip a ``NotImplementedError`` when any
@@ -358,6 +446,7 @@ if __name__ == "__main__":
         "reduced_grad": test_muon_reduced_grad_all_set,
         "momentum": test_muon_momentum_accumulation,
         "nesterov": test_muon_nesterov,
+        "param_groups_fsdp2": test_muon_param_groups_fsdp2,
         "tp_path": test_muon_tp_path,
     }
 

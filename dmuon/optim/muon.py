@@ -45,6 +45,10 @@ class Muon(Optimizer):
         adamw_betas: AdamW beta coefficients.
         adamw_weight_decay: AdamW weight decay.
         adamw_eps: AdamW epsilon.
+        param_groups: Optional PyTorch-style semantic parameter groups. Each
+            user group is lowered into a Muon subgroup and an AdamW subgroup
+            so schedulers and checkpoint metadata can keep per-group
+            hyperparameters without exposing DMuon internals.
         ns_backend: Newton-Schulz backend configuration. Accepts a string
             shorthand (``"gram"`` or ``"direct"``) or a fully configured
             :class:`~dmuon.NewtonSchulz` object for custom coefficients::
@@ -95,6 +99,7 @@ class Muon(Optimizer):
         adamw_betas: tuple[float, float] = (0.9, 0.999),
         adamw_weight_decay: float = 0.01,
         adamw_eps: float = 1e-8,
+        param_groups: Optional[list[dict]] = None,
         ns_backend: Union[str, NewtonSchulz] = "gram",
         nesterov: bool = True,
         replicate_async: bool = True,
@@ -119,17 +124,23 @@ class Muon(Optimizer):
         # waited synchronously at the end of step().
         self._replicate_async = replicate_async
 
-        # Discover dedicated params owned by this rank
+        # Discover all dedicated params, and the subset owned by this rank.
         comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
         if comm_ctx is None:
             raise ValueError(
                 "Model has no _dedicated_comm_ctx. Call dmuon.dedicate_params() first."
             )
         self._comm_ctx = comm_ctx
+        self._all_dedicated_params = []
         self._dedicated_params = []
+        seen_dps: set[int] = set()
         for module in model.modules():
             if hasattr(module, "_dedicated_state"):
                 for dp in module._dedicated_state.group.params:
+                    if id(dp) in seen_dps:
+                        continue
+                    seen_dps.add(id(dp))
+                    self._all_dedicated_params.append(dp)
                     if dp.is_owner:
                         self._dedicated_params.append(dp)
 
@@ -160,7 +171,7 @@ class Muon(Optimizer):
             for p in model.parameters()
         )
         if (
-            self._dedicated_params
+            self._all_dedicated_params
             and non_dedicated_exists
             and not (fsdp_hit or replicate_hit)
         ):
@@ -172,44 +183,348 @@ class Muon(Optimizer):
                 "constructing Muon."
             )
 
-        # Build param_groups for Optimizer base class.
-        # Group 0: placeholders for dedicated params (for LR scheduler compat).
-        #   FSDP2 path uses the 0-size _placeholder; DDP path uses the live
-        #   nn.Parameter (there is no separate placeholder, and the LR
-        #   scheduler does not care about the tensor content — it only needs
-        #   a stable Parameter ref).
-        # Group 1: non-dedicated params (FSDP2-sharded or DDP-replicated).
-        dedicated_placeholders = [
-            # FSDP2 path has ``_placeholder`` (0-size nn.Parameter); DDP path
-            # has ``_orig_param`` (live full Parameter). Pick whichever exists
-            # — ``or`` cannot be used because bool() on an empty Tensor is
-            # ambiguous.
-            dp._placeholder if hasattr(dp, "_placeholder") else dp._orig_param
-            for dp in self._dedicated_params
-        ]
-        param_groups = [
-            {
-                "params": dedicated_placeholders if dedicated_placeholders else [torch.zeros(1)],
-                "lr": lr,
-                "momentum": momentum,
-                "weight_decay": weight_decay,
-            },
-            {
-                "params": list(self._fsdp_params) if self._fsdp_params else [torch.zeros(1)],
-                "lr": adamw_lr,
-                "betas": adamw_betas,
-                "weight_decay": adamw_weight_decay,
-                "eps": adamw_eps,
-            },
-        ]
+        self._dummy_params: list[nn.Parameter] = []
+        self._muon_group_dps: dict[int, list] = {}
+        self._adamw_group_params: dict[int, list[nn.Parameter]] = {}
+        self._dp_to_muon_group_idx: dict[int, int] = {}
+        self._adamw_param_to_group_idx: dict[int, int] = {}
+
+        optimizer_groups = self._build_optimizer_param_groups(
+            param_groups,
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            adamw_lr=adamw_lr,
+            adamw_betas=adamw_betas,
+            adamw_weight_decay=adamw_weight_decay,
+            adamw_eps=adamw_eps,
+        )
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
-        super().__init__(param_groups, defaults)
+        super().__init__(optimizer_groups, defaults)
 
         self._profile_step_idx = 0
         self._profile_param_timer: _balance_profile.ParamTimer = _balance_profile.ParamTimer()
         self._step_profile_enabled = False
         self._last_step_profile: dict[str, object] = {}
         self._last_step_profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+
+    def _dummy_param(self) -> nn.Parameter:
+        device = torch.device("cpu")
+        dtype = torch.float32
+        for p in self.model.parameters():
+            device = getattr(p, "device", device)
+            dtype = getattr(p, "dtype", dtype)
+            break
+        dummy = nn.Parameter(torch.zeros(1, device=device, dtype=dtype), requires_grad=False)
+        self._dummy_params.append(dummy)
+        return dummy
+
+    @staticmethod
+    def _param_ref_for_dp(dp):
+        if hasattr(dp, "_placeholder"):
+            return dp._placeholder
+        return dp._orig_param
+
+    @staticmethod
+    def _param_refs_for_dp(dp) -> list[torch.Tensor]:
+        refs = []
+        if hasattr(dp, "_placeholder"):
+            refs.append(dp._placeholder)
+        if hasattr(dp, "_orig_param"):
+            refs.append(dp._orig_param)
+        return refs
+
+    @staticmethod
+    def _group_value(group: dict, primary: str, secondary: Optional[str], default):
+        if primary in group:
+            return group[primary]
+        if secondary is not None and secondary in group:
+            return group[secondary]
+        return default
+
+    @staticmethod
+    def _normalize_group_params(params) -> list[torch.Tensor]:
+        if isinstance(params, torch.Tensor):
+            return [params]
+        try:
+            return list(params)
+        except TypeError as exc:
+            raise TypeError(
+                "dmuon.Muon param_groups entries must use a Tensor or an "
+                "iterable of Tensors under the 'params' key"
+            ) from exc
+
+    def _make_muon_group(
+        self,
+        *,
+        params: list[torch.Tensor],
+        semantic_name: str,
+        lr: float,
+        momentum: float,
+        weight_decay: float,
+    ) -> dict:
+        return {
+            "params": params if params else [self._dummy_param()],
+            "lr": lr,
+            "momentum": momentum,
+            "weight_decay": weight_decay,
+            "use_muon": True,
+            "group_name": f"{semantic_name}/muon",
+            "semantic_group_name": semantic_name,
+            "subgroup_type": "muon",
+        }
+
+    def _make_adamw_group(
+        self,
+        *,
+        params: list[nn.Parameter],
+        semantic_name: str,
+        lr: float,
+        betas: tuple[float, float],
+        weight_decay: float,
+        eps: float,
+    ) -> dict:
+        return {
+            "params": params if params else [self._dummy_param()],
+            "lr": lr,
+            "betas": betas,
+            "weight_decay": weight_decay,
+            "eps": eps,
+            "use_muon": False,
+            "group_name": f"{semantic_name}/adamw",
+            "semantic_group_name": semantic_name,
+            "subgroup_type": "adamw",
+        }
+
+    def _build_optimizer_param_groups(
+        self,
+        user_param_groups: Optional[list[dict]],
+        *,
+        lr: float,
+        momentum: float,
+        weight_decay: float,
+        adamw_lr: float,
+        adamw_betas: tuple[float, float],
+        adamw_weight_decay: float,
+        adamw_eps: float,
+    ) -> list[dict]:
+        if user_param_groups is None:
+            return self._build_default_param_groups(
+                lr=lr,
+                momentum=momentum,
+                weight_decay=weight_decay,
+                adamw_lr=adamw_lr,
+                adamw_betas=adamw_betas,
+                adamw_weight_decay=adamw_weight_decay,
+                adamw_eps=adamw_eps,
+            )
+        return self._build_semantic_param_groups(
+            user_param_groups,
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            adamw_lr=adamw_lr,
+            adamw_betas=adamw_betas,
+            adamw_weight_decay=adamw_weight_decay,
+            adamw_eps=adamw_eps,
+        )
+
+    def _build_default_param_groups(
+        self,
+        *,
+        lr: float,
+        momentum: float,
+        weight_decay: float,
+        adamw_lr: float,
+        adamw_betas: tuple[float, float],
+        adamw_weight_decay: float,
+        adamw_eps: float,
+    ) -> list[dict]:
+        muon_refs = [self._param_ref_for_dp(dp) for dp in self._dedicated_params]
+        groups = [
+            self._make_muon_group(
+                params=muon_refs,
+                semantic_name="default",
+                lr=lr,
+                momentum=momentum,
+                weight_decay=weight_decay,
+            ),
+            self._make_adamw_group(
+                params=list(self._fsdp_params),
+                semantic_name="default",
+                lr=adamw_lr,
+                betas=adamw_betas,
+                weight_decay=adamw_weight_decay,
+                eps=adamw_eps,
+            ),
+        ]
+        self._muon_group_dps[0] = list(self._dedicated_params)
+        self._adamw_group_params[1] = list(self._fsdp_params)
+        for dp in self._all_dedicated_params:
+            self._dp_to_muon_group_idx[id(dp)] = 0
+        for p in self._fsdp_params:
+            self._adamw_param_to_group_idx[id(p)] = 1
+        return groups
+
+    def _build_semantic_param_groups(
+        self,
+        user_param_groups,
+        *,
+        lr: float,
+        momentum: float,
+        weight_decay: float,
+        adamw_lr: float,
+        adamw_betas: tuple[float, float],
+        adamw_weight_decay: float,
+        adamw_eps: float,
+    ) -> list[dict]:
+        if isinstance(user_param_groups, dict):
+            raise TypeError("dmuon.Muon param_groups must be a list of dicts, not a dict")
+        semantic_groups = list(user_param_groups)
+        if not semantic_groups:
+            raise ValueError("dmuon.Muon param_groups must not be empty")
+
+        param_to_dp: dict[int, object] = {}
+        for dp in self._all_dedicated_params:
+            for ref in self._param_refs_for_dp(dp):
+                param_to_dp[id(ref)] = dp
+        adamw_param_by_id = {id(p): p for p in self._fsdp_params}
+        model_param_names = {id(p): name for name, p in self.model.named_parameters()}
+
+        optimizer_groups: list[dict] = []
+        assigned: dict[tuple[str, int], str] = {}
+
+        for semantic_idx, user_group in enumerate(semantic_groups):
+            if not isinstance(user_group, dict):
+                raise TypeError(
+                    f"dmuon.Muon param_groups[{semantic_idx}] must be a dict"
+                )
+            if "params" not in user_group:
+                raise ValueError(
+                    f"dmuon.Muon param_groups[{semantic_idx}] is missing 'params'"
+                )
+
+            semantic_name = str(
+                user_group.get("group_name", user_group.get("name", f"group_{semantic_idx}"))
+            )
+            raw_params = self._normalize_group_params(user_group["params"])
+            muon_refs: list[torch.Tensor] = []
+            owned_muon_dps = []
+            all_muon_dps = []
+            adamw_params: list[nn.Parameter] = []
+
+            for param in raw_params:
+                if not isinstance(param, torch.Tensor):
+                    if hasattr(param, "_owned_data") and hasattr(param, "param_name"):
+                        raise TypeError(
+                            "dmuon.Muon param_groups must contain tensors, not "
+                            "DedicatedParam objects"
+                        )
+                    raise TypeError(
+                        f"dmuon.Muon param_groups[{semantic_idx}] contains "
+                        f"{type(param).__name__}, expected Tensor"
+                    )
+                if not getattr(param, "requires_grad", False):
+                    continue
+
+                param_id = id(param)
+                if param_id in param_to_dp:
+                    dp = param_to_dp[param_id]
+                    assignment_key = ("muon", id(dp))
+                    if assignment_key in assigned:
+                        raise ValueError(
+                            f"trainable parameter appears in multiple DMuon "
+                            f"param_groups: {assigned[assignment_key]} and {semantic_name}"
+                        )
+                    assigned[assignment_key] = semantic_name
+                    muon_refs.append(param)
+                    all_muon_dps.append(dp)
+                    if getattr(dp, "is_owner", False):
+                        owned_muon_dps.append(dp)
+                elif param_id in adamw_param_by_id:
+                    p = adamw_param_by_id[param_id]
+                    assignment_key = ("adamw", id(p))
+                    if assignment_key in assigned:
+                        raise ValueError(
+                            f"trainable parameter appears in multiple DMuon "
+                            f"param_groups: {assigned[assignment_key]} and {semantic_name}"
+                        )
+                    assigned[assignment_key] = semantic_name
+                    adamw_params.append(p)
+                else:
+                    name = model_param_names.get(param_id, "<not in current model>")
+                    raise RuntimeError(
+                        "dmuon.Muon param_groups contains a trainable parameter "
+                        f"that DMuon does not manage: {name}. Build param_groups "
+                        "from the wrapped model passed to Muon."
+                    )
+
+            muon_group_idx = len(optimizer_groups)
+            optimizer_groups.append(
+                self._make_muon_group(
+                    params=muon_refs,
+                    semantic_name=semantic_name,
+                    lr=self._group_value(user_group, "muon_lr", "lr", lr),
+                    momentum=self._group_value(user_group, "momentum", None, momentum),
+                    weight_decay=self._group_value(
+                        user_group, "muon_weight_decay", "weight_decay", weight_decay
+                    ),
+                )
+            )
+            self._muon_group_dps[muon_group_idx] = owned_muon_dps
+            for dp in all_muon_dps:
+                self._dp_to_muon_group_idx[id(dp)] = muon_group_idx
+
+            adamw_group_idx = len(optimizer_groups)
+            optimizer_groups.append(
+                self._make_adamw_group(
+                    params=adamw_params,
+                    semantic_name=semantic_name,
+                    lr=self._group_value(user_group, "adamw_lr", "lr", adamw_lr),
+                    betas=self._group_value(user_group, "adamw_betas", None, adamw_betas),
+                    weight_decay=self._group_value(
+                        user_group,
+                        "adamw_weight_decay",
+                        "weight_decay",
+                        adamw_weight_decay,
+                    ),
+                    eps=self._group_value(user_group, "adamw_eps", None, adamw_eps),
+                )
+            )
+            self._adamw_group_params[adamw_group_idx] = adamw_params
+            for p in adamw_params:
+                self._adamw_param_to_group_idx[id(p)] = adamw_group_idx
+
+        missing: list[str] = []
+        unmanaged: list[str] = []
+        for name, param in self.model.named_parameters():
+            if not getattr(param, "requires_grad", False):
+                continue
+            param_id = id(param)
+            if param_id in param_to_dp:
+                key = ("muon", id(param_to_dp[param_id]))
+            elif param_id in adamw_param_by_id:
+                key = ("adamw", id(adamw_param_by_id[param_id]))
+            else:
+                unmanaged.append(name)
+                continue
+            if key not in assigned:
+                missing.append(name)
+
+        if unmanaged:
+            preview = ", ".join(unmanaged[:8])
+            raise RuntimeError(
+                "dmuon.Muon found trainable model parameters that are not "
+                f"managed by DMuon: {preview}"
+            )
+        if missing:
+            preview = ", ".join(missing[:8])
+            raise RuntimeError(
+                "dmuon.Muon param_groups omitted trainable model parameters: "
+                f"{preview}"
+            )
+
+        return optimizer_groups
 
     @property
     def last_muon_grad_clip_stats(self) -> Optional[MuonGradClipStats]:
@@ -457,12 +772,37 @@ class Muon(Optimizer):
                 self._profile_event_end(profile_token)
 
     def _step_muon(self, params=None):
-        """Newton-Schulz orthogonalization with momentum on dedicated params."""
-        group = self.param_groups[0]
+        """Newton-Schulz orthogonalization with momentum on dedicated params.
+
+        With ``params=None`` this walks Muon optimizer subgroups.  With a
+        communication-group-local ``params`` list, it keeps that outer
+        communication order and only uses subgroup metadata for per-param
+        hyperparameters.
+        """
+        if params is None:
+            for group_idx, dedicated_params in self._muon_group_dps.items():
+                self._step_muon_params(dedicated_params, self.param_groups[group_idx])
+            return
+
+        by_group: dict[int, list] = {}
+        for dp in params:
+            group_idx = self._dp_to_muon_group_idx.get(id(dp))
+            if group_idx is None:
+                raise RuntimeError(
+                    f"DMuon dedicated param {getattr(dp, 'param_name', '<unknown>')} "
+                    "is not assigned to a Muon param group"
+                )
+            by_group.setdefault(group_idx, []).append(dp)
+
+        for group_idx, dedicated_params in by_group.items():
+            self._step_muon_params(dedicated_params, self.param_groups[group_idx])
+
+    def _step_muon_params(self, dedicated_params, group: dict) -> None:
+        """Apply one Muon subgroup's hyperparameters to dedicated params."""
         lr = group["lr"]
         mu = group["momentum"]
         wd = group["weight_decay"]
-        dedicated_params = self._dedicated_params if params is None else list(params)
+        dedicated_params = list(dedicated_params)
 
         pt = self._profile_param_timer
         per_param = _balance_profile.per_param_enabled()
@@ -590,13 +930,17 @@ class Muon(Optimizer):
 
     def _step_adamw(self):
         """AdamW update on FSDP2-managed symmetric params."""
-        group = self.param_groups[1]
+        for group_idx, params in self._adamw_group_params.items():
+            self._step_adamw_params(params, self.param_groups[group_idx])
+
+    def _step_adamw_params(self, params, group: dict) -> None:
+        """Apply one AdamW subgroup's hyperparameters to managed params."""
         lr = group["lr"]
         beta1, beta2 = group["betas"]
         wd = group["weight_decay"]
         eps = group["eps"]
 
-        for p in self._fsdp_params:
+        for p in params:
             if p.grad is None:
                 continue
 
