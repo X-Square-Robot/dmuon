@@ -22,6 +22,38 @@ mkdir -p "$OUT"
 
 port_base="${DMUON_ALIGN_PORT_BASE:-33100}"
 
+run_torchrun_with_port_retry() {
+    local key="$1"
+    local world="$2"
+    shift 2
+
+    local attempt=1
+    while true; do
+        local port="$port_base"
+        port_base=$((port_base + 1))
+        local attempt_log="${OUT}/${key}.attempt${attempt}.log"
+        echo "port=${port} attempt=${attempt}"
+
+        set +e
+        DMUON_ALIGN_PORT="$port" \
+            "$@" torchrun --nproc_per_node="$world" --master_port="$port" "$SCRIPT" \
+            2>&1 | tee "$attempt_log"
+        local status=${PIPESTATUS[0]}
+        set -e
+
+        if [[ "$status" -eq 0 ]]; then
+            rm -f "$attempt_log"
+            return 0
+        fi
+        if grep -q -E "EADDRINUSE|address already in use" "$attempt_log"; then
+            echo "${key}: port ${port} was busy; retrying" >&2
+            attempt=$((attempt + 1))
+            continue
+        fi
+        return "$status"
+    done
+}
+
 run_case() {
     local key="$1"
     local topology="$2"
@@ -30,19 +62,19 @@ run_case() {
     local world="$5"
     local model="${6:-tiny}"
     local tp_scope="${7:-mlp}"
-    local port="$port_base"
-    port_base=$((port_base + 1))
-    echo "=== ${key}: model=${model} topology=${topology} owner=${owner} mode=${mode} scope=${tp_scope} world=${world} port=${port} ==="
-    DMUON_ALIGN_TOPOLOGY="$topology" \
-    DMUON_ALIGN_MODE="$mode" \
-    DMUON_ALIGN_OWNER="$owner" \
-    DMUON_ALIGN_MODEL="$model" \
-    DMUON_ALIGN_TP_SCOPE="$tp_scope" \
-    DMUON_ALIGN_RUN="$key" \
-    DMUON_ALIGN_OUT="$OUT" \
-    DMUON_ALIGN_STEPS="$STEPS" \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    torchrun --nproc_per_node="$world" --master_port="$port" "$SCRIPT"
+    echo "=== ${key}: model=${model} topology=${topology} owner=${owner} mode=${mode} scope=${tp_scope} world=${world} ==="
+    run_torchrun_with_port_retry "$key" "$world" env \
+        DMUON_ALIGN_TOPOLOGY="$topology" \
+        DMUON_ALIGN_MODE="$mode" \
+        DMUON_ALIGN_OWNER="$owner" \
+        DMUON_ALIGN_MODEL="$model" \
+        DMUON_ALIGN_TP_SCOPE="$tp_scope" \
+        DMUON_ALIGN_RUN="$key" \
+        DMUON_ALIGN_OUT="$OUT" \
+        DMUON_ALIGN_STEPS="$STEPS" \
+        DMUON_NS_KERNEL="${DMUON_NS_KERNEL:-cublas}" \
+        CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}" \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 }
 
 run_expected_fail() {
@@ -52,33 +84,44 @@ run_expected_fail() {
     local model="$4"
     local tp_scope="$5"
     local pattern="$6"
-    local port="$port_base"
     local log="${OUT}/${key}.expected_failure.log"
-    port_base=$((port_base + 1))
-    echo "=== ${key}: EXPECT FAIL model=${model} topology=${topology} scope=${tp_scope} world=${world} port=${port} ==="
-    set +e
-    DMUON_ALIGN_TOPOLOGY="$topology" \
-    DMUON_ALIGN_MODE="sync" \
-    DMUON_ALIGN_OWNER="lpt" \
-    DMUON_ALIGN_MODEL="$model" \
-    DMUON_ALIGN_TP_SCOPE="$tp_scope" \
-    DMUON_ALIGN_RUN="$key" \
-    DMUON_ALIGN_OUT="$OUT" \
-    DMUON_ALIGN_STEPS="$STEPS" \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    torchrun --nproc_per_node="$world" --master_port="$port" "$SCRIPT" >"$log" 2>&1
-    local status=$?
-    set -e
-    if [[ "$status" -eq 0 ]]; then
-        echo "${key}: expected failure but command succeeded" >&2
-        exit 1
-    fi
-    if ! grep -q "$pattern" "$log"; then
-        echo "${key}: failure log did not contain expected pattern: ${pattern}" >&2
-        tail -n 80 "$log" >&2
-        exit 1
-    fi
-    echo "PASS expected failure: ${key} (${pattern})"
+    local attempt=1
+    while true; do
+        local port="$port_base"
+        port_base=$((port_base + 1))
+        echo "=== ${key}: EXPECT FAIL model=${model} topology=${topology} scope=${tp_scope} world=${world} port=${port} attempt=${attempt} ==="
+        set +e
+        DMUON_ALIGN_TOPOLOGY="$topology" \
+        DMUON_ALIGN_MODE="sync" \
+        DMUON_ALIGN_OWNER="lpt" \
+        DMUON_ALIGN_MODEL="$model" \
+        DMUON_ALIGN_TP_SCOPE="$tp_scope" \
+        DMUON_ALIGN_RUN="$key" \
+        DMUON_ALIGN_OUT="$OUT" \
+        DMUON_ALIGN_STEPS="$STEPS" \
+        DMUON_NS_KERNEL="${DMUON_NS_KERNEL:-cublas}" \
+        CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}" \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        torchrun --nproc_per_node="$world" --master_port="$port" "$SCRIPT" >"$log" 2>&1
+        local status=$?
+        set -e
+        if [[ "$status" -eq 0 ]]; then
+            echo "${key}: expected failure but command succeeded" >&2
+            exit 1
+        fi
+        if grep -q -E "EADDRINUSE|address already in use" "$log"; then
+            echo "${key}: port ${port} was busy; retrying" >&2
+            attempt=$((attempt + 1))
+            continue
+        fi
+        if ! grep -q "$pattern" "$log"; then
+            echo "${key}: failure log did not contain expected pattern: ${pattern}" >&2
+            tail -n 80 "$log" >&2
+            exit 1
+        fi
+        echo "PASS expected failure: ${key} (${pattern})"
+        break
+    done
 }
 
 run_tiny_full_matrix() {
@@ -213,6 +256,46 @@ def rel_gap(a, b, field):
     denom = max(max(abs(x) for x in xs), max(abs(y) for y in ys), 1e-8)
     return gap, gap / denom
 
+def has_step_digest(key):
+    return bool(data[key].get("weight_digest_each_step", True)) and (
+        len(data[key].get("weight_digest", [])) == len(data[key].get("losses", []))
+    )
+
+def assert_digest_gap(name, a, b, tol, *, relative):
+    if has_step_digest(a) and has_step_digest(b):
+        if relative:
+            assert_rel_gap(name, a, b, "weight_digest", tol)
+        else:
+            assert_gap(name, a, b, "weight_digest", tol)
+        return
+
+    ax = float(data[a]["final_weight_digest"])
+    bx = float(data[b]["final_weight_digest"])
+    gap = abs(ax - bx)
+    if relative:
+        denom = max(abs(ax), abs(bx), 1e-8)
+        rel = gap / denom
+        status = "PASS" if rel <= tol else "FAIL"
+        print(
+            f"{name:<42} {'final_digest':<14} rel={rel:.6e} abs={gap:.6e} "
+            f"tol={tol:.1e} {status}"
+        )
+        if rel > tol:
+            raise SystemExit(
+                f"{name} final digest relative gap {rel:.6e} exceeds "
+                f"tolerance {tol:.1e}"
+            )
+    else:
+        status = "PASS" if gap <= tol else "FAIL"
+        print(
+            f"{name:<42} {'final_digest':<14} gap={gap:.6e} "
+            f"tol={tol:.1e} {status}"
+        )
+        if gap > tol:
+            raise SystemExit(
+                f"{name} final digest gap {gap:.6e} exceeds tolerance {tol:.1e}"
+            )
+
 def assert_gap(name, a, b, field, tol):
     gap = max_gap(a, b, field)
     status = "PASS" if gap <= tol else "FAIL"
@@ -294,67 +377,35 @@ def maybe_check_family(prefixes):
         async_drain_key = f"{prefix}_async_drain"
         rank0 = f"{prefix}_rank0"
         if lpt in data and async_key in data:
-            if prefix.startswith(("llama_", "qwen_")):
-                assert_rel_gap(
-                    f"{prefix} sync vs async bounded",
-                    lpt,
-                    async_key,
-                    "losses",
-                    async_rel_tol,
-                )
-                assert_rel_gap(
-                    f"{prefix} sync vs async digest bounded",
-                    lpt,
-                    async_key,
-                    "weight_digest",
-                    async_digest_rel_tol,
-                )
-            else:
-                assert_gap(
-                    f"{prefix} sync vs async",
-                    lpt,
-                    async_key,
-                    "losses",
-                    strict,
-                )
-                assert_gap(
-                    f"{prefix} sync vs async",
-                    lpt,
-                    async_key,
-                    "weight_digest",
-                    strict,
-                )
+            assert_gap(
+                f"{prefix} sync vs async",
+                lpt,
+                async_key,
+                "losses",
+                strict,
+            )
+            assert_digest_gap(
+                f"{prefix} sync vs async",
+                lpt,
+                async_key,
+                strict,
+                relative=False,
+            )
         if lpt in data and async_drain_key in data:
-            if prefix.startswith(("llama_", "qwen_")):
-                assert_rel_gap(
-                    f"{prefix} sync vs async_drain bounded",
-                    lpt,
-                    async_drain_key,
-                    "losses",
-                    async_rel_tol,
-                )
-                assert_rel_gap(
-                    f"{prefix} sync vs async_drain digest bounded",
-                    lpt,
-                    async_drain_key,
-                    "weight_digest",
-                    async_digest_rel_tol,
-                )
-            else:
-                assert_gap(
-                    f"{prefix} sync vs async_drain",
-                    lpt,
-                    async_drain_key,
-                    "losses",
-                    strict,
-                )
-                assert_gap(
-                    f"{prefix} sync vs async_drain",
-                    lpt,
-                    async_drain_key,
-                    "weight_digest",
-                    strict,
-                )
+            assert_gap(
+                f"{prefix} sync vs async_drain",
+                lpt,
+                async_drain_key,
+                "losses",
+                strict,
+            )
+            assert_digest_gap(
+                f"{prefix} sync vs async_drain",
+                lpt,
+                async_drain_key,
+                strict,
+                relative=False,
+            )
         if lpt in data and rank0 in data:
             if prefix.startswith(("llama_", "qwen_")):
                 assert_rel_gap(

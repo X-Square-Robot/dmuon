@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 
 from dmuon._core.comm import DedicatedCommContext
+from dmuon._core.dynamo import dynamo_disable
 from dmuon._core.owner_rank import OwnerCoord
 
 from .param import DedicatedParamDDP
@@ -79,7 +80,11 @@ class DedicatedParamGroupDDP:
 
         # Event / pending-reduce machinery
         self._post_reduce_event: Optional[torch.cuda.Event] = None
-        self._pending_reduce: list[tuple[Optional[torch.Tensor], list[DedicatedParamDDP]]] = []
+        self._muon_grad_ready_event: Optional[torch.cuda.Event] = None
+        self._muon_grad_ready_refs: list[torch.Tensor] = []
+        self._pending_reduce: list[
+            tuple[Optional[torch.Tensor], list[DedicatedParamDDP]]
+        ] = []
 
         # Post-step broadcast state
         self._post_step_broadcast_event: Optional[torch.cuda.Event] = None
@@ -110,18 +115,23 @@ class DedicatedParamGroupDDP:
 
     # ---- interface parity with DedicatedParamGroup (no-ops) -----------------
 
+    @dynamo_disable
     def unshard(self) -> None:
         """DDP path: parameter is always live, nothing to allocate."""
 
+    @dynamo_disable
     def wait_for_unshard(self) -> None:
         """DDP path: no pending unshard event."""
 
+    @dynamo_disable
     def reshard(self) -> None:
         """DDP path: never resharded — no storage to free."""
 
+    @dynamo_disable
     def _backward_prefetch(self) -> None:
         """DDP path: no unshard work to prefetch."""
 
+    @dynamo_disable
     def _record_post_forward(self) -> None:
         """Record this group's position in the forward order for post-step
         broadcast scheduling, mirroring DedicatedParamGroup.
@@ -132,6 +142,7 @@ class DedicatedParamGroupDDP:
 
     # ---- gradient reduction -------------------------------------------------
 
+    @dynamo_disable
     def reduce_grads(self) -> None:
         """Dispatch one-stage reduce-to-owner on ``dp_group``.
 
@@ -196,27 +207,57 @@ class DedicatedParamGroupDDP:
 
         self._post_reduce_event = reduce_stream.record_event()
 
-    def wait_for_reduce(self) -> None:
+    @dynamo_disable
+    def wait_for_reduce(
+        self, stream: Optional[torch.cuda.Stream] = None
+    ) -> Optional[torch.cuda.Event]:
         """Wait for pending reduces and save owner-side gradient."""
         if self._post_reduce_event is None:
-            return
-        current_stream = torch.cuda.current_stream()
-        current_stream.wait_event(self._post_reduce_event)
+            return None
+
+        target_stream = stream if stream is not None else torch.cuda.current_stream()
+        if stream is None:
+            target_stream.wait_event(self._post_reduce_event)
+        else:
+            with torch.cuda.stream(stream):
+                target_stream.wait_event(self._post_reduce_event)
         self._post_reduce_event = None
 
-        for grad_buf, plist in self._pending_reduce:
-            if grad_buf is None:
-                continue
-            p = plist[0]
-            if not p.is_owner:
-                continue
-            new_grad = grad_buf.view(p._orig_size)
-            if p._reduced_grad is not None:
-                p._reduced_grad.add_(new_grad)
-            else:
-                p._reduced_grad = new_grad.clone()
+        stream_ctx = torch.cuda.stream(stream) if stream is not None else None
+        if stream_ctx is None:
+            for grad_buf, plist in self._pending_reduce:
+                if grad_buf is None:
+                    continue
+                p = plist[0]
+                if not p.is_owner:
+                    continue
+                new_grad = grad_buf.view(p._orig_size)
+                if p._reduced_grad is not None:
+                    p._reduced_grad.add_(new_grad)
+                else:
+                    p._reduced_grad = new_grad.clone()
+        else:
+            with stream_ctx:
+                for grad_buf, plist in self._pending_reduce:
+                    if grad_buf is None:
+                        continue
+                    p = plist[0]
+                    if not p.is_owner:
+                        continue
+                    new_grad = grad_buf.view(p._orig_size)
+                    if p._reduced_grad is not None:
+                        p._reduced_grad.add_(new_grad)
+                    else:
+                        p._reduced_grad = new_grad.clone()
 
+        self._muon_grad_ready_refs = [
+            grad_buf
+            for grad_buf, _plist in self._pending_reduce
+            if grad_buf is not None
+        ]
         self._pending_reduce = []
+        self._muon_grad_ready_event = target_stream.record_event()
+        return self._muon_grad_ready_event
 
     # ---- post-step broadcast (owner → all ranks on dp_group) ----------------
 
@@ -272,8 +313,9 @@ class DedicatedParamGroupDDP:
         ``_pre_forward_wait`` before the live parameter is read.
         """
         if self._post_step_broadcast_state is not None:
+            group_name = getattr(self, "_debug_name", "<unknown>")
             raise RuntimeError(
-                "post_step_broadcast_async: previous event still pending; "
+                f"post_step_broadcast_async[{group_name}]: previous event still pending; "
                 "pre_forward_wait was not consumed before the next dispatch"
             )
         self.post_step_broadcast_sync()
@@ -290,6 +332,7 @@ class DedicatedParamGroupDDP:
             event=evt,
         )
 
+    @dynamo_disable
     def _pre_forward_wait(self) -> None:
         """Consume any pending post-step broadcast event before the next
         forward reads ``nn.Parameter.data``. No-op when IDLE.

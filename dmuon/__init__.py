@@ -36,7 +36,12 @@ from .checkpoint import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
-from .diagnostics import format_param_group_summary, summarize_param_groups
+from .diagnostics import (
+    format_param_group_summary,
+    format_post_step_group_summary,
+    summarize_param_groups,
+    summarize_post_step_groups,
+)
 from .grad_clip import (
     MuonGradClipStats,
     clip_grad_norm_,
@@ -59,6 +64,7 @@ from .utils import (
     get_dedicated_params,
     get_owned_params,
     no_sync,
+    prepare_muon_grads,
     reset_replicate_fallback,
     wait_all_post_step_broadcasts,
     wait_all_reduces,
@@ -86,6 +92,7 @@ __all__ = [
     "register_muon_grad_clip_strategy",
     "MuonGradClipStats",
     "no_sync",
+    "prepare_muon_grads",
     "wait_all_reduces",
     "wait_all_replicate_broadcasts",
     "wait_all_post_step_broadcasts",
@@ -99,6 +106,8 @@ __all__ = [
     "set_optimizer_state_dict",
     "summarize_param_groups",
     "format_param_group_summary",
+    "summarize_post_step_groups",
+    "format_post_step_group_summary",
     "YOU_COEFFICIENTS",
     "POLAR_EXPRESS_COEFFICIENTS",
 ]

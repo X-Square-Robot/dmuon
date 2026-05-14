@@ -20,8 +20,10 @@ from ..utils import (
     _dispatch_post_step_async,
     _ordered_post_step_groups,
     broadcast_all_updates,
+    prepare_group_muon_grads,
+    prepare_muon_grads,
     update_replicate_fallback,
-    wait_all_reduces,
+    wait_group_muon_grads,
 )
 from .newton_schulz import NewtonSchulz
 
@@ -143,6 +145,10 @@ class Muon(Optimizer):
                     self._all_dedicated_params.append(dp)
                     if dp.is_owner:
                         self._dedicated_params.append(dp)
+        self._has_tp_dedicated = any(
+            getattr(dp, "tp_group", None) is not None
+            for dp in self._all_dedicated_params
+        )
 
         # Discover FSDP2-managed params AND DDP-replicated params. Both go
         # into the same AdamW param group downstream. ``_fsdp_params`` keeps
@@ -203,10 +209,14 @@ class Muon(Optimizer):
         super().__init__(optimizer_groups, defaults)
 
         self._profile_step_idx = 0
-        self._profile_param_timer: _balance_profile.ParamTimer = _balance_profile.ParamTimer()
+        self._profile_param_timer: _balance_profile.ParamTimer = (
+            _balance_profile.ParamTimer()
+        )
         self._step_profile_enabled = False
         self._last_step_profile: dict[str, object] = {}
-        self._last_step_profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self._last_step_profile_events: list[
+            tuple[str, torch.cuda.Event, torch.cuda.Event]
+        ] = []
 
     def _dummy_param(self) -> nn.Parameter:
         device = torch.device("cpu")
@@ -215,7 +225,9 @@ class Muon(Optimizer):
             device = getattr(p, "device", device)
             dtype = getattr(p, "dtype", dtype)
             break
-        dummy = nn.Parameter(torch.zeros(1, device=device, dtype=dtype), requires_grad=False)
+        dummy = nn.Parameter(
+            torch.zeros(1, device=device, dtype=dtype), requires_grad=False
+        )
         self._dummy_params.append(dummy)
         return dummy
 
@@ -379,7 +391,9 @@ class Muon(Optimizer):
         adamw_eps: float,
     ) -> list[dict]:
         if isinstance(user_param_groups, dict):
-            raise TypeError("dmuon.Muon param_groups must be a list of dicts, not a dict")
+            raise TypeError(
+                "dmuon.Muon param_groups must be a list of dicts, not a dict"
+            )
         semantic_groups = list(user_param_groups)
         if not semantic_groups:
             raise ValueError("dmuon.Muon param_groups must not be empty")
@@ -405,7 +419,9 @@ class Muon(Optimizer):
                 )
 
             semantic_name = str(
-                user_group.get("group_name", user_group.get("name", f"group_{semantic_idx}"))
+                user_group.get(
+                    "group_name", user_group.get("name", f"group_{semantic_idx}")
+                )
             )
             raw_params = self._normalize_group_params(user_group["params"])
             muon_refs: list[torch.Tensor] = []
@@ -481,7 +497,9 @@ class Muon(Optimizer):
                     params=adamw_params,
                     semantic_name=semantic_name,
                     lr=self._group_value(user_group, "adamw_lr", "lr", adamw_lr),
-                    betas=self._group_value(user_group, "adamw_betas", None, adamw_betas),
+                    betas=self._group_value(
+                        user_group, "adamw_betas", None, adamw_betas
+                    ),
                     weight_decay=self._group_value(
                         user_group,
                         "adamw_weight_decay",
@@ -535,8 +553,13 @@ class Muon(Optimizer):
     def _profile_requested(self) -> bool:
         return bool(int(os.environ.get("DMUON_STEP_PROFILE", "0") or 0))
 
+    def _tp_prepare_prefetch_enabled(self) -> bool:
+        return bool(int(os.environ.get("DMUON_TP_PREPARE_PREFETCH", "1") or 1))
+
     def _profile_begin_step(self) -> None:
-        self._step_profile_enabled = self._profile_requested() and torch.cuda.is_available()
+        self._step_profile_enabled = (
+            self._profile_requested() and torch.cuda.is_available()
+        )
         self._last_step_profile_events = []
         self._last_step_profile = {
             "enabled": self._step_profile_enabled,
@@ -547,17 +570,23 @@ class Muon(Optimizer):
     def _profile_event_start(self, name: str):
         if not self._step_profile_enabled:
             return None
+        record_ctx = None
+        if bool(int(os.environ.get("DMUON_TORCH_PROFILE_MARKERS", "0") or 0)):
+            record_ctx = torch.profiler.record_function(f"dmuon.optimizer.{name}")
+            record_ctx.__enter__()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        return name, start, end
+        return name, start, end, record_ctx
 
     def _profile_event_end(self, token) -> None:
         if token is None:
             return
-        _name, _start, end = token
+        _name, _start, end, record_ctx = token
         end.record()
         self._last_step_profile_events.append(token)
+        if record_ctx is not None:
+            record_ctx.__exit__(None, None, None)
 
     def _profile_add(self, key: str, value: int | float) -> None:
         if not self._step_profile_enabled:
@@ -575,7 +604,7 @@ class Muon(Optimizer):
             self._last_step_profile_events = []
             return profile
         event_totals: dict[str, float] = {}
-        for name, start, end in self._last_step_profile_events:
+        for name, start, end, _record_ctx in self._last_step_profile_events:
             event_totals[name] = event_totals.get(name, 0.0) + float(
                 start.elapsed_time(end)
             )
@@ -586,11 +615,11 @@ class Muon(Optimizer):
         return profile
 
     def _ensure_grads_ready(self) -> None:
-        """Wait for DMuon reduce/gather once before clipping or stepping."""
+        """Prepare DMuon Muon grads once before clipping or stepping."""
 
         if self._grads_ready:
             return
-        wait_all_reduces(self.model)
+        prepare_muon_grads(self.model)
         self._grads_ready = True
 
     @torch.no_grad()
@@ -615,7 +644,9 @@ class Muon(Optimizer):
             self,
             max_norm,
             norm_type=2.0 if norm_type is None else norm_type,
-            error_if_nonfinite=False if error_if_nonfinite is None else error_if_nonfinite,
+            error_if_nonfinite=(
+                False if error_if_nonfinite is None else error_if_nonfinite
+            ),
             foreach=foreach,
             strategy="global_norm" if strategy is None else strategy,
         )
@@ -626,8 +657,8 @@ class Muon(Optimizer):
         """Perform a single optimization step.
 
         Internally:
-        1. Waits for all async gradient reduces to complete (shard + replicate
-           in HSDP mode).
+        1. Prepares Muon gradients: wait reduce tails and gather TP shards
+           into full gradients on TP owners.
         2. Runs Muon (momentum + NS + update) on owned dedicated params.
         3. Runs AdamW on FSDP2 symmetric params.
         4. Publishes updated dedicated params. In sync mode this happens as
@@ -641,23 +672,35 @@ class Muon(Optimizer):
                 loss = closure()
 
         self._profile_begin_step()
+        use_group_prepare_prefetch = (
+            self._replicate_async
+            and self._has_tp_dedicated
+            and self._tp_prepare_prefetch_enabled()
+        )
         if _balance_profile.enabled():
             timer = _balance_profile.StepTimer()
-            with timer.phase("wait_reduces"):
-                profile_token = self._profile_event_start("wait_reduces")
-                try:
-                    self._ensure_grads_ready()
-                finally:
-                    self._profile_event_end(profile_token)
             if self._replicate_async:
                 update_replicate_fallback(self.model)
-                with timer.phase("muon"):
-                    profile_token = self._profile_event_start("muon")
+                if not use_group_prepare_prefetch:
+                    with timer.phase("prepare_muon_grads"):
+                        profile_token = self._profile_event_start("prepare_muon_grads")
+                        try:
+                            self._ensure_grads_ready()
+                        finally:
+                            self._profile_event_end(profile_token)
+                with timer.phase("group_pipeline"):
+                    profile_token = self._profile_event_start("group_pipeline")
                     try:
                         self._step_muon_and_dispatch_groups_async()
                     finally:
                         self._profile_event_end(profile_token)
             else:
+                with timer.phase("prepare_muon_grads"):
+                    profile_token = self._profile_event_start("prepare_muon_grads")
+                    try:
+                        self._ensure_grads_ready()
+                    finally:
+                        self._profile_event_end(profile_token)
                 with timer.phase("muon"):
                     profile_token = self._profile_event_start("muon")
                     try:
@@ -681,9 +724,7 @@ class Muon(Optimizer):
                     finally:
                         self._profile_event_end(profile_token)
 
-            owned_numel = sum(
-                dp._owned_data.numel() for dp in self._dedicated_params
-            )
+            owned_numel = sum(dp._owned_data.numel() for dp in self._dedicated_params)
             timer.report(
                 self._profile_step_idx,
                 extra={
@@ -698,25 +739,31 @@ class Muon(Optimizer):
             self._grads_ready = False
             return loss
 
-        # 1. Wait for all pending async reduces from backward
-        profile_token = self._profile_event_start("wait_reduces")
-        try:
-            self._ensure_grads_ready()
-        finally:
-            self._profile_event_end(profile_token)
-
         if self._replicate_async:
             # Phase C.4 fallback must be advanced before dispatching this
             # step's post-update collectives so a tripped group degrades
             # immediately.  Then pipeline each group: update it, enqueue its
             # post-step scatter/broadcast, and continue with later groups.
             update_replicate_fallback(self.model)
-            profile_token = self._profile_event_start("muon")
+            if not use_group_prepare_prefetch:
+                profile_token = self._profile_event_start("prepare_muon_grads")
+                try:
+                    self._ensure_grads_ready()
+                finally:
+                    self._profile_event_end(profile_token)
+            profile_token = self._profile_event_start("group_pipeline")
             try:
                 self._step_muon_and_dispatch_groups_async()
             finally:
                 self._profile_event_end(profile_token)
         else:
+            # 1. Prepare every group's Muon gradients before the sync update.
+            profile_token = self._profile_event_start("prepare_muon_grads")
+            try:
+                self._ensure_grads_ready()
+            finally:
+                self._profile_event_end(profile_token)
+
             # 2. Muon update on dedicated params
             profile_token = self._profile_event_start("muon")
             try:
@@ -757,13 +804,28 @@ class Muon(Optimizer):
         every group in the same order, while only the owner ranks do the local
         Newton-Schulz work before their group's collective is enqueued.
         """
-        for group in _ordered_post_step_groups(self.model):
+        groups = _ordered_post_step_groups(self.model)
+        needs_prepare = not self._grads_ready
+        if needs_prepare and groups:
+            prepare_group_muon_grads(groups[0], use_reduce_stream=True)
+
+        for group_idx, group in enumerate(groups):
+            if needs_prepare and group_idx + 1 < len(groups):
+                prepare_group_muon_grads(groups[group_idx + 1], use_reduce_stream=True)
+            if needs_prepare:
+                wait_group_muon_grads(group)
+
             owned_params = [
-                dp for dp in getattr(group, "params", ())
+                dp
+                for dp in getattr(group, "params", ())
                 if getattr(dp, "is_owner", False)
             ]
             if owned_params:
-                self._step_muon(owned_params)
+                profile_token = self._profile_event_start("muon")
+                try:
+                    self._step_muon(owned_params, wait_for_tp_gather=False)
+                finally:
+                    self._profile_event_end(profile_token)
 
             profile_token = self._profile_event_start("replicate_broadcast")
             try:
@@ -771,7 +833,10 @@ class Muon(Optimizer):
             finally:
                 self._profile_event_end(profile_token)
 
-    def _step_muon(self, params=None):
+        if needs_prepare:
+            self._grads_ready = True
+
+    def _step_muon(self, params=None, *, wait_for_tp_gather: bool = True):
         """Newton-Schulz orthogonalization with momentum on dedicated params.
 
         With ``params=None`` this walks Muon optimizer subgroups.  With a
@@ -781,7 +846,11 @@ class Muon(Optimizer):
         """
         if params is None:
             for group_idx, dedicated_params in self._muon_group_dps.items():
-                self._step_muon_params(dedicated_params, self.param_groups[group_idx])
+                self._step_muon_params(
+                    dedicated_params,
+                    self.param_groups[group_idx],
+                    wait_for_tp_gather=wait_for_tp_gather,
+                )
             return
 
         by_group: dict[int, list] = {}
@@ -795,9 +864,15 @@ class Muon(Optimizer):
             by_group.setdefault(group_idx, []).append(dp)
 
         for group_idx, dedicated_params in by_group.items():
-            self._step_muon_params(dedicated_params, self.param_groups[group_idx])
+            self._step_muon_params(
+                dedicated_params,
+                self.param_groups[group_idx],
+                wait_for_tp_gather=wait_for_tp_gather,
+            )
 
-    def _step_muon_params(self, dedicated_params, group: dict) -> None:
+    def _step_muon_params(
+        self, dedicated_params, group: dict, *, wait_for_tp_gather: bool = True
+    ) -> None:
         """Apply one Muon subgroup's hyperparameters to dedicated params."""
         lr = group["lr"]
         mu = group["momentum"]
@@ -812,7 +887,9 @@ class Muon(Optimizer):
         # Synchronise the compute stream once before the loop so the NS
         # read below sees that buffer.  No-op when no TP path is live
         # (reduce_stream is idle or already drained).
-        if any(dp.tp_group is not None for dp in dedicated_params):
+        if wait_for_tp_gather and any(
+            dp.tp_group is not None for dp in dedicated_params
+        ):
             torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
 
         for dp in dedicated_params:
@@ -892,9 +969,7 @@ class Muon(Optimizer):
                 # to finish the Moonlight update in place — no further
                 # NS-related work on the receivers.
                 m_full = dp.full_shape[0]
-                n_full = (
-                    dp.full_shape[1] if len(dp.full_shape) > 1 else m_full
-                )
+                n_full = dp.full_shape[1] if len(dp.full_shape) > 1 else m_full
                 scale = 0.2 * (max(m_full, n_full) ** 0.5)
                 update_full = update.view(dp.full_shape).to(
                     device=dp._owned_data.device,

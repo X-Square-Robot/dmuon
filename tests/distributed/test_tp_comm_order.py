@@ -5,7 +5,8 @@ drives one small CausalLM/Tiny training loop while splitting
 ``Muon.step()`` into its internal phases so we can assert the intended
 communication dependencies directly:
 
-1. backward reduce + TP gather produces full gradients on TP owners;
+1. ``prepare_muon_grads`` waits reduce tails and TP-gathers full gradients
+   on TP owners;
 2. Muon produces full deltas on TP owners while non-owners wait for scatter;
 3. post-step TP scatter pins owner send refs until the scatter event is
    consumed;
@@ -39,16 +40,18 @@ TEST_DIST = REPO / "tests" / "distributed"
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(TEST_DIST))
 
-import dmuon  # noqa: E402
-from dmuon.utils import (  # noqa: E402
-    update_replicate_fallback,
-    wait_all_reduces,
-    wait_all_replicate_broadcasts,
-)
 from test_tp_alignment import (  # noqa: E402
     _build_model,
     _compute_loss,
     _make_inputs,
+)
+
+import dmuon  # noqa: E402
+from dmuon.utils import (  # noqa: E402
+    _ordered_post_step_groups,
+    prepare_muon_grads,
+    update_replicate_fallback,
+    wait_all_replicate_broadcasts,
 )
 
 
@@ -72,11 +75,17 @@ def _local_stats(model) -> dict[str, int]:
         "tp_full_grads": 0,
         "tp_full_deltas": 0,
         "pending_tp_states": 0,
+        "pending_tp_gather_events": 0,
         "pinned_tp_send_refs": 0,
+        "pending_muon_grad_ready_events": 0,
         "pending_replicate_states": 0,
         "pending_replicate_events": 0,
     }
     for group in _groups(model):
+        if getattr(group, "_muon_grad_ready_event", None) is not None:
+            stats["pending_muon_grad_ready_events"] += 1
+        if getattr(group, "_tp_gather_event", None) is not None:
+            stats["pending_tp_gather_events"] += 1
         tp_state = getattr(group, "_tp_scatter_state", None)
         if tp_state is not None:
             stats["pending_tp_states"] += 1
@@ -112,7 +121,7 @@ def _dispatch_post_step_for_observation(model, mode: str) -> None:
     needs the intermediate state, so it mirrors the group-level dispatch
     order and leaves the final wait to ``wait_all_replicate_broadcasts``.
     """
-    for group in _groups(model):
+    for group in _ordered_post_step_groups(model):
         if mode == "async":
             scatter_async = getattr(group, "tp_scatter_delta_async", None)
             if scatter_async is not None:
@@ -132,8 +141,10 @@ def _assert_no_pending(model) -> None:
         "reduced_grads",
         "tp_full_grads",
         "tp_full_deltas",
+        "pending_tp_gather_events",
         "pending_tp_states",
         "pinned_tp_send_refs",
+        "pending_muon_grad_ready_events",
         "pending_replicate_states",
         "pending_replicate_events",
     ):
@@ -195,17 +206,27 @@ def main() -> int:
             loss = _compute_loss(model, batch, model_kind)
             loss.backward()
 
-            wait_all_reduces(model)
-            after_reduce = _sum_stats(_local_stats(model))
-            if after_reduce["tp_params"] == 0:
+            prepare_muon_grads(model)
+            after_prepare = _sum_stats(_local_stats(model))
+            if after_prepare["tp_params"] == 0:
                 raise AssertionError("comm-order test requires TP params")
-            if after_reduce["reduced_grads"] == 0:
-                raise AssertionError(f"no reduced grads after backward: {after_reduce}")
-            if after_reduce["tp_full_grads"] == 0:
-                raise AssertionError(f"no TP full grads after gather: {after_reduce}")
-            if after_reduce["tp_full_deltas"] != 0:
+            if after_prepare["reduced_grads"] == 0:
+                raise AssertionError(f"no reduced grads after prepare: {after_prepare}")
+            if after_prepare["tp_full_grads"] == 0:
+                raise AssertionError(f"no TP full grads after gather: {after_prepare}")
+            if after_prepare["pending_tp_gather_events"] != 0:
                 raise AssertionError(
-                    f"TP full deltas should not exist before Muon: {after_reduce}"
+                    "prepare_muon_grads should drain TP gather events: "
+                    f"{after_prepare}"
+                )
+            if after_prepare["pending_muon_grad_ready_events"] != 0:
+                raise AssertionError(
+                    "prepare_muon_grads should drain readiness events: "
+                    f"{after_prepare}"
+                )
+            if after_prepare["tp_full_deltas"] != 0:
+                raise AssertionError(
+                    f"TP full deltas should not exist before Muon: {after_prepare}"
                 )
 
             optimizer._step_muon()
@@ -227,6 +248,17 @@ def main() -> int:
                 raise AssertionError(
                     f"TP scatter state missing after post-step dispatch: {after_dispatch}"
                 )
+            group_summary = dmuon.summarize_post_step_groups(model, max_rows=32)
+            if not group_summary["groups"]:
+                raise AssertionError("post-step group summary is empty")
+            if not any(
+                group["order_source"] == "recorded_forward"
+                for group in group_summary["groups"]
+            ):
+                raise AssertionError(
+                    "post-step dispatch did not observe recorded forward order: "
+                    f"{dmuon.format_post_step_group_summary(group_summary)}"
+                )
             if after_dispatch["pinned_tp_send_refs"] == 0:
                 raise AssertionError(
                     "TP owner send split refs were not pinned through scatter event: "
@@ -247,10 +279,11 @@ def main() -> int:
                 {
                     "step": step,
                     "loss": float(loss.detach().item()),
-                    "after_reduce": after_reduce,
+                    "after_prepare": after_prepare,
                     "after_muon": after_muon,
                     "after_dispatch": after_dispatch,
                     "after_drain": after_drain,
+                    "post_step_groups": group_summary,
                 }
             )
             if rank == 0:

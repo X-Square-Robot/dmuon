@@ -33,6 +33,16 @@ def _fqn_by_dedicated_param(model: nn.Module) -> dict[object, str]:
     return result
 
 
+def _modules_by_group(model: nn.Module) -> dict[int, list[str]]:
+    result: dict[int, list[str]] = {}
+    for name, module in model.named_modules():
+        state = getattr(module, "_dedicated_state", None)
+        if state is None:
+            continue
+        result.setdefault(id(state.group), []).append(name or "<root>")
+    return result
+
+
 def summarize_param_groups(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -253,4 +263,141 @@ def format_param_group_summary(summary: dict[str, Any]) -> str:
     truncated = int(summary.get("parameters_truncated", 0) or 0)
     if truncated:
         lines.append(f"... truncated {truncated} parameter rows")
+    return "\n".join(lines)
+
+
+def summarize_post_step_groups(
+    model: nn.Module,
+    *,
+    max_rows: int = 100,
+) -> dict[str, Any]:
+    """Return a local, read-only summary of post-step group ordering.
+
+    The helper performs no distributed communication. It is safe to call before
+    training, after forward order has been recorded, or after async post-step
+    dispatch to inspect pending TP scatter / replicate broadcast state.
+    """
+
+    from .utils import _ordered_post_step_groups
+
+    comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
+    recorded_ids: set[int] = set()
+    if comm_ctx is not None:
+        for group in getattr(comm_ctx, "post_forward_order", ()):
+            recorded_ids.add(id(group))
+
+    module_names_by_group = _modules_by_group(model)
+    rows = []
+    for index, group in enumerate(_ordered_post_step_groups(model)):
+        params = list(getattr(group, "params", ()))
+        modules = module_names_by_group.get(id(group), [])
+        dp_group = getattr(group, "_dp_group", None)
+        try:
+            local_shard_rank = dp_group.rank() if dp_group is not None else None
+        except Exception:
+            local_shard_rank = None
+        rows.append(
+            {
+                "index": index,
+                "order_source": (
+                    "recorded_forward"
+                    if id(group) in recorded_ids
+                    else "module_walk_fallback"
+                ),
+                "debug_name": getattr(group, "_debug_name", None),
+                "group_id": f"0x{id(group):x}",
+                "modules": modules[:max_rows] if max_rows >= 0 else modules,
+                "modules_truncated": max(0, len(modules) - max_rows)
+                if max_rows >= 0
+                else 0,
+                "param_count": len(params),
+                "local_owner_param_count": sum(
+                    1 for dp in params if bool(getattr(dp, "is_owner", False))
+                ),
+                "tp_sharded_param_count": sum(
+                    1 for dp in params if getattr(dp, "tp_group", None) is not None
+                ),
+                "local_tp_owner_param_count": sum(
+                    1 for dp in params if bool(getattr(dp, "is_tp_owner", False))
+                ),
+                "replicate_participant_param_count": sum(
+                    1
+                    for dp in params
+                    if local_shard_rank is not None
+                    and local_shard_rank == getattr(dp, "owner_shard", None)
+                ),
+                "tp_scatter_pending": getattr(group, "_tp_scatter_state", None)
+                is not None,
+                "replicate_broadcast_pending": (
+                    getattr(group, "_replicate_broadcast_state", None) is not None
+                    or getattr(group, "_replicate_broadcast_event", None) is not None
+                ),
+                "tp_sync_fallback": bool(getattr(group, "_tp_sync_fallback", False)),
+                "replicate_sync_fallback": bool(
+                    getattr(group, "_replicate_sync_fallback", False)
+                ),
+                "last_tp_scatter_wait_us": float(
+                    getattr(group, "_last_tp_scatter_wait_us", 0.0) or 0.0
+                ),
+                "last_replicate_wait_us": float(
+                    getattr(group, "_last_replicate_wait_us", 0.0) or 0.0
+                ),
+            }
+        )
+
+    truncated = max(0, len(rows) - max_rows)
+    if max_rows >= 0:
+        rows = rows[:max_rows]
+
+    return {
+        "num_groups": len(rows) + truncated,
+        "groups": rows,
+        "groups_truncated": truncated,
+    }
+
+
+def format_post_step_group_summary(summary: dict[str, Any]) -> str:
+    """Format :func:`summarize_post_step_groups` as a compact text report."""
+
+    headers = [
+        "idx",
+        "source",
+        "modules",
+        "params",
+        "owners",
+        "tp",
+        "tp_owner",
+        "repl_part",
+        "tp_pending",
+        "repl_pending",
+        "tp_fb",
+        "repl_fb",
+        "tp_wait_us",
+        "repl_wait_us",
+    ]
+    rows = [
+        [
+            group["index"],
+            group["order_source"],
+            group["debug_name"] or ", ".join(group["modules"]) or "-",
+            group["param_count"],
+            group["local_owner_param_count"],
+            group["tp_sharded_param_count"],
+            group["local_tp_owner_param_count"],
+            group["replicate_participant_param_count"],
+            group["tp_scatter_pending"],
+            group["replicate_broadcast_pending"],
+            group["tp_sync_fallback"],
+            group["replicate_sync_fallback"],
+            group["last_tp_scatter_wait_us"],
+            group["last_replicate_wait_us"],
+        ]
+        for group in summary.get("groups", [])
+    ]
+
+    lines = ["DMuon post-step group summary"]
+    lines.extend(_format_table(headers, rows))
+    truncated = int(summary.get("groups_truncated", 0) or 0)
+    if truncated:
+        lines.append(f"... truncated {truncated} groups")
     return "\n".join(lines)
