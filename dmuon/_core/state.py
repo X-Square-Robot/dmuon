@@ -21,6 +21,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 
 from .comm import DedicatedCommContext
+from .dynamo import dynamo_disable
 
 if TYPE_CHECKING:
     # DedicatedState is backend-agnostic — it operates on the shared
@@ -120,6 +121,7 @@ class DedicatedState:
         )
         self._post_forward_handle = module.register_forward_hook(self._post_forward)
 
+    @dynamo_disable
     def _pre_forward(self, module: nn.Module, args, kwargs):
         """Dispatch broadcasts on broadcast_stream, wait, finalize params.
 
@@ -153,6 +155,7 @@ class DedicatedState:
             args, kwargs = self._register_post_backward(args, kwargs)
         return args, kwargs
 
+    @dynamo_disable
     def _post_forward(self, module: nn.Module, input, output):
         """Reshard params (if enabled), record forward order, register pre-backward."""
         if self.reshard_after_forward:
@@ -169,6 +172,7 @@ class DedicatedState:
 
     # ---- post-backward fast path + fallback ------------------------------
 
+    @dynamo_disable
     def _run_post_backward(self) -> None:
         """Execute reduce + reshard. Idempotent per forward.
 

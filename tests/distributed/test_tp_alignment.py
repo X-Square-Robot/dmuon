@@ -47,7 +47,6 @@ sys.path.insert(
 )
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import dmuon
 from torch.distributed import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor.parallel import (
@@ -56,6 +55,8 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from tp_profile_utils import collect_tp_profile, iter_dedicated_params
+
+import dmuon
 
 
 class MLP(nn.Module):
@@ -153,7 +154,9 @@ def _build_llm(model_kind: str, device: torch.device) -> tuple[nn.Module, dict[s
             max_position_embeddings=cfg["max_positions"],
             use_cache=False,
             tie_word_embeddings=False,
+            attention_dropout=0.0,
         )
+        hf_config._attn_implementation = "eager"
         return LlamaForCausalLM(hf_config).to(device), cfg
     if cfg["family"] == "qwen2":
         from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -170,6 +173,7 @@ def _build_llm(model_kind: str, device: torch.device) -> tuple[nn.Module, dict[s
             tie_word_embeddings=False,
             attention_dropout=0.0,
         )
+        hf_config._attn_implementation = "eager"
         return Qwen2ForCausalLM(hf_config).to(device), cfg
     raise ValueError(f"unsupported CausalLM family={cfg['family']!r}")
 
@@ -464,6 +468,11 @@ def main() -> int:
     world_size = dist.get_world_size()
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
+    os.environ.setdefault("DMUON_NS_KERNEL", "cublas")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
 
     model, model_cfg = _build_model(
         topology,
@@ -496,14 +505,22 @@ def main() -> int:
 
     losses: list[float] = []
     weight_digests: list[float] = []
+    digest_each_step = not (
+        mode == "async"
+        and not bool(int(os.environ.get("DMUON_ALIGN_ASYNC_DIGEST_EACH_STEP", "0") or 0))
+    )
     param_digest_enabled = bool(
         int(os.environ.get("DMUON_ALIGN_PARAM_DIGEST", "0") or 0)
+    )
+    final_param_digest_enabled = bool(
+        int(os.environ.get("DMUON_ALIGN_FINAL_PARAM_DIGEST", "0") or 0)
     )
     param_digests: list[dict[str, float]] = []
 
     def _digest() -> float:
         """Global owned-data digest after pending async work is visible."""
         torch.cuda.synchronize()
+        dist.barrier(device_ids=[device.index])
         total = torch.zeros((), device=device, dtype=torch.float64)
         for dp in optimizer._dedicated_params:
             data = getattr(dp, "_owned_data", None)
@@ -515,7 +532,9 @@ def main() -> int:
     def _param_digest() -> dict[str, float]:
         """Per-parameter global owned-data digest for alignment diagnostics."""
         torch.cuda.synchronize()
+        dist.barrier(device_ids=[device.index])
         out: dict[str, float] = {}
+        module_names = {id(module): name for name, module in model.named_modules()}
         for idx, dp in enumerate(iter_dedicated_params(model)):
             val = torch.zeros((), device=device, dtype=torch.float64)
             data = getattr(dp, "_owned_data", None)
@@ -525,10 +544,14 @@ def main() -> int:
             full_shape = tuple(int(x) for x in getattr(dp, "full_shape", ()))
             shard_dim = getattr(dp, "shard_dim", None)
             owner = getattr(dp, "_tp_owner_local_rank", None)
-            name = str(getattr(dp, "param_name", "<unknown>"))
+            prefix = module_names.get(id(getattr(dp, "module", None)), "")
+            param_name = str(getattr(dp, "param_name", "<unknown>"))
+            name = f"{prefix}.{param_name}" if prefix else param_name
             key = f"{idx:04d}:{name}:shape={full_shape}:shard={shard_dim}:owner={owner}"
             out[key] = float(val.item())
         return out
+
+    from dmuon.utils import wait_all_replicate_broadcasts
 
     for it, x in enumerate(inputs):
         optimizer.zero_grad()
@@ -536,26 +559,34 @@ def main() -> int:
         loss.backward()
         optimizer.step()
         if mode == "async_drain":
-            torch.cuda.synchronize()
-        # Owned-data digest after step completes. For async mode the digest
-        # includes a full sync so scatter/broadcast side effects are visible.
-        digest = _digest()
+            wait_all_replicate_broadcasts(model)
         losses.append(float(loss.item()))
-        weight_digests.append(digest)
+        if digest_each_step:
+            # This inserts a WORLD all-reduce. Raw async mode deliberately
+            # skips it: post-step TP/HSDP work is a next-forward dependency,
+            # so out-of-band collectives must drain first or they can perturb
+            # cross-process-group ordering.
+            digest = _digest()
+            weight_digests.append(digest)
+            digest_text = f"{digest:.12e}"
+        else:
+            digest_text = "deferred"
         if param_digest_enabled:
             param_digests.append(_param_digest())
         if rank == 0:
             print(
                 f"[{topology}/{owner_mode}/{mode} run={run_id}] iter {it}: "
-                f"loss={loss.item():.10f} digest={digest:.12e}",
+                f"loss={loss.item():.10f} digest={digest_text}",
                 flush=True,
             )
     torch.cuda.synchronize()
 
     # Drain any pending async state before teardown.
-    from dmuon.utils import wait_all_replicate_broadcasts
-
     wait_all_replicate_broadcasts(model)
+    final_weight_digest = _digest()
+    final_param_digest = (
+        _param_digest() if final_param_digest_enabled else {}
+    )
 
     if rank == 0:
         os.makedirs(out_dir, exist_ok=True)
@@ -577,7 +608,10 @@ def main() -> int:
                 "owner_load_by_tp_rank": profile["owner_load_by_tp_rank"],
                 "losses": losses,
                 "weight_digest": weight_digests,
+                "weight_digest_each_step": digest_each_step,
+                "final_weight_digest": final_weight_digest,
                 "param_digest": param_digests,
+                "final_param_digest": final_param_digest,
             }, f)
         print(f"wrote {out_path}", flush=True)
 

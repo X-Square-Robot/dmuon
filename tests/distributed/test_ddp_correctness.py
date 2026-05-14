@@ -15,9 +15,11 @@ Coverage:
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import tempfile
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -64,7 +66,37 @@ def _all_ranks_equal(t: torch.Tensor) -> bool:
     return True
 
 
-def _setup_model_and_optim(seed=42):
+def _wallx_style_param_groups(model):
+    base_params = []
+    action_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("layers.0."):
+            action_params.append(param)
+        else:
+            base_params.append(param)
+    return [
+        {
+            "params": base_params,
+            "group_name": "base",
+            "muon_lr": 0.02,
+            "adamw_lr": 1e-3,
+            "muon_weight_decay": 0.0,
+            "adamw_weight_decay": 0.0,
+        },
+        {
+            "params": action_params,
+            "group_name": "action",
+            "muon_lr": 0.04,
+            "adamw_lr": 2e-3,
+            "muon_weight_decay": 0.0,
+            "adamw_weight_decay": 0.0,
+        },
+    ]
+
+
+def _setup_model_and_optim(seed=42, *, replicate_async=False, param_groups_factory=None):
     torch.manual_seed(seed)
     model = TinyModel().cuda()
     rank = dist.get_rank()
@@ -76,12 +108,28 @@ def _setup_model_and_optim(seed=42):
         predicate=lambda n, p: "proj" in n and p.ndim == 2,
     )
     dmuon.replicate(model, mesh=mesh)
+    param_groups = (
+        None if param_groups_factory is None else param_groups_factory(model)
+    )
     optimizer = dmuon.Muon(
         model, lr=0.02, momentum=0.95, ns_steps=3,
         adamw_lr=1e-3, adamw_weight_decay=0.0,
-        replicate_async=False,  # P1: sync post-step broadcast
+        replicate_async=replicate_async,
+        param_groups=param_groups,
     )
     return model, optimizer, mesh, rank
+
+
+def _pending_post_step_states(model) -> int:
+    pending = 0
+    for module in model.modules():
+        state = getattr(module, "_dedicated_state", None)
+        if state is None:
+            continue
+        group = state.group
+        if getattr(group, "_post_step_broadcast_state", None) is not None:
+            pending += 1
+    return pending
 
 
 def test_forward_backward_numerics():
@@ -210,6 +258,214 @@ def test_muon_grad_clip_scales_dedicated_owner_grads():
         print("[muon_grad_clip] dedicated grads clipped and optimizer.step completed")
 
 
+def test_async_post_step_broadcast_leaves_pending_state_until_drain():
+    """DDP async path should dispatch group states and drain them explicitly."""
+
+    model, optimizer, _mesh, rank = _setup_model_and_optim(replicate_async=True)
+    optimizer.zero_grad()
+    x = torch.randn(4, 128, device="cuda")
+    loss = model(x)
+    loss.backward()
+    optimizer.step()
+
+    pending = _pending_post_step_states(model)
+    assert pending > 0, f"rank {rank}: expected pending async post-step state"
+
+    dmuon.wait_all_post_step_broadcasts(model)
+    assert _pending_post_step_states(model) == 0
+
+    errors = []
+    for name, p in model.named_parameters():
+        if hasattr(p, "_dedicated_owner_rank") and not _all_ranks_equal(p.data):
+            errors.append(name)
+    if rank == 0:
+        assert not errors, f"Async DDP dedicated params diverged: {errors}"
+        print("[async_post_step] pending states drain and params sync")
+
+
+def test_async_matches_sync_loss_trajectory():
+    """Group-pipelined async DDP should match the sync post-step path."""
+
+    batches = []
+    for step in range(3):
+        torch.manual_seed(7000 + step)
+        batches.append(torch.randn(4, 128, device="cuda"))
+
+    def run(*, replicate_async: bool) -> torch.Tensor:
+        model, optimizer, _mesh, _rank = _setup_model_and_optim(
+            seed=777, replicate_async=replicate_async
+        )
+        losses = []
+        for x in batches:
+            optimizer.zero_grad()
+            loss = model(x)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach().item()))
+        dmuon.wait_all_post_step_broadcasts(model)
+        return torch.tensor(losses, device="cuda")
+
+    sync_losses = run(replicate_async=False)
+    dist.barrier()
+    async_losses = run(replicate_async=True)
+    dist.barrier()
+
+    if not torch.allclose(sync_losses, async_losses, rtol=0, atol=1e-6):
+        raise AssertionError(
+            f"async losses diverged from sync: sync={sync_losses.tolist()} "
+            f"async={async_losses.tolist()}"
+        )
+    if dist.get_rank() == 0:
+        print("[async_vs_sync] loss trajectories match")
+
+
+def test_param_groups_lower_and_step():
+    """Semantic groups lower to Muon/AdamW subgroups and still train."""
+
+    model, optimizer, _mesh, rank = _setup_model_and_optim(
+        replicate_async=False,
+        param_groups_factory=_wallx_style_param_groups,
+    )
+
+    expected = [
+        ("base/muon", True, "muon", 0.02),
+        ("base/adamw", False, "adamw", 1e-3),
+        ("action/muon", True, "muon", 0.04),
+        ("action/adamw", False, "adamw", 2e-3),
+    ]
+    actual = [
+        (
+            group["group_name"],
+            group["use_muon"],
+            group["subgroup_type"],
+            group["lr"],
+        )
+        for group in optimizer.param_groups
+    ]
+    assert actual == expected
+    assert len(optimizer._muon_group_dps) == 2
+    assert len(optimizer._adamw_group_params) == 2
+    summary = dmuon.summarize_param_groups(model, optimizer, max_rows=20)
+    assert summary["num_groups"] == 4
+    groups = {group["group_name"]: group for group in summary["groups"]}
+    assert set(groups) == {item[0] for item in expected}
+    assert groups["action/muon"]["lr"] == 0.04
+    assert groups["action/muon"]["dedicated_param_count"] > 0
+    assert groups["action/adamw"]["adamw_param_count"] > 0
+    assert any(
+        row["route"] == "muon" and row["group_name"] == "action/muon"
+        for row in summary["parameters"]
+    )
+    formatted = dmuon.format_param_group_summary(summary)
+    assert "action/muon" in formatted and "action/adamw" in formatted
+    optim_sd = dmuon.get_optimizer_state_dict(
+        model, optimizer, cpu_offload=True, rank0_only=False
+    )
+    assert [
+        group["group_name"] for group in optim_sd["param_groups"]
+    ] == [item[0] for item in expected]
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda epoch: 1.0 if epoch == 0 else 0.5,
+    )
+
+    optimizer.zero_grad()
+    x = torch.randn(4, 128, device="cuda")
+    loss = model(x)
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+    scheduled_lrs = [group["lr"] for group in optimizer.param_groups]
+    assert scheduled_lrs == [0.01, 5e-4, 0.02, 1e-3]
+
+    dmuon.wait_all_post_step_broadcasts(model)
+
+    errors = []
+    for name, p in model.named_parameters():
+        if hasattr(p, "_dedicated_owner_rank") and not _all_ranks_equal(p.data):
+            errors.append(name)
+    if rank == 0:
+        assert not errors, f"Param-group dedicated params diverged: {errors}"
+        print("[param_groups] lowering and sync step passed")
+
+
+def test_param_groups_async_matches_sync_loss_trajectory():
+    """Param-group async DDP keeps the same loss trajectory as sync."""
+
+    batches = []
+    for step in range(3):
+        torch.manual_seed(9100 + step)
+        batches.append(torch.randn(4, 128, device="cuda"))
+
+    def run(*, replicate_async: bool) -> torch.Tensor:
+        model, optimizer, _mesh, _rank = _setup_model_and_optim(
+            seed=9191,
+            replicate_async=replicate_async,
+            param_groups_factory=_wallx_style_param_groups,
+        )
+        losses = []
+        for x in batches:
+            optimizer.zero_grad()
+            loss = model(x)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach().item()))
+        dmuon.wait_all_post_step_broadcasts(model)
+        return torch.tensor(losses, device="cuda")
+
+    sync_losses = run(replicate_async=False)
+    dist.barrier()
+    async_losses = run(replicate_async=True)
+    dist.barrier()
+
+    if not torch.allclose(sync_losses, async_losses, rtol=0, atol=1e-6):
+        raise AssertionError(
+            "param-group async losses diverged from sync: "
+            f"sync={sync_losses.tolist()} async={async_losses.tolist()}"
+        )
+    if dist.get_rank() == 0:
+        print("[param_groups_async_vs_sync] loss trajectories match")
+
+
+def test_param_groups_validate_duplicate_and_missing():
+    """Fail loud when semantic groups duplicate or omit trainable params."""
+
+    torch.manual_seed(1234)
+    model = TinyModel().cuda()
+    world_size = dist.get_world_size()
+    mesh = init_device_mesh("cuda", (world_size,))
+    dmuon.dedicate_params_ddp(
+        model, mesh,
+        predicate=lambda n, p: "proj" in n and p.ndim == 2,
+    )
+    dmuon.replicate(model, mesh=mesh)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    assert len(trainable) >= 2
+
+    duplicate_groups = [
+        {"params": [trainable[0]], "group_name": "a"},
+        {"params": [trainable[0]], "group_name": "b"},
+    ]
+    try:
+        dmuon.Muon(model, param_groups=duplicate_groups)
+    except ValueError as exc:
+        assert "multiple DMuon param_groups" in str(exc)
+    else:
+        raise AssertionError("duplicate param_groups did not raise")
+
+    missing_groups = [{"params": trainable[:-1], "group_name": "partial"}]
+    try:
+        dmuon.Muon(model, param_groups=missing_groups)
+    except RuntimeError as exc:
+        assert "omitted trainable model parameters" in str(exc)
+    else:
+        raise AssertionError("missing param_groups coverage did not raise")
+
+    if dist.get_rank() == 0:
+        print("[param_groups_validation] duplicate and missing checks passed")
+
+
 def test_checkpoint_roundtrip():
     """Save → load → verify every rank holds identical parameters."""
     model, optimizer, _, rank = _setup_model_and_optim()
@@ -259,6 +515,90 @@ def test_checkpoint_roundtrip():
     dist.barrier()
 
 
+def test_param_groups_checkpoint_metadata_roundtrip():
+    """Param-group metadata should restore and structural mismatches should fail."""
+
+    model, optimizer, _, rank = _setup_model_and_optim(
+        replicate_async=False,
+        param_groups_factory=_wallx_style_param_groups,
+    )
+
+    optimizer.zero_grad()
+    x = torch.randn(4, 128, device="cuda")
+    loss = model(x)
+    loss.backward()
+    optimizer.step()
+    dmuon.wait_all_post_step_broadcasts(model)
+
+    optim_sd = dmuon.get_optimizer_state_dict(
+        model, optimizer, cpu_offload=True, rank0_only=False
+    )
+    expected = [
+        ("base/muon", True, "muon", 0.02),
+        ("base/adamw", False, "adamw", 1e-3),
+        ("action/muon", True, "muon", 0.04),
+        ("action/adamw", False, "adamw", 2e-3),
+    ]
+    saved = [
+        (
+            group["group_name"],
+            group["use_muon"],
+            group["subgroup_type"],
+            group["lr"],
+        )
+        for group in optim_sd["param_groups"]
+    ]
+    assert saved == expected
+
+    for group in optimizer.param_groups:
+        group["lr"] = 123.0
+        group["group_name"] = "mutated"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dmuon.set_optimizer_state_dict(model, optimizer, optim_sd)
+    assert len(caught) == len(expected)
+    assert all("group name mismatch" in str(w.message) for w in caught)
+    restored = [
+        (
+            group["group_name"],
+            group["use_muon"],
+            group["subgroup_type"],
+            group["lr"],
+        )
+        for group in optimizer.param_groups
+    ]
+    assert restored == expected
+
+    bad_use_muon = copy.deepcopy(optim_sd)
+    bad_use_muon["param_groups"][0]["use_muon"] = False
+    try:
+        dmuon.set_optimizer_state_dict(model, optimizer, bad_use_muon)
+    except RuntimeError as exc:
+        assert "use_muon" in str(exc)
+    else:
+        raise AssertionError("checkpoint use_muon mismatch did not raise")
+
+    bad_subgroup = copy.deepcopy(optim_sd)
+    bad_subgroup["param_groups"][0]["subgroup_type"] = "adamw"
+    try:
+        dmuon.set_optimizer_state_dict(model, optimizer, bad_subgroup)
+    except RuntimeError as exc:
+        assert "subgroup_type" in str(exc)
+    else:
+        raise AssertionError("checkpoint subgroup_type mismatch did not raise")
+
+    renamed = copy.deepcopy(optim_sd)
+    renamed["param_groups"][0]["group_name"] = "renamed/muon"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dmuon.set_optimizer_state_dict(model, optimizer, renamed)
+    assert any("group name mismatch" in str(w.message) for w in caught)
+
+    if rank == 0:
+        print("[param_groups_checkpoint] metadata restore and mismatch checks passed")
+    dist.barrier()
+
+
 def main():
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -270,7 +610,13 @@ def main():
         test_reduce_to_owner_only,
         test_replicate_avgs_non_dedicated_grads,
         test_muon_grad_clip_scales_dedicated_owner_grads,
+        test_async_post_step_broadcast_leaves_pending_state_until_drain,
+        test_async_matches_sync_loss_trajectory,
+        test_param_groups_lower_and_step,
+        test_param_groups_async_matches_sync_loss_trajectory,
+        test_param_groups_validate_duplicate_and_missing,
         test_checkpoint_roundtrip,
+        test_param_groups_checkpoint_metadata_roundtrip,
     ]
 
     for t in tests:

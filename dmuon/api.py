@@ -364,8 +364,10 @@ def dedicate_params(
         layer_to_dparams[layer_module].append(d_param)
 
     all_states: list[DedicatedState] = []
+    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     for layer_module, d_params in layer_to_dparams.items():
         group = DedicatedParamGroup(d_params, comm_ctx)
+        group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         state = DedicatedState(layer_module, group, comm_ctx, reshard_after_forward)
         layer_module._dedicated_state = state
         all_states.append(state)
@@ -508,8 +510,10 @@ def dedicate_params_ddp(
         layer_to_dparams[layer_module].append(d_param)
 
     all_states: list[DedicatedState] = []
+    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     for layer_module, d_params in layer_to_dparams.items():
         group = DedicatedParamGroupDDP(d_params, comm_ctx)
+        group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         # ``reshard_after_forward`` is meaningless on the DDP path (no
         # storage to free). Pass False so DedicatedState skips the
         # ``group.reshard()`` call in post-forward. On DDP groups

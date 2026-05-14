@@ -142,6 +142,54 @@ optimizer = dmuon.Muon(
 - **组 0**（专属参数）：Muon — 动量 + NS + 更新，仅所有者
 - **组 1**（对称参数）：AdamW — 标准，所有 rank
 
+### 语义参数组
+
+当训练框架需要业务级学习率分组时使用 `param_groups`，例如 VLA 的
+action expert 使用更高学习率。参数组必须从传给 `dmuon.Muon` 的同一个
+wrapped model 上构建；在 FSDP2 下，也就是先完成 `dedicate_params()` 和
+FSDP2 wrapping，再用当前模型的 `named_parameters()` 分组。DMuon 会把每个
+用户组降解为两个优化器子组：`<name>/muon` 管理专属参数，
+`<name>/adamw` 管理对称参数。
+
+```python
+base_params = []
+action_params = []
+for name, param in model.named_parameters():
+    if not param.requires_grad:
+        continue
+    if "action_transformer" in name:
+        action_params.append(param)
+    else:
+        base_params.append(param)
+
+optimizer = dmuon.Muon(
+    model,
+    lr=5e-5,
+    adamw_lr=5e-5,
+    param_groups=[
+        {"params": base_params, "lr": 5e-5, "group_name": "base"},
+        {"params": action_params, "lr": 1e-4, "group_name": "action"},
+    ],
+)
+```
+
+普通场景下，`lr` 同时作用于该语义组的 Muon 和 AdamW 子组。高级场景可以用
+`muon_lr`、`adamw_lr`、`muon_weight_decay`、`adamw_weight_decay`、
+`momentum`、`adamw_betas`、`adamw_eps` 分别覆盖两条路径。每个
+trainable 参数必须且只能出现在一个用户组中；如果传入 wrapping 前的旧参数、
+重复参数或漏掉参数，优化器构造阶段会直接报错。
+
+Scheduler 和 checkpoint 仍然通过 `optimizer.param_groups` 工作。可见组名会
+变为 `base/muon`、`base/adamw`、`action/muon`、`action/adamw`。
+
+可以用诊断 helper 检查实际分流：
+
+```python
+summary = dmuon.summarize_param_groups(model, optimizer, max_rows=80)
+if dist.get_rank() == 0:
+    print(dmuon.format_param_group_summary(summary))
+```
+
 ### 超参数指南
 
 | 参数 | 默认值 | 说明 |
@@ -152,6 +200,7 @@ optimizer = dmuon.Muon(
 | `ns_backend` | `"gram"` | `"gram"` 或 `"direct"` 字符串，或 `dmuon.NewtonSchulz(...)` 对象以自定义系数。 |
 | `nesterov` | True | Nesterov 前瞻：`ns_input = grad + mu * buf`。推荐开启。 |
 | `adamw_lr` | 1e-3 | 非矩阵参数的独立学习率。 |
+| `param_groups` | None | 可选的 PyTorch 风格语义参数组，会被降解成 Muon 和 AdamW 子组。 |
 
 ## 第 5 步：训练循环
 
