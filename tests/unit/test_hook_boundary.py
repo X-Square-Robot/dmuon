@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import pytest
 import torch.nn as nn
 
-from dmuon.api import _find_hook_module
+from dmuon.api import _find_hook_module, _resolve_hook_module
 
 
 class TinyLinear(nn.Module):
@@ -105,3 +105,35 @@ def test_predicate_none_returns_none():
     p = m.visual.blocks[0].attn.fc1.weight
     mod = _find_hook_module(m, p, None)
     assert mod is None
+
+
+def test_resolver_can_select_non_ancestor_boundary():
+    """Resolver supports execution boundaries that are not parameter ancestors."""
+    m = ToyVLA()
+    p = m.visual.blocks[0].attn.fc1.weight
+
+    mod = _resolve_hook_module(
+        m,
+        p,
+        param_fqn="visual.blocks.0.attn.fc1.weight",
+        hook_boundary_predicate=None,
+        hook_boundary_resolver=lambda _name, _param: m.layers[1],
+        strict=True,
+    )
+
+    assert mod is m.layers[1]
+
+
+def test_resolver_strict_raises_on_unmatched_param():
+    m = ToyVLA()
+    p = m.visual.blocks[0].attn.fc1.weight
+
+    with pytest.raises(ValueError, match="hook_boundary_resolver returned None"):
+        _resolve_hook_module(
+            m,
+            p,
+            param_fqn="visual.blocks.0.attn.fc1.weight",
+            hook_boundary_predicate=None,
+            hook_boundary_resolver=lambda _name, _param: None,
+            strict=True,
+        )

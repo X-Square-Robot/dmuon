@@ -127,6 +127,46 @@ def _find_hook_module(
     return parent_module
 
 
+HookBoundaryResolver = Callable[[str, nn.Parameter], Optional[nn.Module]]
+AssignmentGroupKeyFn = Callable[[str, nn.Parameter], Optional[str]]
+
+
+def _resolve_hook_module(
+    model: nn.Module,
+    target_param: nn.Parameter,
+    *,
+    param_fqn: str,
+    hook_boundary_predicate: Optional[Callable[[nn.Module], bool]],
+    hook_boundary_resolver: Optional[HookBoundaryResolver],
+    strict: bool,
+) -> nn.Module:
+    """Resolve the forward boundary that should own a dedicated parameter."""
+    if hook_boundary_resolver is not None:
+        module = hook_boundary_resolver(param_fqn, target_param)
+        if module is not None:
+            return module
+        if strict:
+            raise ValueError(
+                f"{param_fqn}: hook_boundary_resolver returned None. Either "
+                "extend the resolver to cover this parameter or exclude it via "
+                "the dedicate_params predicate."
+            )
+        parent_module, _ = _find_parent_module(model, target_param)
+        return parent_module
+
+    if hook_boundary_predicate is not None:
+        module = _find_hook_module(
+            model, target_param, hook_boundary_predicate, strict=strict
+        )
+        assert module is not None
+        return module
+
+    layer_module, _parent_module, _param_name = _find_layer_module(
+        model, target_param
+    )
+    return layer_module
+
+
 def dedicate_params(
     model: nn.Module,
     mesh: DeviceMesh,
@@ -136,6 +176,9 @@ def dedicate_params(
     replicate_mesh: Optional[DeviceMesh] = None,
     hook_boundary_predicate: Optional[Callable[[nn.Module], bool]] = None,
     hook_boundary_strict: bool = True,
+    hook_boundary_resolver: Optional[HookBoundaryResolver] = None,
+    assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
+    max_owners_per_group: Optional[int] = None,
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -202,6 +245,14 @@ def dedicate_params(
             is given, raise if a dedicated param has no ancestor matching the
             predicate. When False, fall back to the param's direct parent
             module. Strict is recommended to avoid silent per-sub-module hooks.
+        hook_boundary_resolver: Optional ``(param_fqn, param) -> module`` hook
+            selector for models whose execution boundary is not an ancestor of
+            the parameter. It takes precedence over ``hook_boundary_predicate``.
+        assignment_group_key_fn: Optional ``(param_fqn, param) -> key`` selector
+            used by the owner assignment pass. Use this to align owner packing
+            with communication boundaries.
+        max_owners_per_group: Optional cap on distinct owner slots used by one
+            assignment group.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its DP owner
@@ -217,6 +268,8 @@ def dedicate_params(
     result = compute_balanced_assignment(
         model, mesh, predicate,
         replicate_mesh=replicate_mesh,
+        assignment_group_key_fn=assignment_group_key_fn,
+        max_owners_per_group=max_owners_per_group,
     )
     assignment = result.dp_owners
     if not assignment:
@@ -275,21 +328,18 @@ def dedicate_params(
 
     # 4. Group by layer module and create DedicatedParam + DedicatedState
     layer_to_dparams: dict[nn.Module, list[DedicatedParam]] = defaultdict(list)
+    param_to_fqn = {param: name for name, param in model.named_parameters()}
 
     for param, coord in normalized.items():
-        if hook_boundary_predicate is not None:
-            # User-explicit hook boundary: lowest ancestor where predicate holds.
-            # Mirrors FSDP2 `fully_shard(module, ...)` granularity — the user
-            # tells DMuon where the per-layer unit is, independent of DMuon's
-            # global LPT partition.
-            layer_module = _find_hook_module(
-                model, param, hook_boundary_predicate, strict=hook_boundary_strict
-            )
-            parent_module, param_name = _find_parent_module(model, param)
-        else:
-            # Default heuristic: infer layer module from `layers.N` / `blocks.N`
-            # in the FQN; fall back to parent module if neither matches.
-            layer_module, parent_module, param_name = _find_layer_module(model, param)
+        parent_module, param_name = _find_parent_module(model, param)
+        layer_module = _resolve_hook_module(
+            model,
+            param,
+            param_fqn=param_to_fqn[param],
+            hook_boundary_predicate=hook_boundary_predicate,
+            hook_boundary_resolver=hook_boundary_resolver,
+            strict=hook_boundary_strict,
+        )
         if (
             is_tp_sharded(param, dp_mesh_dim_names)
             and param not in result.tp_owners
@@ -314,8 +364,10 @@ def dedicate_params(
         layer_to_dparams[layer_module].append(d_param)
 
     all_states: list[DedicatedState] = []
+    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     for layer_module, d_params in layer_to_dparams.items():
         group = DedicatedParamGroup(d_params, comm_ctx)
+        group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         state = DedicatedState(layer_module, group, comm_ctx, reshard_after_forward)
         layer_module._dedicated_state = state
         all_states.append(state)
@@ -337,6 +389,9 @@ def dedicate_params_ddp(
     compute_dtype: Optional[torch.dtype] = None,
     hook_boundary_predicate: Optional[Callable[[nn.Module], bool]] = None,
     hook_boundary_strict: bool = True,
+    hook_boundary_resolver: Optional[HookBoundaryResolver] = None,
+    assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
+    max_owners_per_group: Optional[int] = None,
 ) -> dict[nn.Parameter, int]:
     """DDP-path variant of :func:`dedicate_params`.
 
@@ -368,6 +423,9 @@ def dedicate_params_ddp(
             :func:`dedicate_params`. Default heuristic uses
             ``layers.N`` / ``blocks.N``.
         hook_boundary_strict: Same as :func:`dedicate_params`.
+        hook_boundary_resolver: Same as :func:`dedicate_params`.
+        assignment_group_key_fn: Same as :func:`dedicate_params`.
+        max_owners_per_group: Same as :func:`dedicate_params`.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its owner
@@ -379,7 +437,13 @@ def dedicate_params_ddp(
             "For HSDP use dedicate_params + fully_shard with replicate_mesh."
         )
 
-    result = compute_balanced_assignment(model, mesh, predicate)
+    result = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate,
+        assignment_group_key_fn=assignment_group_key_fn,
+        max_owners_per_group=max_owners_per_group,
+    )
     assignment = result.dp_owners
     if not assignment:
         logger.warning("dedicate_params_ddp: no parameters matched the predicate")
@@ -421,15 +485,18 @@ def dedicate_params_ddp(
     comm_ctx = DedicatedCommContext(device, replicate_group=None)
 
     layer_to_dparams: dict[nn.Module, list[DedicatedParamDDP]] = defaultdict(list)
+    param_to_fqn = {param: name for name, param in model.named_parameters()}
 
     for param, coord in normalized.items():
-        if hook_boundary_predicate is not None:
-            layer_module = _find_hook_module(
-                model, param, hook_boundary_predicate, strict=hook_boundary_strict
-            )
-            parent_module, param_name = _find_parent_module(model, param)
-        else:
-            layer_module, parent_module, param_name = _find_layer_module(model, param)
+        parent_module, param_name = _find_parent_module(model, param)
+        layer_module = _resolve_hook_module(
+            model,
+            param,
+            param_fqn=param_to_fqn[param],
+            hook_boundary_predicate=hook_boundary_predicate,
+            hook_boundary_resolver=hook_boundary_resolver,
+            strict=hook_boundary_strict,
+        )
 
         d_param = DedicatedParamDDP(
             param=param,
@@ -443,8 +510,10 @@ def dedicate_params_ddp(
         layer_to_dparams[layer_module].append(d_param)
 
     all_states: list[DedicatedState] = []
+    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     for layer_module, d_params in layer_to_dparams.items():
         group = DedicatedParamGroupDDP(d_params, comm_ctx)
+        group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         # ``reshard_after_forward`` is meaningless on the DDP path (no
         # storage to free). Pass False so DedicatedState skips the
         # ``group.reshard()`` call in post-forward. On DDP groups

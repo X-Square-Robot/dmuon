@@ -7,12 +7,14 @@ synchronization instead of CPU-blocking work.wait().
 
 import os
 from collections import defaultdict
+from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
 
 from dmuon._core.comm import DedicatedCommContext
+from dmuon._core.dynamo import dynamo_disable
 from dmuon._core.owner_rank import OwnerCoord
 
 from .param import DedicatedParam
@@ -21,6 +23,17 @@ try:
     from torch.distributed.tensor import DTensor as _DTensor
 except ImportError:
     _DTensor = None
+
+
+@contextmanager
+def _profile_range(name: str):
+    if bool(int(os.environ.get("DMUON_TORCH_PROFILE_MARKERS", "0") or 0)):
+        from torch.profiler import record_function
+
+        with record_function(name):
+            yield
+    else:
+        yield
 
 
 class ReplicateReduceState(NamedTuple):
@@ -52,13 +65,15 @@ class TPScatterState(NamedTuple):
     without waiting; the event is consumed on the next iteration's
     :meth:`_pre_forward_wait` hook.
 
-    The state pins TP-owner send shards until the scatter event is visible.
+    The state pins TP-owner send shards and receiver scratch shards until the
+    scatter/update event is visible.
     This is required because the owner builds transient contiguous split
     tensors for ``scatter_list`` and ``Muon._step_muon`` clears
     ``_tp_full_delta`` before async communication has necessarily consumed
-    those tensors.  Recv shards are not pinned here: the dispatch body calls
-    ``recv_shard.record_stream(bcast_stream)``, which is the correct
-    allocator-safety primitive for receive buffers.
+    those tensors.  Receiver scratch shards are also used by an enqueued
+    ``_owned_data.mul_(wd).add_(recv_shard)`` on the same stream, so keep a
+    Python reference until the event is consumed instead of relying only on
+    allocator stream recording.
     """
 
     refs: list[torch.Tensor]
@@ -126,6 +141,8 @@ class DedicatedParamGroup:
         self._broadcast_event: Optional[torch.cuda.Event] = None
         self._post_reduce_event: Optional[torch.cuda.Event] = None
         self._replicate_reduce_state: Optional[ReplicateReduceState] = None
+        self._muon_grad_ready_event: Optional[torch.cuda.Event] = None
+        self._muon_grad_ready_refs: list[torch.Tensor] = []
         # Phase B.2 / C.1: replicate-dim post-step broadcast state.
         #
         # Two event/state fields coexist — they correspond to two code paths:
@@ -159,6 +176,8 @@ class DedicatedParamGroup:
         # Consumed together with the replicate broadcast state in
         # ``_pre_forward_wait``. See ``tp_design.md`` §4.2 (O2) + §5 fallback.
         self._tp_scatter_state: Optional[TPScatterState] = None
+        self._tp_gather_event: Optional[torch.cuda.Event] = None
+        self._tp_gather_refs: list[torch.Tensor] = []
         self._tp_sync_fallback: bool = False
         self._last_tp_scatter_wait_us: float = 0.0
         self._tp_scatter_slow_wait_count: int = 0
@@ -171,7 +190,9 @@ class DedicatedParamGroup:
         self._partial_reduce_by_param: dict[int, torch.Tensor] = {}
 
         # Deferred reduce unpack (fixes data race in old _packed_reduce)
-        self._pending_reduce: list[tuple[Optional[torch.Tensor], list[DedicatedParam]]] = []
+        self._pending_reduce: list[
+            tuple[Optional[torch.Tensor], list[DedicatedParam]]
+        ] = []
 
         # Prefetch tracking (mirrors FSDPParamGroup._post_forward_indices)
         self._post_forward_indices: list[int] = []
@@ -231,11 +252,14 @@ class DedicatedParamGroup:
         # calls. dst views survive ``free_storage`` → ``alloc_storage`` because
         # they share the packed buf's Storage object (resize is in-place).
         from dmuon._core.internal_utils import free_storage
+
         self._packed_buf_by_owner: dict[OwnerCoord, torch.Tensor] = {}
         self._copy_in_dsts_by_owner: dict[OwnerCoord, list[torch.Tensor]] = {}
         if self._comm_dtype is not None:
             for owner, total_numel in self._total_numel_by_owner.items():
-                packed = torch.empty(total_numel, dtype=self._comm_dtype, device=self.device)
+                packed = torch.empty(
+                    total_numel, dtype=self._comm_dtype, device=self.device
+                )
                 self._packed_buf_by_owner[owner] = packed
                 # Bind each param to a view of its owner's packed buf and
                 # cache a 1-D dst slice for foreach copy-in.
@@ -251,6 +275,7 @@ class DedicatedParamGroup:
 
     # ---- unshard (broadcast) — dispatch phase ----
 
+    @dynamo_disable
     def unshard(self):
         """Dispatch broadcasts on broadcast_stream. Does NOT wait.
 
@@ -277,6 +302,7 @@ class DedicatedParamGroup:
         broadcast_stream.wait_stream(torch.cuda.current_stream())
 
         from dmuon._core.internal_utils import alloc_storage
+
         dp_group = self._dp_group
         local_shard_rank = dp_group.rank()
         with torch.cuda.stream(broadcast_stream):
@@ -285,8 +311,9 @@ class DedicatedParamGroup:
             # preserve_version_counter so autograd doesn't see the resize /
             # copy_ as an inplace modification of tensors in the compute graph.
             for owner_coord, packed_buf in self._packed_buf_by_owner.items():
-                with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
-                    packed_buf
+                with (
+                    torch.no_grad(),
+                    torch.autograd._unsafe_preserve_version_counter(packed_buf),
                 ):
                     alloc_storage(packed_buf)
 
@@ -301,12 +328,12 @@ class DedicatedParamGroup:
             for owner_coord, dsts in self._copy_in_dsts_by_owner.items():
                 if owner_coord[0] != local_shard_rank:
                     continue
-                srcs = [
-                    p._owned_data.view(-1)
-                    for p in self._by_owner[owner_coord]
-                ]
-                with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
-                    self._packed_buf_by_owner[owner_coord]
+                srcs = [p._owned_data.view(-1) for p in self._by_owner[owner_coord]]
+                with (
+                    torch.no_grad(),
+                    torch.autograd._unsafe_preserve_version_counter(
+                        self._packed_buf_by_owner[owner_coord]
+                    ),
                 ):
                     torch._foreach_copy_(dsts, srcs)
 
@@ -320,6 +347,7 @@ class DedicatedParamGroup:
 
         self._broadcast_event = broadcast_stream.record_event()
 
+    @dynamo_disable
     def wait_for_unshard(self):
         """GPU-side wait for broadcasts to complete, then finalize params.
 
@@ -340,6 +368,7 @@ class DedicatedParamGroup:
 
     # ---- reshard ----
 
+    @dynamo_disable
     def reshard(self):
         """Reshard all params: detach from modules, then free packed buffers.
 
@@ -361,15 +390,18 @@ class DedicatedParamGroup:
         for p in self.params:
             p.reshard()
         from dmuon._core.internal_utils import free_storage
+
         for packed_buf in self._packed_buf_by_owner.values():
-            with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(
-                packed_buf
+            with (
+                torch.no_grad(),
+                torch.autograd._unsafe_preserve_version_counter(packed_buf),
             ):
                 free_storage(packed_buf)
         self._is_unsharded = False
 
     # ---- gradient reduction — dispatch phase ----
 
+    @dynamo_disable
     def reduce_grads(self):
         """Dispatch gradient reduces. Stage-1 on the shard (``dp_group``) dim,
         and — when HSDP is enabled and ``replicate_grads_enabled`` — Stage-2
@@ -415,7 +447,10 @@ class DedicatedParamGroup:
         # without optimizer.step). This ensures _reduced_grad is accumulated before
         # we dispatch a new reduce that would overwrite _pending_reduce/
         # _post_reduce_event.
-        if self._post_reduce_event is not None or self._replicate_reduce_state is not None:
+        if (
+            self._post_reduce_event is not None
+            or self._replicate_reduce_state is not None
+        ):
             self.wait_for_reduce()
 
         # Merge any accumulated gradients from prior no_sync steps
@@ -459,8 +494,10 @@ class DedicatedParamGroup:
                         grad = grad._local_tensor
                     grad = grad.contiguous()
                     dist.reduce(
-                        grad, dst=self._global_owner_ranks[p.owner_rank],
-                        op=dist.ReduceOp.AVG, group=dp_group,
+                        grad,
+                        dst=self._global_owner_ranks[p.owner_rank],
+                        op=dist.ReduceOp.AVG,
+                        group=dp_group,
                     )
                     p._unsharded_param.grad = None
                     self._pending_reduce.append((grad.view(-1), [p]))
@@ -515,12 +552,17 @@ class DedicatedParamGroup:
                 if existing is not None:
                     existing.add_(grad.view(p._orig_size))
                 else:
-                    self._partial_reduce_by_param[id(p)] = grad.view(p._orig_size).clone()
+                    self._partial_reduce_by_param[id(p)] = grad.view(
+                        p._orig_size
+                    ).clone()
             self._post_reduce_event = stage1_event
         else:
             self._post_reduce_event = stage1_event
 
-    def wait_for_reduce(self):
+    @dynamo_disable
+    def wait_for_reduce(
+        self, stream: Optional[torch.cuda.Stream] = None
+    ) -> Optional[torch.cuda.Event]:
         """GPU-side wait for reduces to complete, then save owner grad.
 
         Mirrors FSDP2's ``_wait_for_post_backward`` (``_fsdp_param_group.py:
@@ -533,36 +575,53 @@ class DedicatedParamGroup:
         ``is_owner`` already encodes both shard and replicate dimensions.
         """
         if self._post_reduce_event is None and self._replicate_reduce_state is None:
-            return
+            return None
 
-        current_stream = torch.cuda.current_stream()
-        if self._post_reduce_event is not None:
-            current_stream.wait_event(self._post_reduce_event)
-            self._post_reduce_event = None
-        if (
-            self._replicate_reduce_state is not None
-            and self._replicate_reduce_state.event is not None
-        ):
-            current_stream.wait_event(self._replicate_reduce_state.event)
+        target_stream = stream if stream is not None else torch.cuda.current_stream()
+        replicate_state = self._replicate_reduce_state
+
+        def _wait_and_unpack() -> None:
+            if self._post_reduce_event is not None:
+                target_stream.wait_event(self._post_reduce_event)
+            if replicate_state is not None and replicate_state.event is not None:
+                target_stream.wait_event(replicate_state.event)
+
+            for grad_buf, plist in self._pending_reduce:
+                if grad_buf is None:
+                    continue
+                p = plist[0]
+                if not p.is_owner:
+                    continue
+                new_grad = grad_buf.view(p._orig_size)
+                if p._reduced_grad is not None:
+                    p._reduced_grad.add_(new_grad)
+                else:
+                    p._reduced_grad = new_grad.clone()
+
+        if stream is None:
+            _wait_and_unpack()
+        else:
+            with torch.cuda.stream(stream):
+                _wait_and_unpack()
+
+        self._post_reduce_event = None
         self._replicate_reduce_state = None
-
-        for grad_buf, plist in self._pending_reduce:
-            if grad_buf is None:
-                continue
-            p = plist[0]
-            if not p.is_owner:
-                continue
-            new_grad = grad_buf.view(p._orig_size)
-            if p._reduced_grad is not None:
-                p._reduced_grad.add_(new_grad)
-            else:
-                p._reduced_grad = new_grad.clone()
-
+        self._muon_grad_ready_refs = [
+            grad_buf
+            for grad_buf, _plist in self._pending_reduce
+            if grad_buf is not None
+        ]
+        if replicate_state is not None:
+            self._muon_grad_ready_refs.append(replicate_state.replicate_input)
         self._pending_reduce = []
+        self._muon_grad_ready_event = target_stream.record_event()
+        return self._muon_grad_ready_event
 
     # ---- TP gather (T2a) -------------------------------------------------
 
-    def tp_gather_grads(self) -> None:
+    def tp_gather_grads(
+        self, *, wait_current_stream: bool = True
+    ) -> Optional[torch.cuda.Event]:
         """Reassemble the full (M, N) gradient on the TP owner for every
         TP-sharded parameter in this group.
 
@@ -600,44 +659,82 @@ class DedicatedParamGroup:
             work.append((p, p._reduced_grad))
 
         if not work:
-            return
+            self._tp_gather_event = None
+            self._tp_gather_refs = []
+            return None
 
-        # Ensure the gather sees the final reduced grad (wait_for_reduce
-        # already ran on the current stream; reduce_stream may still be
-        # mid-flight from an unrelated reduce).
-        reduce_stream.wait_stream(torch.cuda.current_stream())
+        # Compatibility path: wait_for_reduce may have unpacked _reduced_grad
+        # on the current compute stream, so the gather must follow it.
+        # Per-group prefetch unpacks on reduce_stream and disables this wait
+        # so later groups' gathers can overlap current-group NS work.
+        if wait_current_stream:
+            reduce_stream.wait_stream(torch.cuda.current_stream())
+
+        grouped_work = []
+        for item in work:
+            tp_group = item[0].tp_group
+            for group, items in grouped_work:
+                if group is tp_group:
+                    items.append(item)
+                    break
+            else:
+                grouped_work.append((tp_group, [item]))
 
         with torch.cuda.stream(reduce_stream):
-            with dist._coalescing_manager(group=None, device=self.device):
-                for p, local_grad in work:
-                    tp_size = p.tp_group.size()
-                    if p.is_tp_owner:
-                        # Allocate the full (M, N) buffer fresh every step
-                        # (MVP — see tp_design.md §6.7 note on pre-alloc
-                        # deferral).  gather_list entries must be separate
-                        # tensors; we cat them post-gather along shard_dim.
-                        shard_dim = p.shard_dim if p.shard_dim is not None else 0
-                        recv_bufs = [
-                            torch.empty_like(local_grad) for _ in range(tp_size)
-                        ]
-                        dist.gather(
-                            local_grad,
-                            gather_list=recv_bufs,
-                            dst=p._tp_owner_global_rank,
-                            group=p.tp_group,
-                        )
-                        p._tp_full_grad = torch.cat(recv_bufs, dim=shard_dim)
-                    else:
-                        dist.gather(
-                            local_grad,
-                            gather_list=None,
-                            dst=p._tp_owner_global_rank,
-                            group=p.tp_group,
-                        )
-                        p._tp_full_grad = None
-        # No event record: the TP owner consumes ``_tp_full_grad`` on the
-        # default (compute) stream in optimizer.step, which will
-        # ``wait_stream(reduce_stream)`` just before reading.
+            gather_refs: list[torch.Tensor] = []
+            gathered_full_grads: list[
+                tuple[DedicatedParam, list[torch.Tensor], torch.Tensor, int]
+            ] = []
+            for tp_group, group_work in grouped_work:
+                with dist._coalescing_manager(group=tp_group, device=self.device):
+                    for p, local_grad in group_work:
+                        tp_size = p.tp_group.size()
+                        if p.is_tp_owner:
+                            # Allocate the full (M, N) buffer fresh every step
+                            # (MVP — see tp_design.md §6.7 note on pre-alloc
+                            # deferral).  gather_list entries must be separate
+                            # tensors; we cat them post-gather along shard_dim.
+                            shard_dim = p.shard_dim if p.shard_dim is not None else 0
+                            recv_bufs = [
+                                torch.empty_like(local_grad) for _ in range(tp_size)
+                            ]
+                            gather_refs.extend(recv_bufs)
+                            gather_refs.append(local_grad)
+                            dist.gather(
+                                local_grad,
+                                gather_list=recv_bufs,
+                                dst=p._tp_owner_global_rank,
+                                group=p.tp_group,
+                            )
+                            gathered_full_grads.append(
+                                (p, recv_bufs, local_grad, shard_dim)
+                            )
+                        else:
+                            gather_refs.append(local_grad)
+                            dist.gather(
+                                local_grad,
+                                gather_list=None,
+                                dst=p._tp_owner_global_rank,
+                                group=p.tp_group,
+                            )
+                            p._tp_full_grad = None
+            for p, recv_bufs, local_grad, shard_dim in gathered_full_grads:
+                recv_bufs[p.tp_group.rank()] = local_grad
+                p._tp_full_grad = torch.cat(recv_bufs, dim=shard_dim)
+            self._tp_gather_refs = gather_refs
+        self._tp_gather_event = reduce_stream.record_event()
+        self._muon_grad_ready_event = self._tp_gather_event
+        return self._tp_gather_event
+
+    def wait_for_tp_gather(self) -> None:
+        """Wait until this group's TP gathered grads are visible to compute."""
+        if self._tp_gather_event is None:
+            return
+        torch.cuda.current_stream().wait_event(self._tp_gather_event)
+        self._tp_gather_event = None
+        self._tp_gather_refs = []
+        self._muon_grad_ready_refs = []
+        self._muon_grad_ready_event = None
 
     # ---- TP scatter (T2b) ------------------------------------------------
 
@@ -654,7 +751,8 @@ class DedicatedParamGroup:
         pending updates (no dispatch happened).
         """
         work: list[DedicatedParam] = [
-            p for p in self.params
+            p
+            for p in self.params
             if p.tp_group is not None and p._reduced_grad is not None
         ]
         if not work:
@@ -665,44 +763,72 @@ class DedicatedParamGroup:
 
         refs: list[torch.Tensor] = []
         updates: list[tuple[DedicatedParam, torch.Tensor]] = []
+        grouped_work = []
+        for p in work:
+            for group, items in grouped_work:
+                if group is p.tp_group:
+                    items.append(p)
+                    break
+            else:
+                grouped_work.append((p.tp_group, [p]))
+
         with torch.cuda.stream(bcast_stream):
-            with dist._coalescing_manager(group=None, device=self.device):
-                for p in work:
-                    shard_dim = p.shard_dim if p.shard_dim is not None else 0
-                    recv_shard = torch.empty_like(p._owned_data)
-                    if p.is_tp_owner:
-                        assert p._tp_full_delta is not None, (
-                            f"{p.param_name}: TP owner has _tp_full_delta=None "
-                            "— Muon._step_muon did not populate it."
-                        )
-                        splits = [
-                            s.contiguous()
-                            for s in p._tp_full_delta.split(
-                                p._orig_size[shard_dim], dim=shard_dim,
+            for tp_group, group_work in grouped_work:
+                with dist._coalescing_manager(group=tp_group, device=self.device):
+                    for p in group_work:
+                        shard_dim = p.shard_dim if p.shard_dim is not None else 0
+                        recv_shard = torch.empty_like(p._owned_data)
+                        refs.append(recv_shard)
+                        if p.is_tp_owner:
+                            assert p._tp_full_delta is not None, (
+                                f"{p.param_name}: TP owner has _tp_full_delta=None "
+                                "— Muon._step_muon did not populate it."
                             )
-                        ]
-                        refs.extend(splits)
-                        dist.scatter(
-                            recv_shard,
-                            scatter_list=splits,
-                            src=p._tp_owner_global_rank,
-                            group=p.tp_group,
-                        )
-                    else:
-                        dist.scatter(
-                            recv_shard,
-                            scatter_list=None,
-                            src=p._tp_owner_global_rank,
-                            group=p.tp_group,
-                        )
-                    updates.append((p, recv_shard))
+                            # The contiguous split copies are enqueued on
+                            # bcast_stream below. Keep the source full-delta
+                            # alive until the scatter event is consumed;
+                            # otherwise async group pipelining can let later
+                            # NS allocations reuse its storage before those
+                            # copies have actually read it.
+                            refs.append(p._tp_full_delta)
+                            splits = [
+                                s.contiguous()
+                                for s in p._tp_full_delta.split(
+                                    p._orig_size[shard_dim],
+                                    dim=shard_dim,
+                                )
+                            ]
+                            refs.extend(splits)
+                            dist.scatter(
+                                recv_shard,
+                                scatter_list=splits,
+                                src=p._tp_owner_global_rank,
+                                group=p.tp_group,
+                            )
+                            # ``dist.scatter`` is needed for the remote TP
+                            # peers, but the source rank's output tensor is
+                            # not a portable way to obtain its own shard.
+                            # Use the already materialized split matching the
+                            # local TP rank, otherwise deterministic debug
+                            # fill can expose an uninitialized recv tensor.
+                            update_shard = splits[p.tp_group.rank()]
+                        else:
+                            dist.scatter(
+                                recv_shard,
+                                scatter_list=None,
+                                src=p._tp_owner_global_rank,
+                                group=p.tp_group,
+                            )
+                            update_shard = recv_shard
+                        refs.append(recv_shard)
+                        updates.append((p, update_shard))
 
             # Keep the local weight update explicitly after the coalesced
             # scatter dispatch.  This avoids relying on private
             # _coalescing_manager launch timing for recv_shard readiness.
-            for p, recv_shard in updates:
-                p._owned_data.mul_(p._tp_wd_factor).add_(recv_shard)
-                recv_shard.record_stream(bcast_stream)
+            for p, update_shard in updates:
+                p._owned_data.mul_(p._tp_wd_factor).add_(update_shard)
+                update_shard.record_stream(bcast_stream)
                 p._tp_full_grad = None
                 p._tp_full_delta = None
                 p._reduced_grad = None
@@ -733,9 +859,7 @@ class DedicatedParamGroup:
         # CPU block, so keep TP-owner split tensors alive until the event is
         # consumed by the next pre-forward/wait_all drain.
         torch.cuda.current_stream().wait_event(event)
-        self._tp_scatter_state = TPScatterState(
-            refs=refs, event=event
-        )
+        self._tp_scatter_state = TPScatterState(refs=refs, event=event)
 
     def tp_scatter_delta_async(self) -> None:
         """T2d async variant of :meth:`tp_scatter_delta`.
@@ -749,23 +873,28 @@ class DedicatedParamGroup:
 
         Gate semantics:
           * ``_tp_sync_fallback=True`` → degrade to sync; state stays IDLE.
+          * ``DMUON_TP_SCATTER_ASYNC`` unset/false → correctness-first sync
+            fallback; this keeps async replicate broadcast enabled while
+            avoiding rank-order/lifetime bugs in the experimental TP scatter.
           * Double-dispatch (state still PENDING) → ``RuntimeError``.
         """
-        if self._tp_sync_fallback:
+        tp_async_enabled = os.environ.get(
+            "DMUON_TP_SCATTER_ASYNC", "0"
+        ).lower() not in {"0", "false", "no", "off"}
+        if self._tp_sync_fallback or not tp_async_enabled:
             self.tp_scatter_delta()
             return
         if self._tp_scatter_state is not None:
+            group_name = getattr(self, "_debug_name", "<unknown>")
             raise RuntimeError(
-                "tp_scatter_delta_async: previous event still pending — "
+                f"tp_scatter_delta_async[{group_name}]: previous event still pending — "
                 "pre_forward_wait was not consumed before the next dispatch"
             )
         refs = self._tp_scatter_dispatch()
         if refs is None:
             return
         event = self.comm_ctx.replicate_broadcast_stream.record_event()
-        self._tp_scatter_state = TPScatterState(
-            refs=refs, event=event
-        )
+        self._tp_scatter_state = TPScatterState(refs=refs, event=event)
 
     # ---- replicate-dim post-step broadcast (Phase B.2) -------------------
 
@@ -801,9 +930,7 @@ class DedicatedParamGroup:
         bcast_stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(bcast_stream):
-            with dist._coalescing_manager(
-                group=replicate_group, device=self.device
-            ):
+            with dist._coalescing_manager(group=replicate_group, device=self.device):
                 for p in self.params:
                     if my_shard_rank != p.owner_shard:
                         continue
@@ -862,8 +989,9 @@ class DedicatedParamGroup:
             return
 
         if self._replicate_broadcast_state is not None:
+            group_name = getattr(self, "_debug_name", "<unknown>")
             raise RuntimeError(
-                "replicate_broadcast_async: previous event still pending — "
+                f"replicate_broadcast_async[{group_name}]: previous event still pending — "
                 "pre_forward_wait was not consumed before the next dispatch"
             )
 
@@ -879,9 +1007,7 @@ class DedicatedParamGroup:
         # the coalescing manager below.
         pin_ref: Optional[torch.Tensor] = None
         with torch.cuda.stream(bcast_stream):
-            with dist._coalescing_manager(
-                group=replicate_group, device=self.device
-            ):
+            with dist._coalescing_manager(group=replicate_group, device=self.device):
                 for p in self.params:
                     if my_shard_rank != p.owner_shard:
                         continue
@@ -900,6 +1026,7 @@ class DedicatedParamGroup:
             event=event,
         )
 
+    @dynamo_disable
     def _pre_forward_wait(self) -> None:
         """Phase C.3: consume any pending async replicate broadcast before
         the shard-dim unshard's copy-in reads ``_owned_data``.
@@ -914,6 +1041,7 @@ class DedicatedParamGroup:
         round-trip per group per step and is NOT safe to leave on in
         production; it is meant for fallback monitoring + profiling.
         """
+        group_name = getattr(self, "_debug_name", None) or f"group_{id(self):x}"
         # T2d: drain the async TP scatter state first.  The scatter is
         # what writes ``_owned_data`` on every DP-owner TP rank; the
         # replicate broadcast fans that value out.  In pure-DP mode (no
@@ -924,6 +1052,27 @@ class DedicatedParamGroup:
         # (and its pinned TP-owner send refs) can be released.
         tp_state = self._tp_scatter_state
         if tp_state is not None:
+            with _profile_range(f"dmuon.pre_forward_wait.tp_scatter.{group_name}"):
+                profile_enabled = bool(
+                    int(os.environ.get("DMUON_REPLICATE_PROFILE", "0") or 0)
+                )
+                if profile_enabled:
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    torch.cuda.current_stream().wait_event(tp_state.event)
+                    end.record()
+                    end.synchronize()
+                    self._last_tp_scatter_wait_us = start.elapsed_time(end) * 1000.0
+                else:
+                    torch.cuda.current_stream().wait_event(tp_state.event)
+            self._tp_scatter_state = None
+
+        state = self._replicate_broadcast_state
+        if state is None:
+            return
+
+        with _profile_range(f"dmuon.pre_forward_wait.replicate.{group_name}"):
             profile_enabled = bool(
                 int(os.environ.get("DMUON_REPLICATE_PROFILE", "0") or 0)
             )
@@ -931,38 +1080,20 @@ class DedicatedParamGroup:
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-                torch.cuda.current_stream().wait_event(tp_state.event)
+                torch.cuda.current_stream().wait_event(state.event)
                 end.record()
+                # ``elapsed_time`` requires both events to be complete; the
+                # current-stream synchronize is the cheapest way to enforce it
+                # (only waits on the two timing events on the default stream).
                 end.synchronize()
-                self._last_tp_scatter_wait_us = (
-                    start.elapsed_time(end) * 1000.0
+                self._last_replicate_wait_us = start.elapsed_time(end) * 1000.0  # ms→μs
+                from dmuon import _replicate_profile
+
+                _replicate_profile.record_wait_from_group(
+                    self, self._last_replicate_wait_us
                 )
             else:
-                torch.cuda.current_stream().wait_event(tp_state.event)
-            self._tp_scatter_state = None
-
-        state = self._replicate_broadcast_state
-        if state is None:
-            return
-
-        profile_enabled = bool(int(os.environ.get("DMUON_REPLICATE_PROFILE", "0") or 0))
-        if profile_enabled:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            torch.cuda.current_stream().wait_event(state.event)
-            end.record()
-            # ``elapsed_time`` requires both events to be complete; the
-            # current-stream synchronize is the cheapest way to enforce it
-            # (only waits on the two timing events on the default stream).
-            end.synchronize()
-            self._last_replicate_wait_us = start.elapsed_time(end) * 1000.0  # ms→μs
-            from dmuon import _replicate_profile
-            _replicate_profile.record_wait_from_group(
-                self, self._last_replicate_wait_us
-            )
-        else:
-            torch.cuda.current_stream().wait_event(state.event)
+                torch.cuda.current_stream().wait_event(state.event)
 
         self._replicate_broadcast_state = None
 
@@ -1025,6 +1156,7 @@ class DedicatedParamGroup:
 
     # ---- backward prefetch ----
 
+    @dynamo_disable
     def _backward_prefetch(self) -> None:
         """Prefetch next layer's unshard during current layer's backward.
 
@@ -1046,6 +1178,7 @@ class DedicatedParamGroup:
             return  # target already backward'd — prefetch would read stale data
         target_group.unshard()  # dispatch only — no wait
 
+    @dynamo_disable
     def _record_post_forward(self) -> None:
         """Record this group's position in forward order for backward prefetch."""
         post_forward_index = len(self.comm_ctx.post_forward_order)

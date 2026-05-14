@@ -150,6 +150,42 @@ def test_same_layer_different_ranks(model):
     )
 
 
+def test_max_owners_per_assignment_group_caps_owner_spread():
+    """A custom group can deliberately trade load balance for fewer broadcasts."""
+    mesh = FakeDeviceMesh(8)
+    model = MiniModel(num_layers=1, hidden=1024, intermediate=8192)
+
+    default = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate=lambda n, p: "proj" in n,
+        assignment_group_key_fn=lambda _n, _p: "packed.layer",
+    ).dp_owners
+    capped = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate=lambda n, p: "proj" in n,
+        assignment_group_key_fn=lambda _n, _p: "packed.layer",
+        max_owners_per_group=2,
+    ).dp_owners
+
+    assert len(set(default.values())) > 2
+    assert len(set(capped.values())) <= 2
+
+
+def test_max_owners_per_assignment_group_rejects_non_positive():
+    mesh = FakeDeviceMesh(8)
+    model = MiniModel(num_layers=1, hidden=1024, intermediate=8192)
+
+    with pytest.raises(ValueError, match="max_owners_per_group"):
+        compute_balanced_assignment(
+            model,
+            mesh,
+            predicate=lambda n, p: "proj" in n,
+            max_owners_per_group=0,
+        )
+
+
 def test_small_params_merged(model):
     """Small params (k_proj, v_proj) in the same layer should share owner."""
     mesh = FakeDeviceMesh(8)

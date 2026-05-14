@@ -33,6 +33,7 @@ SMALL_PARAM_THRESHOLD = 5_000_000
 
 OwnerCoord = Tuple[int, int]
 OwnerValue = Union[int, OwnerCoord]
+AssignmentGroupKeyFn = Callable[[str, nn.Parameter], Optional[str]]
 
 
 @dataclass
@@ -130,6 +131,8 @@ def compute_balanced_assignment(
     predicate: Callable[[str, nn.Parameter], bool],
     replicate_mesh: Optional[DeviceMesh] = None,
     tp_owner_strategy: str = "lpt",
+    assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
+    max_owners_per_group: Optional[int] = None,
 ) -> AssignmentResult:
     """Compute a globally balanced dedicated ownership assignment.
 
@@ -160,6 +163,12 @@ def compute_balanced_assignment(
             TP-sharded parameter.  Only ``"lpt"`` is supported publicly.
             Legacy ``"rank0"`` is intentionally rejected to avoid silently
             concentrating all TP-sharded NS compute on one TP rank.
+        assignment_group_key_fn: Optional override for the group key used by
+            LPT's same-group owner-spreading rule. Defaults to
+            ``_extract_layer_id(name)``.
+        max_owners_per_group: Optional cap on distinct DP/HSDP owner slots used
+            by one assignment group. This lets models trade some optimizer load
+            balance for far fewer packed broadcasts at a layer/module boundary.
 
     Returns:
         ``AssignmentResult`` with ``dp_owners`` (shape matches pre-TP
@@ -178,6 +187,8 @@ def compute_balanced_assignment(
             f"Unsupported tp_owner_strategy: {tp_owner_strategy!r}; "
             "DMuon publicly supports only 'lpt'."
         )
+    if max_owners_per_group is not None and max_owners_per_group <= 0:
+        raise ValueError("max_owners_per_group must be positive when set")
 
     dp_names: set[str] = set()
     if mesh.mesh_dim_names:
@@ -187,10 +198,16 @@ def compute_balanced_assignment(
     dp_mesh_dim_names = frozenset(dp_names)
 
     # Collect candidates grouped by layer
+    param_names: dict[nn.Parameter, str] = {}
     layer_params: dict[Optional[str], list[tuple[nn.Parameter, str, int]]] = defaultdict(list)
     for name, param in model.named_parameters():
         if predicate(name, param):
-            layer_id = _extract_layer_id(name)
+            param_names[param] = name
+            layer_id = (
+                assignment_group_key_fn(name, param)
+                if assignment_group_key_fn is not None
+                else _extract_layer_id(name)
+            )
             tp_sharded = is_tp_sharded(param, dp_mesh_dim_names)
             numel = (
                 _param_logical_numel(param) if tp_sharded else _param_numel(param)
@@ -231,8 +248,16 @@ def compute_balanced_assignment(
             merged_numel = sum(s for _, _, s in small)
             alloc_units.append((merged_params, layer_id, merged_numel))
 
-    # Sort by numel descending (LPT)
-    alloc_units.sort(key=lambda x: x[2], reverse=True)
+    # Sort by numel descending (LPT), then by stable parameter names.  Without
+    # the name tie-break, equal-size TP params may pick different owner ranks
+    # across independent processes, which breaks strict loss-alignment checks.
+    alloc_units.sort(
+        key=lambda x: (
+            -x[2],
+            "" if x[1] is None else str(x[1]),
+            ",".join(param_names.get(p, "") for p in x[0]),
+        )
+    )
 
     # Greedy assignment with same-layer concurrency constraint.  Owner slots
     # are the full 2D grid; in shard-only mode every slot has replicate=0
@@ -244,8 +269,14 @@ def compute_balanced_assignment(
 
     for params_list, layer_id, total_numel in alloc_units:
         used_slots = layer_usage[layer_id]
+        candidate_slots = slots
+        if (
+            max_owners_per_group is not None
+            and len(used_slots) >= max_owners_per_group
+        ):
+            candidate_slots = sorted(used_slots)
         best_slot = min(
-            slots,
+            candidate_slots,
             key=lambda s: (s in used_slots, rank_loads[s]),
         )
         for p in params_list:
@@ -292,7 +323,10 @@ def compute_balanced_assignment(
         tp_size = get_tp_mesh(params[0], dp_mesh_dim_names).size()
         tp_loads = [0] * tp_size
         tie_offset = _tp_tie_offset(dp_owner, tp_size)
-        for p in sorted(params, key=_param_logical_numel, reverse=True):
+        for p in sorted(
+            params,
+            key=lambda p: (-_param_logical_numel(p), param_names.get(p, "")),
+        ):
             owner = min(
                 range(tp_size),
                 key=lambda idx: (tp_loads[idx], (idx - tie_offset) % tp_size),

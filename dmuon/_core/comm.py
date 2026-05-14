@@ -50,6 +50,15 @@ class DedicatedCommContext:
             tensor required gradient).
         post_backward_final_callback_queued: guards the callback so it is
             queued at most once per backward pass.
+
+    Rolling reduce drain (1-outstanding):
+        last_reduced_group: most recently ``reduce_grads``-dispatched group
+            whose ``_pending_reduce`` has not been drained yet.  Each new
+            ``_run_post_backward`` waits on this group before dispatching
+            its own reduce, so per-rank backward memory peaks at ~2 groups'
+            full gradients instead of accumulating all N groups until the
+            final ``wait_all_reduces`` / root callback.  Reset by the root
+            post-backward callback at the end of every backward pass.
     """
 
     def __init__(
@@ -83,7 +92,16 @@ class DedicatedCommContext:
         self.post_forward_order: list = []  # DedicatedParamGroup | DedicatedParamGroupDDP
         self.all_states: list[DedicatedState] = []
         self.post_backward_final_callback_queued: bool = False
+        # Rolling-drain pointer for the 1-outstanding reduce policy; see the
+        # class docstring's "Rolling reduce drain" section.  Untyped because
+        # it holds whichever concrete group type the active backend uses
+        # (FSDP2 or DDP), same convention as ``post_forward_order``.
+        self.last_reduced_group = None
 
     def reset_post_forward_order(self) -> None:
         """Clear post-forward order. Call at the start of each forward pass."""
         self.post_forward_order.clear()
+        for state in self.all_states:
+            indices = getattr(state.group, "_post_forward_indices", None)
+            if indices is not None:
+                indices.clear()

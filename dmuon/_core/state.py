@@ -21,6 +21,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 
 from .comm import DedicatedCommContext
+from .dynamo import dynamo_disable
 
 if TYPE_CHECKING:
     # DedicatedState is backend-agnostic — it operates on the shared
@@ -120,12 +121,20 @@ class DedicatedState:
         )
         self._post_forward_handle = module.register_forward_hook(self._post_forward)
 
+    @dynamo_disable
     def _pre_forward(self, module: nn.Module, args, kwargs):
         """Dispatch broadcasts on broadcast_stream, wait, finalize params.
 
         Also wraps an input tensor through _DedicatedPostBackward so that
         gradient reduce + reshard fires after this module's backward.
         """
+        if (
+            not _is_backward_pass()
+            and self.comm_ctx.all_states
+            and self is self.comm_ctx.all_states[0]
+        ):
+            self.comm_ctx.reset_post_forward_order()
+
         # Phase C.3: consume any pending async replicate broadcast from
         # the previous step BEFORE ``unshard`` reads ``_owned_data``.
         # ``_pre_forward_wait`` is a no-op when the group is in IDLE
@@ -133,8 +142,10 @@ class DedicatedState:
         self.group._pre_forward_wait()
         self.group.unshard()            # no-op if already unsharded or prefetched
         self.group.wait_for_unshard()   # no-op if already unsharded
-        # Forward prefetch: dispatch next layer's unshard (no wait)
-        if self._next_group is not None:
+        # Forward prefetch: dispatch next layer's unshard (no wait).
+        # During activation-checkpoint recompute this hook runs inside backward;
+        # the next forward layer is not the next layer consumed by backward.
+        if self._next_group is not None and not _is_backward_pass():
             self._next_group.unshard()  # no-op if already unsharded
         # Reset fast-path flag for this forward — backward (fast path or root
         # callback fallback) will set it True.
@@ -144,6 +155,7 @@ class DedicatedState:
             args, kwargs = self._register_post_backward(args, kwargs)
         return args, kwargs
 
+    @dynamo_disable
     def _post_forward(self, module: nn.Module, input, output):
         """Reshard params (if enabled), record forward order, register pre-backward."""
         if self.reshard_after_forward:
@@ -160,6 +172,7 @@ class DedicatedState:
 
     # ---- post-backward fast path + fallback ------------------------------
 
+    @dynamo_disable
     def _run_post_backward(self) -> None:
         """Execute reduce + reshard. Idempotent per forward.
 
@@ -170,11 +183,25 @@ class DedicatedState:
         Phase 2: autograd writes .grad directly onto the persistent
         ``_unsharded_param`` object, so no forward-time snapshot / transfer
         step is needed — ``reduce_grads`` reads ``.grad`` in place.
+
+        Rolling reduce drain (1-outstanding): before dispatching this group's
+        reduce, wait on the previously-dispatched group's ``_pending_reduce``
+        so per-rank backward memory caps at ~2 groups' full gradients instead
+        of accumulating all N groups until ``wait_all_reduces`` /
+        :func:`_root_post_backward_final_callback` at the end of backward.
+        ``wait_for_reduce`` is idempotent — a no-op when the previous group
+        has already been drained — so this is safe even when callers (e.g.
+        gradient-accumulation paths or the inner-engine root callback under
+        ``use_reentrant=True``) interleave drains and dispatches.
         """
         if self.group._post_backward_fired:
             return
+        prev = self.comm_ctx.last_reduced_group
+        if prev is not None and prev is not self.group:
+            prev.wait_for_reduce()
         self.group.reduce_grads()
         self.group.reshard()
+        self.comm_ctx.last_reduced_group = self.group
         self.group._post_backward_fired = True
 
     def _queue_root_post_backward_callback(self) -> None:
@@ -259,15 +286,30 @@ class DedicatedState:
 def _root_post_backward_final_callback(comm_ctx: DedicatedCommContext) -> None:
     """Run at the end of the backward pass (autograd engine callback).
 
-    Iterates every registered DedicatedState; any whose group did NOT fire
-    post_backward via the fast path gets its post_backward executed here.
-    This is the fallback for cases where no input tensor required gradient,
-    so _DedicatedPostBackward.backward never ran.
+    Two responsibilities:
+
+    1. Force-fire post_backward on any group whose fast path did not run
+       (e.g. when no input tensor required gradient, so
+       ``_DedicatedPostBackward.backward`` never executed).
+    2. Drain the rolling 1-outstanding reduce window: the last group whose
+       reduce was dispatched still has a live ``_pending_reduce`` (held by
+       the rolling-drain protocol — see :meth:`_run_post_backward`).  Walk
+       every registered group and call ``wait_for_reduce`` to release the
+       grad buffer back to the caching allocator before the optimizer step.
+       ``wait_for_reduce`` is idempotent, so already-drained groups are
+       cheap no-ops.
+
+    The two passes are intentionally separated: step 1's ``_run_post_backward``
+    calls may dispatch new reduces (updating ``last_reduced_group``), so the
+    drain in step 2 has to run *after* all dispatches are in flight.
     """
     try:
         for state in comm_ctx.all_states:
             if state.group._post_backward_fired:
                 continue
             state._run_post_backward()
+        for state in comm_ctx.all_states:
+            state.group.wait_for_reduce()
+        comm_ctx.last_reduced_group = None
     finally:
         comm_ctx.post_backward_final_callback_queued = False

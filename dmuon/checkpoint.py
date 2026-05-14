@@ -23,6 +23,7 @@ Usage::
     dmuon.set_optimizer_state_dict(model, optimizer, ckpt["optim"])
 """
 
+import warnings
 from typing import Any
 
 import torch
@@ -59,7 +60,9 @@ def _compute_dedicated_fqns(model: nn.Module) -> dict[DedicatedParam, str]:
 # ---- Broadcast / all-gather helpers ----
 
 
-def _broadcast_from_owner(dp: DedicatedParam, *, cpu_offload: bool) -> torch.Tensor:
+def _broadcast_from_owner(
+    dp: DedicatedParam, *, cpu_offload: bool, keep: bool = True
+) -> torch.Tensor:
     """Broadcast ``_owned_data`` to every rank for a full-param reconstruction.
 
     Phase B: every rank in the owner's shard column already holds a populated
@@ -68,16 +71,45 @@ def _broadcast_from_owner(dp: DedicatedParam, *, cpu_offload: bool) -> torch.Ten
     shard-owner has the up-to-date value because either (a) it IS the global
     owner, or (b) the most recent ``broadcast_all_updates`` fanned the
     updated value into it along the replicate axis.
+
+    If ``keep`` is False, every rank still participates in the NCCL broadcast
+    (otherwise the collective would hang), but the result is discarded and
+    ``None`` is returned. Use this for ``rank0_only`` state dicts so that
+    non-rank0 ranks don't keep a full CPU copy per dedicated param.
     """
     buf = torch.empty(dp._orig_size, dtype=dp._orig_dtype, device=dp.device)
     if dp._owned_data is not None:
         buf.copy_(dp._owned_data.to(dp._orig_dtype))
     dist.broadcast(buf, src=dp._owner_global_rank, group=dp.dp_group)
+    if not keep:
+        del buf
+        return None
     return buf.cpu() if cpu_offload else buf
 
 
+def _owns_dedicated_optimizer_state(dp: DedicatedParam) -> bool:
+    """Return whether this rank owns the Muon momentum state for ``dp``."""
+
+    if getattr(dp, "tp_group", None) is not None:
+        return bool(getattr(dp, "is_tp_owner", False))
+    return bool(dp.is_owner)
+
+
+def _momentum_matrix_shape(dp: DedicatedParam) -> tuple[int, int]:
+    """Matrix shape used by Muon's momentum buffer for a dedicated param."""
+
+    shape = (
+        getattr(dp, "full_shape", dp._orig_size)
+        if getattr(dp, "tp_group", None) is not None
+        else dp._orig_size
+    )
+    m = int(shape[0])
+    n = int(shape.numel() // m)
+    return m, n
+
+
 def _broadcast_state_tensor(
-    tensor, dp: DedicatedParam, *, cpu_offload: bool
+    tensor, dp: DedicatedParam, *, cpu_offload: bool, keep: bool = True
 ) -> torch.Tensor:
     """Broadcast a momentum buffer from the global owner to every rank.
 
@@ -94,17 +126,31 @@ def _broadcast_state_tensor(
 
     In 1D shard-only mode (``replicate_group is None``), Stage 1 is a no-op
     and the behaviour collapses to the original single-broadcast path.
+
+    If ``keep`` is False, every rank still participates in both broadcast
+    stages but the result is discarded and ``None`` is returned (for
+    rank0_only).
     """
-    m = dp._orig_size[0]
-    n = dp._orig_size.numel() // m
+    m, n = _momentum_matrix_shape(dp)
     buf = torch.empty(m, n, dtype=torch.float32, device=dp.device)
-    if dp.is_owner and tensor is not None:
+    if _owns_dedicated_optimizer_state(dp) and tensor is not None:
         assert tensor.shape == (m, n), (
             f"Momentum buffer shape {tensor.shape} does not match expected "
-            f"({m}, {n}) derived from param shape {dp._orig_size}. "
+            f"({m}, {n}) derived from param shape "
+            f"{getattr(dp, 'full_shape', dp._orig_size)}. "
             f"If _step_muon's view convention changed, update _broadcast_state_tensor."
         )
         buf.copy_(tensor.float())
+    # TP stage — for TP-sharded dedicated params, Muon momentum lives only on
+    # the TP owner.  First fan it to the other TP peers in the owner
+    # shard/replicate cell; the existing replicate/shard stages below then
+    # distribute that per-TP-coordinate buffer through HSDP/DP.
+    if getattr(dp, "tp_group", None) is not None and dp.is_owner:
+        dist.broadcast(
+            buf,
+            src=dp._tp_owner_global_rank,
+            group=dp.tp_group,
+        )
     # Stage 1 — replicate axis (HSDP only).  Fires only on ranks in the
     # owner's shard column; on other ranks the replicate_group is a
     # different process group (belonging to their own shard column) and
@@ -122,11 +168,14 @@ def _broadcast_state_tensor(
     # shard-owner rank has the full buffer; now each row fans it to the
     # remaining shard peers.
     dist.broadcast(buf, src=dp._owner_global_rank, group=dp.dp_group)
+    if not keep:
+        del buf
+        return None
     return buf.cpu() if cpu_offload else buf
 
 
 def _all_gather_fsdp_tensor(
-    local_tensor: torch.Tensor, dp_mesh, *, cpu_offload: bool
+    local_tensor: torch.Tensor, dp_mesh, *, cpu_offload: bool, keep: bool = True
 ) -> torch.Tensor:
     """All-gather a FSDP2-sharded tensor to reconstruct the full tensor.
 
@@ -138,13 +187,19 @@ def _all_gather_fsdp_tensor(
     reconstruct the full tensor.  The selection uses the dim whose
     placement is Shard(0) — FSDP2's convention for its sharded params.
 
+    If ``keep`` is False, every rank still participates in the all_gather
+    collective (required for NCCL correctness), but the gathered shards are
+    freed without concatenation and ``None`` is returned. Use this for
+    ``rank0_only`` state dicts.
+
     Args:
         local_tensor: Local shard (FSDP2 uses Shard(0) by default).
         dp_mesh: The DP device mesh.  May be 1D (shard-only) or 2D (HSDP).
         cpu_offload: Move result to CPU.
+        keep: If False, discard the gathered result after the collective.
 
     Returns:
-        Full (unsharded) tensor.
+        Full (unsharded) tensor, or None if ``keep`` is False.
     """
     if dp_mesh.ndim == 1:
         world_size = dp_mesh.size()
@@ -178,6 +233,8 @@ def _all_gather_fsdp_tensor(
         max_size = max(sizes)
         if max_size == 0:
             # All shards empty — return empty tensor with correct tail dims
+            if not keep:
+                return None
             full_shape = list(local_tensor.shape)
             full_shape[0] = 0
             return torch.empty(full_shape, dtype=local_tensor.dtype,
@@ -193,8 +250,41 @@ def _all_gather_fsdp_tensor(
         # Trim each shard to its actual size
         gathered = [g[:s] for g, s in zip(gathered, sizes) if s > 0]
 
+    if not keep:
+        del gathered
+        return None
     full = torch.cat(gathered, dim=0)
     return full.cpu() if cpu_offload else full
+
+
+def _padded_local_shard(
+    full: torch.Tensor,
+    rank: int,
+    world_size: int,
+    local_ref: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``full``'s rank-local chunk under fully_shard's even-padded
+    sharding, matching the layout produced by ``_all_gather_fsdp_tensor``
+    on the save side.
+
+    ``torch.tensor_split(world_size, dim=0)`` produces *uneven* chunks for
+    shapes not divisible by world_size (e.g. shape[0]=14 on ws=4 →
+    [4,4,3,3]); ``fully_shard`` pads dim 0 so every rank holds the same
+    ``ceil(shape0 / world_size)``. Pre-padding ``full`` with zeros along
+    dim 0 to ``local_ref.shape[0] * world_size`` and narrowing to the
+    rank's contiguous chunk reproduces the fully_shard layout.
+
+    The pad value is irrelevant — fully_shard's padded slots are
+    write-only (never read in compute), so any value works as long as
+    the shard size matches ``local_ref``.
+    """
+    local_size_0 = local_ref.shape[0]
+    padded_size = local_size_0 * world_size
+    if full.shape[0] < padded_size:
+        pad_shape = [padded_size - full.shape[0], *full.shape[1:]]
+        pad = torch.zeros(pad_shape, dtype=full.dtype, device=full.device)
+        full = torch.cat([full, pad], dim=0)
+    return full.narrow(0, rank * local_size_0, local_size_0)
 
 
 def _get_dp_mesh(model: nn.Module):
@@ -209,7 +299,7 @@ def _get_dp_mesh(model: nn.Module):
 
 
 def get_model_state_dict(
-    model: nn.Module, *, cpu_offload: bool = True
+    model: nn.Module, *, cpu_offload: bool = True, rank0_only: bool = True
 ) -> dict[str, torch.Tensor]:
     """Get full model state dict with both dedicated and FSDP2 parameters.
 
@@ -222,9 +312,16 @@ def get_model_state_dict(
     Args:
         model: Model with ``dedicate_params`` and ``fully_shard`` applied.
         cpu_offload: Move tensors to CPU (default True, recommended for saving).
+        rank0_only: If True (default), only rank 0 returns a populated state
+            dict; other ranks return ``{}``. All ranks still participate in
+            the NCCL broadcast / all_gather collectives (required for
+            correctness) but discard the gathered tensors so non-rank0 nodes
+            don't accumulate ~tens of GB of CPU RAM per rank. Matches the
+            semantics of FSDP1's ``FullStateDictConfig(rank0_only=True)``.
 
     Returns:
-        Complete state dict with full (unsharded) tensors for all parameters.
+        Complete state dict with full (unsharded) tensors for all parameters
+        on rank 0; empty dict on other ranks when ``rank0_only`` is True.
     """
     # Phase C.3: drain any pending async replicate broadcast so every
     # owner's ``_owned_data`` reflects the latest optimizer update.
@@ -234,6 +331,7 @@ def get_model_state_dict(
     dedicated_fqn_set = set(dp_fqns.values())
     dp_mesh = _get_dp_mesh(model)
 
+    keep = (not rank0_only) or (dist.get_rank() == 0)
     sd: dict[str, torch.Tensor] = {}
 
     # 1. Dedicated params.
@@ -245,10 +343,13 @@ def get_model_state_dict(
         mode = getattr(dp._orig_param if hasattr(dp, "_orig_param") else None,
                        "_dedicated_mode", None)
         if mode == "ddp":
-            t = dp._orig_param.data
-            sd[fqn] = t.cpu() if cpu_offload else t.clone()
+            if keep:
+                t = dp._orig_param.data
+                sd[fqn] = t.cpu() if cpu_offload else t.clone()
         else:
-            sd[fqn] = _broadcast_from_owner(dp, cpu_offload=cpu_offload)
+            t = _broadcast_from_owner(dp, cpu_offload=cpu_offload, keep=keep)
+            if keep:
+                sd[fqn] = t
 
     # 2. Non-dedicated params. FSDP2 path → all-gather sharded DTensors.
     #    DDP-replicate path → param is already full on every rank; read .data.
@@ -257,12 +358,14 @@ def get_model_state_dict(
             continue
         if _DTensor is not None and isinstance(param, _DTensor) and dp_mesh is not None:
             full = _all_gather_fsdp_tensor(
-                param._local_tensor, dp_mesh, cpu_offload=cpu_offload
+                param._local_tensor, dp_mesh, cpu_offload=cpu_offload, keep=keep
             )
-            sd[name] = full
+            if keep:
+                sd[name] = full
         else:
-            t = param.data
-            sd[name] = t.cpu() if cpu_offload else t.clone()
+            if keep:
+                t = param.data
+                sd[name] = t.cpu() if cpu_offload else t.clone()
 
     return sd
 
@@ -326,8 +429,7 @@ def set_model_state_dict(
                 shard_rank = mesh.get_local_rank(mesh_dim=shard_dim)
                 shard_world = mesh.size(shard_dim)
             full_on_device = full_tensor.to(local.dtype).to(local.device)
-            chunks = full_on_device.tensor_split(shard_world, dim=0)
-            local.copy_(chunks[shard_rank])
+            local.copy_(_padded_local_shard(full_on_device, shard_rank, shard_world, local))
         else:
             param.data.copy_(full_tensor.to(param.dtype).to(param.device))
 
@@ -336,7 +438,8 @@ def set_model_state_dict(
 
 
 def get_optimizer_state_dict(
-    model: nn.Module, optimizer: Any, *, cpu_offload: bool = True
+    model: nn.Module, optimizer: Any, *, cpu_offload: bool = True,
+    rank0_only: bool = True,
 ) -> dict:
     """Get optimizer state dict for a DMuon Muon optimizer.
 
@@ -349,6 +452,10 @@ def get_optimizer_state_dict(
         model: Model with ``dedicate_params`` and ``fully_shard`` applied.
         optimizer: :class:`dmuon.Muon` optimizer instance.
         cpu_offload: Move tensors to CPU (default True).
+        rank0_only: If True (default), only rank 0 returns a populated dict;
+            other ranks return an empty ``{"fsdp": {}, "dedicated": {},
+            "param_groups": []}``. All ranks still participate in the NCCL
+            broadcast / all_gather collectives.
 
     Returns:
         Optimizer state dict in DMuon format.
@@ -361,6 +468,8 @@ def get_optimizer_state_dict(
     dp_fqns = _compute_dedicated_fqns(model)
     dedicated_fqn_set = set(dp_fqns.values())
 
+    keep = (not rank0_only) or (dist.get_rank() == 0)
+
     # 1. Dedicated Muon state: broadcast momentum_buffer from owners.
     #    Must iterate ALL dedicated params (not just owned) so all ranks
     #    participate in each broadcast collective.
@@ -370,7 +479,9 @@ def get_optimizer_state_dict(
     # Check if any owner has momentum state (optimizer.step called at least once).
     # Use a flag broadcast to coordinate: if no owner has state, skip all broadcasts.
     any_has_state = any(
-        id(dp) in optimizer.state for dp in all_dedicated if dp.is_owner
+        id(dp) in optimizer.state
+        for dp in all_dedicated
+        if _owns_dedicated_optimizer_state(dp)
     )
     has_state_tensor = torch.tensor([int(any_has_state)], device=next(iter(dp_fqns)).device)
     dist.all_reduce(has_state_tensor, op=dist.ReduceOp.MAX)
@@ -379,12 +490,19 @@ def get_optimizer_state_dict(
         for dp in all_dedicated:
             fqn = dp_fqns[dp]
             dp_id = id(dp)
-            if dp.is_owner and dp_id in optimizer.state and "momentum_buffer" in optimizer.state[dp_id]:
+            if (
+                _owns_dedicated_optimizer_state(dp)
+                and dp_id in optimizer.state
+                and "momentum_buffer" in optimizer.state[dp_id]
+            ):
                 buf = optimizer.state[dp_id]["momentum_buffer"]
             else:
                 buf = None
-            full_buf = _broadcast_state_tensor(buf, dp, cpu_offload=cpu_offload)
-            dedicated_state[fqn] = {"momentum_buffer": full_buf}
+            full_buf = _broadcast_state_tensor(
+                buf, dp, cpu_offload=cpu_offload, keep=keep
+            )
+            if keep:
+                dedicated_state[fqn] = {"momentum_buffer": full_buf}
 
     # 2. FSDP2 AdamW state: all-gather sharded state tensors.
     dp_mesh = _get_dp_mesh(model)
@@ -405,19 +523,26 @@ def get_optimizer_state_dict(
         fsdp_entry: dict[str, Any] = {}
         for key, val in state.items():
             if isinstance(val, torch.Tensor) and dp_mesh is not None:
-                fsdp_entry[key] = _all_gather_fsdp_tensor(
-                    val, dp_mesh, cpu_offload=cpu_offload
+                gathered = _all_gather_fsdp_tensor(
+                    val, dp_mesh, cpu_offload=cpu_offload, keep=keep
                 )
+                if keep:
+                    fsdp_entry[key] = gathered
             else:
                 # Scalar (e.g., step count)
-                fsdp_entry[key] = val
-        fsdp_state[fqn] = fsdp_entry
+                if keep:
+                    fsdp_entry[key] = val
+        if keep:
+            fsdp_state[fqn] = fsdp_entry
 
     # 3. Param group hyperparameters (without tensor refs).
-    param_groups = []
-    for group in optimizer.param_groups:
-        pg = {k: v for k, v in group.items() if k != "params"}
-        param_groups.append(pg)
+    if keep:
+        param_groups = [
+            {k: v for k, v in g.items() if k != "params"}
+            for g in optimizer.param_groups
+        ]
+    else:
+        param_groups = []
 
     return {
         "fsdp": fsdp_state,
@@ -447,9 +572,9 @@ def set_optimizer_state_dict(
             if fqn not in fqn_to_dp:
                 continue
             dp = fqn_to_dp[fqn]
-            if dp.is_owner and "momentum_buffer" in state:
+            if _owns_dedicated_optimizer_state(dp) and "momentum_buffer" in state:
                 buf = state["momentum_buffer"].to(dp.device)
-                m = dp._owned_data.shape[0]
+                m, _n = _momentum_matrix_shape(dp)
                 buf = buf.view(m, -1)
                 optimizer.state[id(dp)] = {"momentum_buffer": buf}
 
@@ -484,15 +609,48 @@ def set_optimizer_state_dict(
                         shard_world = dp_mesh.size(shard_dim)
                     local_ref = p._local_tensor if hasattr(p, "_local_tensor") else p.data
                     full_on_device = val.to(local_ref.dtype).to(local_ref.device)
-                    chunks = full_on_device.tensor_split(shard_world, dim=0)
-                    opt_state[key] = chunks[shard_rank].contiguous()
+                    opt_state[key] = _padded_local_shard(
+                        full_on_device, shard_rank, shard_world, local_ref
+                    ).contiguous()
                 else:
                     opt_state[key] = val
             optimizer.state[p] = opt_state
 
     # 3. Load param group hyperparameters.
     if "param_groups" in state_dict:
-        for saved_pg, current_pg in zip(state_dict["param_groups"], optimizer.param_groups):
+        saved_groups = state_dict["param_groups"]
+        current_groups = optimizer.param_groups
+        if len(saved_groups) != len(current_groups):
+            warnings.warn(
+                "DMuon optimizer param group count mismatch while loading "
+                f"checkpoint: saved={len(saved_groups)} current={len(current_groups)}. "
+                "Only the matching prefix will be restored.",
+                stacklevel=2,
+            )
+        for idx, (saved_pg, current_pg) in enumerate(zip(saved_groups, current_groups)):
+            for structural_key in ("use_muon", "subgroup_type"):
+                if (
+                    structural_key in saved_pg
+                    and structural_key in current_pg
+                    and saved_pg[structural_key] != current_pg[structural_key]
+                ):
+                    raise RuntimeError(
+                        "DMuon optimizer param group structure mismatch at "
+                        f"index {idx}: {structural_key} saved="
+                        f"{saved_pg[structural_key]!r} current="
+                        f"{current_pg[structural_key]!r}"
+                    )
+            if (
+                "group_name" in saved_pg
+                and "group_name" in current_pg
+                and saved_pg["group_name"] != current_pg["group_name"]
+            ):
+                warnings.warn(
+                    "DMuon optimizer param group name mismatch while loading "
+                    f"checkpoint at index {idx}: saved={saved_pg['group_name']!r} "
+                    f"current={current_pg['group_name']!r}",
+                    stacklevel=2,
+                )
             for k, v in saved_pg.items():
                 if k != "params":
                     current_pg[k] = v

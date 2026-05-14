@@ -66,8 +66,12 @@ Scale from a single node to multi-node HSDP clusters with a two-line API change.
 ??? abstract "VLA and VLM — Vision-Language-Action and Vision-Language Models"
 
     DMuon's predicate-based selection works with any architecture.
-    For VLMs and VLAs, apply the predicate to attention and MLP projection
-    layers; embedding and vision encoder weights stay under standard FSDP2.
+    For VLMs and VLAs, start by applying the predicate to trainable attention
+    and MLP projection layers that need Muon. Parameters not selected by the
+    predicate, such as embeddings, frozen vision towers, or task heads, remain
+    under standard FSDP2. If the vision encoder is trainable and uses
+    compatible projection layers, include it by extending the predicate and hook
+    boundaries.
     TP compatibility via Gram Newton-Schulz (O(d_model²) communication)
     keeps DMuon usable with column/row-parallel tensor parallelism.
 

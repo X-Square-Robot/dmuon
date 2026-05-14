@@ -25,15 +25,27 @@ Usage::
 
 __version__ = "0.2.0"
 
-from .api import dedicate_params, dedicate_params_ddp
 from ._backends.ddp import replicate
 from ._backends.fsdp2 import install_patch
 from ._core.comm import DedicatedCommContext
+from ._replicate_profile import replicate_profile_report
+from .api import dedicate_params, dedicate_params_ddp
 from .checkpoint import (
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
+)
+from .diagnostics import (
+    format_param_group_summary,
+    format_post_step_group_summary,
+    summarize_param_groups,
+    summarize_post_step_groups,
+)
+from .grad_clip import (
+    MuonGradClipStats,
+    clip_grad_norm_,
+    register_muon_grad_clip_strategy,
 )
 from .optim import (
     POLAR_EXPRESS_COEFFICIENTS,
@@ -45,7 +57,6 @@ from .optim import (
     gram_newton_schulz,
     newton_schulz,
 )
-from ._replicate_profile import replicate_profile_report
 from .utils import (
     broadcast_all_updates,
     broadcast_all_updates_async,
@@ -53,6 +64,7 @@ from .utils import (
     get_dedicated_params,
     get_owned_params,
     no_sync,
+    prepare_muon_grads,
     reset_replicate_fallback,
     wait_all_post_step_broadcasts,
     wait_all_reduces,
@@ -70,12 +82,17 @@ __all__ = [
     "NewtonSchulz",
     "newton_schulz",
     "gram_newton_schulz",
+    "get_backend_status",
     "get_ns_backend",
     "get_comm_ctx",
     "get_dedicated_params",
     "get_owned_params",
     "DedicatedCommContext",
+    "clip_grad_norm_",
+    "register_muon_grad_clip_strategy",
+    "MuonGradClipStats",
     "no_sync",
+    "prepare_muon_grads",
     "wait_all_reduces",
     "wait_all_replicate_broadcasts",
     "wait_all_post_step_broadcasts",
@@ -87,6 +104,10 @@ __all__ = [
     "set_model_state_dict",
     "get_optimizer_state_dict",
     "set_optimizer_state_dict",
+    "summarize_param_groups",
+    "format_param_group_summary",
+    "summarize_post_step_groups",
+    "format_post_step_group_summary",
     "YOU_COEFFICIENTS",
     "POLAR_EXPRESS_COEFFICIENTS",
 ]

@@ -142,6 +142,56 @@ optimizer = dmuon.Muon(
 - **Group 0** (dedicated params): Muon — momentum + NS + update, owner only
 - **Group 1** (symmetric params): AdamW — standard, all ranks
 
+### Semantic Param Groups
+
+Use `param_groups` when a training framework needs business-level learning
+rate groups, such as a VLA action expert with a higher LR. Build the groups
+from the same wrapped model object that you pass to `dmuon.Muon`; with FSDP2,
+this means after `dedicate_params()` and after wrapping. DMuon lowers each user
+group into two optimizer subgroups: `<name>/muon` for dedicated parameters and
+`<name>/adamw` for symmetric parameters.
+
+```python
+base_params = []
+action_params = []
+for name, param in model.named_parameters():
+    if not param.requires_grad:
+        continue
+    if "action_transformer" in name:
+        action_params.append(param)
+    else:
+        base_params.append(param)
+
+optimizer = dmuon.Muon(
+    model,
+    lr=5e-5,
+    adamw_lr=5e-5,
+    param_groups=[
+        {"params": base_params, "lr": 5e-5, "group_name": "base"},
+        {"params": action_params, "lr": 1e-4, "group_name": "action"},
+    ],
+)
+```
+
+`lr` applies to both Muon and AdamW subgroups for that semantic group. Advanced
+callers can override route-specific values with `muon_lr`, `adamw_lr`,
+`muon_weight_decay`, `adamw_weight_decay`, `momentum`, `adamw_betas`, and
+`adamw_eps`. Every trainable parameter must appear in exactly one user group;
+stale pre-wrapping parameters, duplicate parameters, and missing parameters
+raise during optimizer construction.
+
+Schedulers and checkpoints work through `optimizer.param_groups` as usual. The
+visible group names become `base/muon`, `base/adamw`, `action/muon`, and
+`action/adamw`.
+
+Use the diagnostics helper to audit the actual split:
+
+```python
+summary = dmuon.summarize_param_groups(model, optimizer, max_rows=80)
+if dist.get_rank() == 0:
+    print(dmuon.format_param_group_summary(summary))
+```
+
 ### Hyperparameter Guide
 
 | Parameter | Default | Notes |
@@ -152,6 +202,7 @@ optimizer = dmuon.Muon(
 | `ns_backend` | `"gram"` | `"gram"` or `"direct"` string, or a `dmuon.NewtonSchulz(...)` object for custom coefficients. |
 | `nesterov` | True | Nesterov lookahead: `ns_input = grad + mu * buf`. Recommended. |
 | `adamw_lr` | 1e-3 | Separate learning rate for non-matrix parameters. |
+| `param_groups` | None | Optional semantic PyTorch-style parameter groups, lowered into Muon and AdamW subgroups. |
 
 ## Step 5: Training Loop
 
@@ -172,21 +223,38 @@ The training loop is identical to standard PyTorch. No special hooks or context 
 
 ### Gradient Clipping
 
-Use PyTorch's native `clip_grad_norm_` — it works with DMuon out of the box:
+Use PyTorch's native `clip_grad_norm_` for ordinary `param.grad` tensors, and
+add DMuon's Muon-only clip when you want dedicated parameters covered too:
 
 ```python
 for step, batch in enumerate(dataloader):
     optimizer.zero_grad()
     loss = model(batch).loss
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+    # Non-dedicated / AdamW parameters: handled by the training framework.
+    torch.nn.utils.clip_grad_norm_(adamw_params, max_norm=1.0)
+
+    # DMuon dedicated / Muon parameters: gradients live on DedicatedParam.
+    dmuon.clip_grad_norm_(optimizer, max_norm=1.0)
+
     optimizer.step()
 ```
 
-!!! info "Why does this work?"
-    Dedicated params store their gradients in `_reduced_grad`, not `param.grad`. So `clip_grad_norm_` naturally sees only symmetric params (LayerNorm, embeddings) — which are the ones that actually need clipping.
+!!! info "What is clipped?"
+    `dmuon.clip_grad_norm_` only clips DMuon dedicated parameters. It does not
+    touch AdamW parameters, so existing training frameworks can keep their
+    standard PyTorch clipping path unchanged.
 
-    Dedicated params don't need clipping because Newton-Schulz orthogonalization projects the gradient onto an orthogonal matrix with bounded spectral norm, regardless of the input gradient magnitude.
+    Muon clipping happens after DMuon's async reduce / TP gather and before
+    momentum + Newton-Schulz. Newton-Schulz bounds the final matrix update
+    scale, so this clip is mainly a safety guard for anomalous gradients,
+    momentum-buffer contamination, and non-finite checks rather than the main
+    learning-rate control mechanism.
+
+The default strategy is global p-norm clipping over Muon gradients. Custom
+strategies can be registered with `dmuon.register_muon_grad_clip_strategy(...)`
+for future schemes such as MuonClip or projection-specific clipping.
 
 ## Logging and Debugging
 
