@@ -86,6 +86,27 @@ def _broadcast_from_owner(
     return buf.cpu() if cpu_offload else buf
 
 
+def _owns_dedicated_optimizer_state(dp: DedicatedParam) -> bool:
+    """Return whether this rank owns the Muon momentum state for ``dp``."""
+
+    if getattr(dp, "tp_group", None) is not None:
+        return bool(getattr(dp, "is_tp_owner", False))
+    return bool(dp.is_owner)
+
+
+def _momentum_matrix_shape(dp: DedicatedParam) -> tuple[int, int]:
+    """Matrix shape used by Muon's momentum buffer for a dedicated param."""
+
+    shape = (
+        getattr(dp, "full_shape", dp._orig_size)
+        if getattr(dp, "tp_group", None) is not None
+        else dp._orig_size
+    )
+    m = int(shape[0])
+    n = int(shape.numel() // m)
+    return m, n
+
+
 def _broadcast_state_tensor(
     tensor, dp: DedicatedParam, *, cpu_offload: bool, keep: bool = True
 ) -> torch.Tensor:
@@ -109,16 +130,26 @@ def _broadcast_state_tensor(
     stages but the result is discarded and ``None`` is returned (for
     rank0_only).
     """
-    m = dp._orig_size[0]
-    n = dp._orig_size.numel() // m
+    m, n = _momentum_matrix_shape(dp)
     buf = torch.empty(m, n, dtype=torch.float32, device=dp.device)
-    if dp.is_owner and tensor is not None:
+    if _owns_dedicated_optimizer_state(dp) and tensor is not None:
         assert tensor.shape == (m, n), (
             f"Momentum buffer shape {tensor.shape} does not match expected "
-            f"({m}, {n}) derived from param shape {dp._orig_size}. "
+            f"({m}, {n}) derived from param shape "
+            f"{getattr(dp, 'full_shape', dp._orig_size)}. "
             f"If _step_muon's view convention changed, update _broadcast_state_tensor."
         )
         buf.copy_(tensor.float())
+    # TP stage — for TP-sharded dedicated params, Muon momentum lives only on
+    # the TP owner.  First fan it to the other TP peers in the owner
+    # shard/replicate cell; the existing replicate/shard stages below then
+    # distribute that per-TP-coordinate buffer through HSDP/DP.
+    if getattr(dp, "tp_group", None) is not None and dp.is_owner:
+        dist.broadcast(
+            buf,
+            src=dp._tp_owner_global_rank,
+            group=dp.tp_group,
+        )
     # Stage 1 — replicate axis (HSDP only).  Fires only on ranks in the
     # owner's shard column; on other ranks the replicate_group is a
     # different process group (belonging to their own shard column) and
@@ -447,7 +478,9 @@ def get_optimizer_state_dict(
     # Check if any owner has momentum state (optimizer.step called at least once).
     # Use a flag broadcast to coordinate: if no owner has state, skip all broadcasts.
     any_has_state = any(
-        id(dp) in optimizer.state for dp in all_dedicated if dp.is_owner
+        id(dp) in optimizer.state
+        for dp in all_dedicated
+        if _owns_dedicated_optimizer_state(dp)
     )
     has_state_tensor = torch.tensor([int(any_has_state)], device=next(iter(dp_fqns)).device)
     dist.all_reduce(has_state_tensor, op=dist.ReduceOp.MAX)
@@ -456,7 +489,11 @@ def get_optimizer_state_dict(
         for dp in all_dedicated:
             fqn = dp_fqns[dp]
             dp_id = id(dp)
-            if dp.is_owner and dp_id in optimizer.state and "momentum_buffer" in optimizer.state[dp_id]:
+            if (
+                _owns_dedicated_optimizer_state(dp)
+                and dp_id in optimizer.state
+                and "momentum_buffer" in optimizer.state[dp_id]
+            ):
                 buf = optimizer.state[dp_id]["momentum_buffer"]
             else:
                 buf = None
@@ -534,9 +571,9 @@ def set_optimizer_state_dict(
             if fqn not in fqn_to_dp:
                 continue
             dp = fqn_to_dp[fqn]
-            if dp.is_owner and "momentum_buffer" in state:
+            if _owns_dedicated_optimizer_state(dp) and "momentum_buffer" in state:
                 buf = state["momentum_buffer"].to(dp.device)
-                m = dp._owned_data.shape[0]
+                m, _n = _momentum_matrix_shape(dp)
                 buf = buf.view(m, -1)
                 optimizer.state[id(dp)] = {"momentum_buffer": buf}
 

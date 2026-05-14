@@ -126,6 +126,13 @@ class DedicatedState:
         Also wraps an input tensor through _DedicatedPostBackward so that
         gradient reduce + reshard fires after this module's backward.
         """
+        if (
+            not _is_backward_pass()
+            and self.comm_ctx.all_states
+            and self is self.comm_ctx.all_states[0]
+        ):
+            self.comm_ctx.reset_post_forward_order()
+
         # Phase C.3: consume any pending async replicate broadcast from
         # the previous step BEFORE ``unshard`` reads ``_owned_data``.
         # ``_pre_forward_wait`` is a no-op when the group is in IDLE

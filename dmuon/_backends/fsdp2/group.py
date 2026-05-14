@@ -52,13 +52,15 @@ class TPScatterState(NamedTuple):
     without waiting; the event is consumed on the next iteration's
     :meth:`_pre_forward_wait` hook.
 
-    The state pins TP-owner send shards until the scatter event is visible.
+    The state pins TP-owner send shards and receiver scratch shards until the
+    scatter/update event is visible.
     This is required because the owner builds transient contiguous split
     tensors for ``scatter_list`` and ``Muon._step_muon`` clears
     ``_tp_full_delta`` before async communication has necessarily consumed
-    those tensors.  Recv shards are not pinned here: the dispatch body calls
-    ``recv_shard.record_stream(bcast_stream)``, which is the correct
-    allocator-safety primitive for receive buffers.
+    those tensors.  Receiver scratch shards are also used by an enqueued
+    ``_owned_data.mul_(wd).add_(recv_shard)`` on the same stream, so keep a
+    Python reference until the event is consumed instead of relying only on
+    allocator stream recording.
     """
 
     refs: list[torch.Tensor]
@@ -691,6 +693,7 @@ class DedicatedParamGroup:
                     for p in group_work:
                         shard_dim = p.shard_dim if p.shard_dim is not None else 0
                         recv_shard = torch.empty_like(p._owned_data)
+                        refs.append(recv_shard)
                         if p.is_tp_owner:
                             assert p._tp_full_delta is not None, (
                                 f"{p.param_name}: TP owner has _tp_full_delta=None "
@@ -770,9 +773,15 @@ class DedicatedParamGroup:
 
         Gate semantics:
           * ``_tp_sync_fallback=True`` → degrade to sync; state stays IDLE.
+          * ``DMUON_TP_SCATTER_ASYNC`` unset/false → correctness-first sync
+            fallback; this keeps async replicate broadcast enabled while
+            avoiding rank-order/lifetime bugs in the experimental TP scatter.
           * Double-dispatch (state still PENDING) → ``RuntimeError``.
         """
-        if self._tp_sync_fallback:
+        tp_async_enabled = os.environ.get(
+            "DMUON_TP_SCATTER_ASYNC", "0"
+        ).lower() not in {"0", "false", "no", "off"}
+        if self._tp_sync_fallback or not tp_async_enabled:
             self.tp_scatter_delta()
             return
         if self._tp_scatter_state is not None:

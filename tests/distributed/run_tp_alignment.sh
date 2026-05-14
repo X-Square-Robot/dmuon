@@ -21,6 +21,24 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 
 port_base="${DMUON_ALIGN_PORT_BASE:-33100}"
+NEXT_PORT=""
+
+next_port() {
+    if [[ "$port_base" == "auto" || "$port_base" == "0" ]]; then
+        NEXT_PORT="$(
+            python - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+        )"
+    else
+        NEXT_PORT="$port_base"
+        port_base=$((port_base + 1))
+    fi
+}
 
 run_case() {
     local key="$1"
@@ -30,8 +48,8 @@ run_case() {
     local world="$5"
     local model="${6:-tiny}"
     local tp_scope="${7:-mlp}"
-    local port="$port_base"
-    port_base=$((port_base + 1))
+    next_port
+    local port="$NEXT_PORT"
     echo "=== ${key}: model=${model} topology=${topology} owner=${owner} mode=${mode} scope=${tp_scope} world=${world} port=${port} ==="
     DMUON_ALIGN_TOPOLOGY="$topology" \
     DMUON_ALIGN_MODE="$mode" \
@@ -52,9 +70,9 @@ run_expected_fail() {
     local model="$4"
     local tp_scope="$5"
     local pattern="$6"
-    local port="$port_base"
+    next_port
+    local port="$NEXT_PORT"
     local log="${OUT}/${key}.expected_failure.log"
-    port_base=$((port_base + 1))
     echo "=== ${key}: EXPECT FAIL model=${model} topology=${topology} scope=${tp_scope} world=${world} port=${port} ==="
     set +e
     DMUON_ALIGN_TOPOLOGY="$topology" \

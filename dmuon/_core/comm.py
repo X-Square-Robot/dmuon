@@ -87,3 +87,7 @@ class DedicatedCommContext:
     def reset_post_forward_order(self) -> None:
         """Clear post-forward order. Call at the start of each forward pass."""
         self.post_forward_order.clear()
+        for state in self.all_states:
+            indices = getattr(state.group, "_post_forward_indices", None)
+            if indices is not None:
+                indices.clear()

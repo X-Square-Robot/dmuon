@@ -66,3 +66,6 @@ tests/distributed/*.pt.trace.json
 /tests/experiment_256gpu/
 /benchmarks/__init__.py
 /.experiment_256gpu*/
+
+.profiles
+.tmp_tp_overlap_*/

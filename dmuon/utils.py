@@ -143,6 +143,23 @@ def broadcast_all_updates_async(model: nn.Module) -> None:
     ``replicate_broadcast_async`` (dispatch + wait inline); the caller
     sees no pending state for it.
     """
+    model_order = list(_iter_groups(model))
+    # TP scatter uses collectives on the TP process group.  Every rank in that
+    # group must enter those scatters in exactly the same order, so do not use
+    # rank-local forward-order records when a TP scatter is pending.
+    has_pending_tp_scatter = any(
+        any(
+            getattr(p, "tp_group", None) is not None
+            and getattr(p, "_reduced_grad", None) is not None
+            for p in getattr(g, "params", ())
+        )
+        for g in model_order
+    )
+    if has_pending_tp_scatter:
+        for g in model_order:
+            _dispatch_post_step_async(g)
+        return
+
     comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
     order: list = []
     seen: set = set()
@@ -154,7 +171,7 @@ def broadcast_all_updates_async(model: nn.Module) -> None:
                 order.append(g)
     # Append groups not observed in post-forward order (first-epoch, or
     # groups whose layer did not run in the last forward).
-    for g in _iter_groups(model):
+    for g in model_order:
         if id(g) not in seen:
             seen.add(id(g))
             order.append(g)
