@@ -44,6 +44,20 @@ run_core_matrix() {
     run_case tp4_rank0_sync tp4 4 rank0 0
 }
 
+run_phase4_matrix() {
+    run_case dp_only_lpt_sync dp_only 8 lpt 0
+    run_case hsdp_lpt_sync hsdp 8 lpt 0
+
+    run_case tp2_lpt_sync tp2 2 lpt 0
+    run_case tp2_lpt_async tp2 2 lpt 1
+
+    run_case dp_tp2_lpt_sync dp_tp2 4 lpt 0
+    run_case dp_tp2_lpt_async dp_tp2 4 lpt 1
+
+    run_case hsdp_tp2_lpt_sync hsdp_tp2 8 lpt 0
+    run_case hsdp_tp2_lpt_async hsdp_tp2 8 lpt 1
+}
+
 run_full_matrix() {
     run_core_matrix
 
@@ -64,11 +78,14 @@ case "$MATRIX" in
     core)
         run_core_matrix
         ;;
+    phase4)
+        run_phase4_matrix
+        ;;
     full)
         run_full_matrix
         ;;
     *)
-        echo "Unknown DMUON_TP_LLM_MATRIX=${MATRIX}; expected core or full" >&2
+        echo "Unknown DMUON_TP_LLM_MATRIX=${MATRIX}; expected core, phase4, or full" >&2
         exit 2
         ;;
 esac
@@ -93,7 +110,11 @@ for fp in sorted(glob.glob(os.path.join(out, f"{model}_*.json"))):
     data_factor = s.get("data_parallel_factor")
     if data_factor is None:
         topology = d["topology"]
-        tp_size = 4 if topology.endswith("tp4") else 2
+        tp_size = 1
+        if topology.endswith("tp4"):
+            tp_size = 4
+        elif topology.endswith("tp2"):
+            tp_size = 2
         data_factor = d["world_size"] // tp_size
     global_tokens_per_s = s.get(
         "global_tokens_per_s_p50",
@@ -110,20 +131,23 @@ for fp in sorted(glob.glob(os.path.join(out, f"{model}_*.json"))):
         s["step_ms_p90"],
         s["tokens_per_s_p50"],
         global_tokens_per_s,
+        s.get("approx_mfu", 0.0),
         s["peak_memory_allocated_gb_max_rank"],
         d["tp_profile"]["owner_coverage"],
     ))
 
 print(
     f"{'case':<24} {'topology':<9} {'owner':<6} {'mode':<6} {'world':>5} {'data':>4} "
-    f"{'p50_ms':>10} {'p90_ms':>10} {'local tok/s':>12} {'global tok/s':>13} {'memGB':>8} coverage"
+    f"{'p50_ms':>10} {'p90_ms':>10} {'local tok/s':>12} {'global tok/s':>13} "
+    f"{'MFU':>8} {'memGB':>8} coverage"
 )
 print("-" * 150)
 for row in rows:
-    key, topo, owner, mode, world, data_factor, p50, p90, tok_s, global_tok_s, mem, cov = row
+    key, topo, owner, mode, world, data_factor, p50, p90, tok_s, global_tok_s, mfu, mem, cov = row
     print(
         f"{key:<24} {topo:<9} {owner:<6} {mode:<6} {world:>5} {data_factor:>4} "
-        f"{p50:>10.3f} {p90:>10.3f} {tok_s:>12.1f} {global_tok_s:>13.1f} {mem:>8.2f} {cov}"
+        f"{p50:>10.3f} {p90:>10.3f} {tok_s:>12.1f} {global_tok_s:>13.1f} "
+        f"{mfu:>8.3f} {mem:>8.2f} {cov}"
     )
 
 print()

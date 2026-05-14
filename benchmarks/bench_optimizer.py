@@ -9,18 +9,20 @@ Run:
   torchrun --nproc_per_node=N benchmarks/bench_optimizer.py detail
   torchrun --nproc_per_node=N benchmarks/bench_optimizer.py           # both
 """
-import os, sys, time
+import os
+import sys
+import time
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from dmuon import Muon, dedicate_params, wait_all_reduces, get_ns_backend
+from dmuon import Muon, dedicate_params, get_ns_backend, prepare_muon_grads
 from dmuon.utils import get_owned_params
-
 
 # ── Shared config ─────────────────────────────────────────────────────────────
 
@@ -81,7 +83,9 @@ def bench_phases(name, model_fn, rank, warmup=3, repeat=5):
             bwd_times.append((t2 - t1) * 1000)
             opt_times.append((t3 - t2) * 1000)
 
-    fwd_times.sort(); bwd_times.sort(); opt_times.sort()
+    fwd_times.sort()
+    bwd_times.sort()
+    opt_times.sort()
     mid = len(fwd_times) // 2
     fwd, bwd, opt = fwd_times[mid], bwd_times[mid], opt_times[mid]
     total = fwd + bwd + opt
@@ -112,14 +116,16 @@ def run_phase(rank, world_size, device, mesh, mp_policy):
     with device:
         model_ddp = LlamaForCausalLM(config).to(torch.bfloat16)
     proj_params = {p for n, p in model_ddp.named_parameters() if "proj" in n and p.ndim == 2}
-    model_ddp = DDP(model_ddp, device_ids=[rank])
+    model_ddp_wrapped = DDP(model_ddp, device_ids=[rank])
 
-    def ddp_fwd():
-        return model_ddp(input_ids=input_ids, labels=labels)
+    def ddp_fwd(model=model_ddp_wrapped):
+        return model(input_ids=input_ids, labels=labels)
+
     def ddp_bwd(out):
         out.loss.backward()
-    def ddp_opt():
-        for p in model_ddp.parameters():
+
+    def ddp_opt(model=model_ddp_wrapped):
+        for p in model.parameters():
             if p.grad is None:
                 continue
             if p in proj_params:
@@ -130,9 +136,15 @@ def run_phase(rank, world_size, device, mesh, mp_policy):
                 p.data.add_(p.grad, alpha=-0.01)
             p.grad = None
 
-    ddp_total = bench_phases("DDP + Muon (baseline)",
-                             {"forward": ddp_fwd, "backward": ddp_bwd, "optimizer": ddp_opt}, rank)
-    del model_ddp; torch.cuda.empty_cache(); dist.barrier()
+    ddp_total = bench_phases(
+        "DDP + Muon (baseline)",
+        {"forward": ddp_fwd, "backward": ddp_bwd, "optimizer": ddp_opt},
+        rank,
+    )
+    del model_ddp_wrapped
+    del model_ddp
+    torch.cuda.empty_cache()
+    dist.barrier()
 
     # DMuon
     torch.manual_seed(42)
@@ -148,14 +160,19 @@ def run_phase(rank, world_size, device, mesh, mp_policy):
 
     def dmuon_fwd():
         return model_dmuon(input_ids=input_ids, labels=labels)
+
     def dmuon_bwd(out):
         out.loss.backward()
+
     def dmuon_opt():
         optimizer.step()
         optimizer.zero_grad()
 
-    dmuon_total = bench_phases("DMuon (CuteDSL SYRK)",
-                               {"forward": dmuon_fwd, "backward": dmuon_bwd, "optimizer": dmuon_opt}, rank)
+    dmuon_total = bench_phases(
+        "DMuon (CuteDSL SYRK)",
+        {"forward": dmuon_fwd, "backward": dmuon_bwd, "optimizer": dmuon_opt},
+        rank,
+    )
 
     if rank == 0:
         print(f"\n  Speedup: {ddp_total / dmuon_total:.2f}x")
@@ -182,7 +199,6 @@ def run_detail(rank, world_size, device, mesh, mp_policy):
     input_ids = torch.randint(0, 1000, (BATCH_SIZE, SEQ_LEN), device=device)
     labels = torch.randint(0, 1000, (BATCH_SIZE, SEQ_LEN), device=device)
 
-    import dmuon.optim.newton_schulz
     ns = sys.modules["dmuon.optim.newton_schulz"]
 
     if rank == 0:
@@ -212,9 +228,9 @@ def run_detail(rank, world_size, device, mesh, mp_policy):
 
     torch.cuda.synchronize()
 
-    # Phase 1: wait_all_reduces
+    # Phase 1: prepare_muon_grads (wait reduce tails + TP gather when present)
     t0 = time.perf_counter()
-    wait_all_reduces(model)
+    prepare_muon_grads(model)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
 
@@ -280,15 +296,15 @@ def run_detail(rank, world_size, device, mesh, mp_policy):
         adamw_ms = (ta1 - ta0) * 1000
         total = wait_ms + ns_total + mom_total + upd_total + adamw_ms
 
-        print(f"\n=== Optimizer Step Breakdown ===")
-        print(f"  wait_all_reduces:  {wait_ms:>8.1f} ms")
+        print("\n=== Optimizer Step Breakdown ===")
+        print(f"  prepare_muon_grads:{wait_ms:>8.1f} ms")
         print(f"  momentum:          {mom_total:>8.1f} ms  ({len(momentum_times)} params)")
         print(f"  newton_schulz:     {ns_total:>8.1f} ms  ({len(ns_times)} params)")
         print(f"  param_update:      {upd_total:>8.1f} ms")
         print(f"  adamw:             {adamw_ms:>8.1f} ms")
         print(f"  TOTAL:             {total:>8.1f} ms")
 
-        print(f"\n=== NS Time by Shape ===")
+        print("\n=== NS Time by Shape ===")
         shape_ns = {}
         for dp, t in zip(owned, ns_times):
             s = tuple(dp._owned_data.shape)
