@@ -143,11 +143,10 @@ What you get out of the box:
 - **Two-stage grad reduce** — `AVG` over shard, then `AVG` over replicate; total divisor = `G·R`, matching a single all-reduce over the world
 - **Async post-step broadcast** — updated `_owned_data` fans out to replicate peers on a dedicated stream; the wait is consumed per-layer in the next forward
 - **Z2 / Z3 packed-buffer lifecycle** — pass `reshard_after_forward=False` on `dedicate_params()` for **DMuon-Z2** (comm-optimal `2(N-1)/N · P_M` bytes/step, higher memory); default `True` gives **DMuon-Z3** (memory-efficient, matches FSDP2 ZeRO-3 convention). Mirrors `fully_shard(..., reshard_after_forward=...)` for non-Muon params — pick memory budget independently of the ownership primitive
-- **Auto-fallback** — a single-direction protocol degrades a group to sync if blocked-waits sustain > 100 μs (tunable); reset via `dmuon.reset_replicate_fallback(model)`
 - **Bit-identical** to sync baseline (validated on 4 GPU G=2 R=2) — safe to turn on by default
 - **Checkpoint-safe** — `get_model_state_dict` drains pending async state before reading
 
-Full API, profiling, and troubleshooting in the [HSDP guide](https://starrickliu.github.io/dmuon/guides/hsdp/).
+Full API and troubleshooting in the [HSDP guide](https://starrickliu.github.io/dmuon/guides/hsdp/).
 
 ### Checkpoint Save / Load
 
@@ -215,33 +214,41 @@ dmuon.dedicate_params(model, dp_mesh, ...)      # DMuon second
 fully_shard(layer, mesh=dp_mesh)                # FSDP2 third
 ```
 
-Within a DP group, all ranks share the same TP position, so broadcasting a TP shard is correct.
+DMuon detects `DTensor` TP shards, gathers each logical matrix at a TP owner for
+the matrix update, scatters updated shards back, and then uses the same DP,
+FSDP2, or HSDP publish path as non-TP parameters.  For replicated DP with TP
+inside each replica, use `dedicate_params_ddp_tp()` together with
+`replicate_tp()`.
 
 ## Benchmarks
 
-**8 x A800-SXM4-80GB, bf16, seq=2048, bs=2**
+Current snapshot: A800-SXM4-80GB, bf16, random initialization, synthetic data. Step time is reported as p50 step-start interval, so cross-step communication overlap is not double-counted. Source: accepted summaries from the DMuon 256GPU experiment dashboard, 2026-05-24 run set. 256GPU entries are still pending the 32-node run window.
 
-### Total Step Time
+### LLM 128GPU Step Time
 
-| Model | FSDP2+AdamW | FSDP2+Muon | DMuon | vs AdamW |
-|:------|----------:|-----------:|------:|------:|
-| Qwen2.5-1.5B | 328 ms | 684 ms | 340 ms | +4% |
-| Llama-3.2-3B | 599 ms | 1,810 ms | 660 ms | +10% |
-| Qwen2.5-7B | 1,108 ms | 3,985 ms | 1,222 ms | +10% |
-| Llama-3.1-8B | 1,188 ms | 4,617 ms | 1,349 ms | +13% |
+LLM runs use seq=4096.
 
-### Optimizer-Only Time
+| Model | Runtime | AdamW step | DMuon step | Delta vs AdamW |
+|:------|:--------|-----------:|-----------:|---------------:|
+| Qwen2.5-1.5B | FSDP-Z2 | 623 ms | 634 ms | +1.8% |
+| Qwen2.5-1.5B | HSDP-Z3 | 657 ms | 634 ms | -3.5% |
+| Qwen2.5-7B | FSDP-Z2 | 1,233 ms | 1,229 ms | -0.3% |
+| Qwen2.5-7B | HSDP-Z3 | 1,246 ms | 1,334 ms | +7.1% |
+| Llama-3.2-3B | FSDP-Z2 | 1,168 ms | 1,166 ms | -0.2% |
+| Llama-3.2-3B | HSDP-Z3 | 1,192 ms | 1,165 ms | -2.3% |
+| Llama-3.1-8B | FSDP-Z2 | 1,271 ms | 1,372 ms | +8.0% |
+| Llama-3.1-8B | HSDP-Z3 | 1,348 ms | 1,412 ms | +4.7% |
 
-| Model | AdamW | FSDP2+Muon | DMuon | Speedup |
-|:------|------:|-----------:|------:|------:|
-| Qwen2.5-1.5B | 17 ms | 373 ms | 31 ms | **12.0x** |
-| Llama-3.2-3B | 27 ms | 1,232 ms | 99 ms | **12.5x** |
-| Qwen2.5-7B | 53 ms | 2,917 ms | 189 ms | **15.5x** |
-| Llama-3.1-8B | 56 ms | 3,468 ms | 260 ms | **13.3x** |
+### VLA 128GPU Step Time
 
-DMuon adds **4-13% total overhead** vs FSDP2+AdamW — the cost of using a matrix optimizer. The optimizer step itself is **12-15x faster** than naive FSDP2+Muon, from two factors: 1/8 parameter sharding (~8x) and Gram NS with SYRK kernel (~1.6x).
+These VLA runs use the real Pi0 and WallX training entries, not reduced mock models. Batch size follows the accepted dashboard run for each optimizer/runtime pair.
 
-All benchmarks verified: every rank produces identical loss values. See [docs/llm_benchmark.md](docs/llm_benchmark.md) for detailed phase breakdown.
+| Model | Runtime | AdamW step | DMuon step | Delta vs AdamW |
+|:------|:--------|-----------:|-----------:|---------------:|
+| Pi0 | FSDP-Z2 | 1,587 ms | 1,659 ms | +4.6% |
+| Pi0 | HSDP-Z3 | 1,630 ms | 1,652 ms | +1.4% |
+| WallX/Qwen2.5-VL-3B | FSDP-Z2 | 1,690 ms | 1,790 ms | +5.9% |
+| WallX/Qwen2.5-VL-3B | HSDP-Z3 | 1,492 ms | 1,522 ms | +2.0% |
 
 ## 📖 Documentation
 
@@ -290,31 +297,20 @@ Full documentation is hosted on GitHub Pages: **[starrickliu.github.io/dmuon](ht
 
 ### Done
 
-- [x] Core ownership model (broadcast/reduce/owner-only NS)
-- [x] Balanced partition with concurrency constraints (2D-aware LPT over G·R slots)
-- [x] FSDP2 composition (zero modification to FSDP2 internals)
-- [x] **HSDP native support** — 2D mesh, two-stage reduce (shard + replicate), async forward-hidden broadcast, fallback protocol, checkpoint restart
-- [x] TP compatibility
-- [x] LLM step time benchmarks (Qwen2.5, Llama-3, 8xA800)
-- [x] Gram NS with TP SYRK decomposition (O(m^2) TP comm instead of O(mn))
-- [x] CuteDSL SYRK kernel (5/7 Gram NS ops, 1.4-1.5x E2E speedup)
-- [x] Prefetch pipeline (forward + backward)
-- [x] Gradient accumulation (default + `no_sync` context manager)
-- [x] State dict save/load (compatible with single-GPU, HuggingFace, and HSDP restart)
-- [x] **Full user documentation** — English + 中文; installation / quickstart / guides / design / API / FAQ / troubleshooting (v2 docs)
-
-### In Progress
-
-- [ ] Convergence validation (loss curves vs AdamW vs Muon)
-- [ ] Naive Muon baselines (DDP / FSDP-ZeRO2 / FSDP-ZeRO3) for per-byte A/B traces
-- [ ] Multi-node scaling benchmarks (16-256 GPUs, Qwen2.5-7B/14B)
+- [x] Core dedicated-ownership runtime for DDP and FSDP2 paths
+- [x] HSDP 2D mesh support with shard-stage reduce, replicate-stage reduce, and async post-step publish
+- [x] FSDP-style Z2/Z3 lifecycle for DMuon-managed matrix parameters via `reshard_after_forward`
+- [x] Tensor Parallel support for DTensor-sharded matrices: TP gather, owner-side matrix update, and TP scatter
+- [x] Type-split optimizer routing: Muon for matrix parameters, AdamW / sharded AdamW routes for non-Muon trainable parameters
+- [x] Shape-aware LPT owner assignment with `lpt`, `round_robin`, and `rank0` strategies for benchmark ablations
+- [x] Hook-boundary controls for real model layouts (`hook_boundary_predicate`, `hook_boundary_resolver`, `assignment_group_key_fn`)
+- [x] Gram Newton-Schulz and direct Newton-Schulz backends with cuBLAS / SYRK dispatch
+- [x] Gradient accumulation via `no_sync`, DMuon-aware grad clipping, and TP-aware gradient handling
+- [x] Model and optimizer state-dict save/load for dedicated Muon, dedicated AdamW, FSDP-managed params, and TP momentum shards
 
 ### Planned
 
-- [ ] Larger model benchmarks (14B+, 32B)
-- [ ] Shampoo / SOAP under the same ownership primitive
 - [ ] DeepSpeed ZeRO integration
-- [ ] Communication & memory profiling reports
 - [ ] CI/CD (GitHub Actions)
 - [ ] torch.compile support
 
@@ -324,18 +320,9 @@ See [TODO.md](TODO.md) for details.
 
 DMuon's dedicated-ownership primitive builds on foundational work by [Rajbhandari et al., 2020 (ZeRO-1)](https://arxiv.org/abs/1910.02054) and [Shi et al., 2023 (Distributed Shampoo)](https://arxiv.org/abs/2309.06497). The Gram Newton-Schulz iteration is adapted from [Dao-AILab/gram-newton-schulz](https://github.com/Dao-AILab/gram-newton-schulz) and the [CuteDSL SYRK kernel from quack](https://github.com/Dao-AILab/quack) by Tri Dao et al. Concurrent work [Canzona (Wang et al., 2026)](https://arxiv.org/abs/2602.06079) explores a parallel extension of the same primitive within Megatron-LM's TP + ZeRO-1 setting.
 
-## Citation
+## Related Citations
 
-```bibtex
-@misc{DMuon,
-  title   = {DMuon: Dedicated Parameter Ownership for Distributed Muon Training},
-  author  = {Xingchen Liu},
-  year    = {2026},
-  url     = {https://github.com/StarrickLiu/dmuon}
-}
-```
-
-DMuon builds on Gram Newton-Schulz. If you use the Gram NS iteration, please also cite:
+DMuon builds on Gram Newton-Schulz. If you use the Gram NS iteration, please cite:
 
 ```bibtex
 @misc{GramNewtonSchulz,

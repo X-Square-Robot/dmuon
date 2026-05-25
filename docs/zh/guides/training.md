@@ -50,11 +50,13 @@ assignment = dmuon.dedicate_params(
 
 ### 编写 Predicate
 
-`predicate` 函数决定哪些参数使用 Muon（专属）vs AdamW（对称）。它接收参数的全限定名和参数张量：
+`predicate` 函数决定哪些参数进入 DMuon 的 dedicated ownership runtime。
+默认设置下，被选中的参数走 Muon，未选中的参数继续走普通 FSDP2/AdamW 路径。
+它接收参数的全限定名和参数张量：
 
 ```python
 def predicate(name: str, param: nn.Parameter) -> bool:
-    return ...  # True = 专属（Muon），False = 对称（AdamW）
+    return ...  # True = DMuon-managed Muon，False = FSDP2/AdamW
 ```
 
 **常见模式：**
@@ -95,6 +97,32 @@ def predicate(name: str, param: nn.Parameter) -> bool:
 - **仅 2D 矩阵** — 1D 参数（LayerNorm、bias）应使用 AdamW
 - **足够大以受益于 NS** — 非常小的矩阵不会从 Newton-Schulz 中获益。粗略阈值：`numel > 100k`
 - **Embedding/head 层** — 通常保留在 AdamW 下（它们不太适合 NS 优化几何）
+
+### 高级模式：Type-Split Routing
+
+在大规模 scaling run 中，如果希望所有可训练参数的通信都由 DMuon 管理，可以传入
+更宽的 `predicate` 和一个 `route_hint_fn`。`"muon"` route 让大矩阵参数走
+矩阵优化器路径；`"sharded_adamw"` route 让非 Muon 可训练参数走
+DMuon-managed sharded AdamW 路径。这样可以避免同一个训练 step 内同时混用
+FSDP2 collectives 和 DMuon collectives。
+
+```python
+def route_hint(name, param):
+    if param.ndim == 2 and "proj" in name:
+        return "muon"
+    return "sharded_adamw"
+
+dmuon.dedicate_params(
+    model,
+    mesh,
+    predicate=lambda n, p: p.requires_grad,
+    route_hint_fn=route_hint,
+)
+```
+
+默认的 `predicate=lambda n, p: "proj" in n and p.ndim == 2` 仍然是更简单的
+集成路径。只有当你希望 DMuon 同时接管非 Muon 可训练参数的 placement 和
+collectives 时，才需要 type-split routing。
 
 ### 查看分配结果
 
@@ -180,15 +208,8 @@ trainable 参数必须且只能出现在一个用户组中；如果传入 wrappi
 重复参数或漏掉参数，优化器构造阶段会直接报错。
 
 Scheduler 和 checkpoint 仍然通过 `optimizer.param_groups` 工作。可见组名会
-变为 `base/muon`、`base/adamw`、`action/muon`、`action/adamw`。
-
-可以用诊断 helper 检查实际分流：
-
-```python
-summary = dmuon.summarize_param_groups(model, optimizer, max_rows=80)
-if dist.get_rank() == 0:
-    print(dmuon.format_param_group_summary(summary))
-```
+变为 `base/muon`、`base/adamw`、`action/muon`、`action/adamw`，这也是
+检查 route split 的公开入口。
 
 ### 超参数指南
 
@@ -215,7 +236,7 @@ for step, batch in enumerate(dataloader):
         print(f"step {step}: loss={loss.item():.4f}")
 ```
 
-1. `optimizer.step()` 内部：(a) 等待所有异步梯度 reduce 完成，(b) 对专属参数运行 Muon，(c) 对 FSDP2 参数运行 AdamW。
+1. `optimizer.step()` 内部：(a) 等待异步梯度 reduce 完成，(b) 对 routed matrix params 运行 Muon，(c) 根据 route 设置，对 FSDP2-managed 参数或 DMuon-managed sharded AdamW 参数运行 AdamW。
 
 训练循环与标准 PyTorch 完全相同。无需特殊 hook 或上下文管理器。
 
@@ -308,7 +329,7 @@ for layer in model.layers:
 fully_shard(model, mesh=hsdp)
 ```
 
-完整 API、同步/异步模式、fallback 协议、profile 说明见 [HSDP 训练指南](hsdp.md)。
+完整 API 与同步/异步模式见 [HSDP 训练指南](hsdp.md)。
 
 FSDP 和 HSDP 下都适用的 DMuon-Z2 vs DMuon-Z3 packed buffer 生命周期选择，详见 [Z2 与 Z3 模式](z2-z3-modes.md)。
 
@@ -317,7 +338,6 @@ FSDP 和 HSDP 下都适用的 DMuon-Z2 vs DMuon-Z3 packed buffer 生命周期选
 - [HSDP 训练（多机）](hsdp.md) — 2D mesh + 异步 broadcast
 - [自定义 Hook 边界](custom-hook-boundaries.md) — 控制 DMuon 的前向/反向 hook 绑定到哪个模块
 - [Z2 与 Z3 模式](z2-z3-modes.md) — Packed buffer 生命周期与显存/通信权衡
-- [性能分析与 Fallback](profiling-and-fallback.md) — 广播延迟测量与异步 fallback 调优
 - [张量并行](tp-support.md) — 使用 DMuon + TP
 - [检查点](checkpoint.md) — 保存和加载训练状态
 - [梯度累积](grad-accumulation.md) — 等效批量大小扩展

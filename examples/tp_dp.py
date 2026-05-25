@@ -1,7 +1,8 @@
 """Tensor Parallel + Data Parallel training with DMuon.
 
 2D mesh (DP x TP) example.  DMuon detects TP-sharded parameters from
-their ``DTensor`` structure automatically — no TP-specific API needed.
+their ``DTensor`` structure automatically, so the required setup still
+passes the same DP mesh slice used by FSDP2.
 For each TP-sharded parameter DMuon runs a TP gather →
 full-matrix Newton-Schulz on the TP owner → scatter back, preserving
 Muon's exact math while every rank keeps only its TP shard in memory.
@@ -142,12 +143,11 @@ def main():
         fully_shard(layer, mesh=dp_mesh)
     fully_shard(model, mesh=dp_mesh)
 
-    # Optimizer — no TP-specific flags.  DMuon's TP path (All-to-All
-    # gather → full-matrix NS on the TP owner → scatter back) activates
-    # automatically for any DTensor parameter sharded on a non-DP mesh
-    # dim.  ``replicate_async`` toggles whether the post-step scatter
-    # completes inside ``step()`` (False) or overlaps with the next
-    # forward (True, default).
+    # Optimizer — defaults are enough for TP.  DMuon's TP path (gather →
+    # full-matrix NS on the TP owner → scatter back) activates automatically
+    # for any DTensor parameter sharded on a non-DP mesh dim.  Advanced runs
+    # can set tp_buffer_reuse= on dedicate_params() or tp_distributed_gram=
+    # on Muon.
     optimizer = dmuon.Muon(
         model, lr=0.02, momentum=0.95,
         adamw_lr=1e-3,

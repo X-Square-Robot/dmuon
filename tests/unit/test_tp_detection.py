@@ -22,8 +22,14 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.distributed import init_device_mesh
-from torch.distributed.tensor import distribute_tensor
+try:
+    from torch.distributed import init_device_mesh
+except ImportError:
+    from torch.distributed.device_mesh import init_device_mesh
+try:
+    from torch.distributed.tensor import distribute_tensor
+except ImportError:
+    pytest.skip("DTensor distribute_tensor is unavailable", allow_module_level=True)
 from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 

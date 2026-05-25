@@ -34,10 +34,38 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.autograd import Variable
-from torch.distributed import DeviceMesh
+try:
+    from torch.distributed import DeviceMesh
+except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
+    from torch.distributed.device_mesh import DeviceMesh
 
 
-def _is_fsdp_managed(p: nn.Parameter) -> bool:
+def _is_tp_only_dtensor(p: nn.Parameter, dp_mesh_dim_names: frozenset[str]) -> bool:
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:
+        return False
+    if not isinstance(p, DTensor):
+        return False
+    names = p.device_mesh.mesh_dim_names
+    if names is None:
+        raise ValueError(
+            "replicate_tp() requires named DTensor meshes so TP-only "
+            "parameters can be distinguished from FSDP-managed DTensors."
+        )
+    if any(name in dp_mesh_dim_names for name in names):
+        return False
+    if "tp" not in names:
+        return False
+    return p.device_mesh["tp"].size() > 1
+
+
+def _is_fsdp_managed(
+    p: nn.Parameter,
+    *,
+    dp_mesh_dim_names: frozenset[str],
+    allow_tp_dtensor: bool,
+) -> bool:
     """Best-effort detection of a parameter already under FSDP2's reducer.
 
     FSDP2 replaces managed parameters with ``DTensor`` instances whose
@@ -49,7 +77,11 @@ def _is_fsdp_managed(p: nn.Parameter) -> bool:
         from torch.distributed.tensor import DTensor
     except ImportError:
         return False
-    return isinstance(p, DTensor)
+    if not isinstance(p, DTensor):
+        return False
+    if allow_tp_dtensor and _is_tp_only_dtensor(p, dp_mesh_dim_names):
+        return False
+    return True
 
 
 class _ReplicatedGroup:
@@ -59,7 +91,13 @@ class _ReplicatedGroup:
     optimizer can discover the parameters to update with AdamW.
     """
 
-    def __init__(self, model: nn.Module, mesh: DeviceMesh):
+    def __init__(
+        self,
+        model: nn.Module,
+        mesh: DeviceMesh,
+        *,
+        allow_tp_dtensor: bool = False,
+    ):
         if mesh.ndim != 1:
             raise ValueError(
                 f"replicate() requires a 1D mesh; got ndim={mesh.ndim}. "
@@ -69,16 +107,24 @@ class _ReplicatedGroup:
         self.mesh = mesh
         self._group: dist.ProcessGroup = mesh.get_group()
         self._device = torch.device("cuda", torch.cuda.current_device())
+        dp_names = set(mesh.mesh_dim_names or ())
+        self._dp_mesh_dim_names = frozenset(dp_names)
+        self._allow_tp_dtensor = allow_tp_dtensor
 
         self.params: list[nn.Parameter] = []
         for p in model.parameters():
             if hasattr(p, "_dedicated_owner_rank"):
                 continue  # dedicated (FSDP2 or DDP path) or its placeholder
-            if _is_fsdp_managed(p):
+            if _is_fsdp_managed(
+                p,
+                dp_mesh_dim_names=self._dp_mesh_dim_names,
+                allow_tp_dtensor=allow_tp_dtensor,
+            ):
                 raise RuntimeError(
                     "replicate(): parameter is already managed by FSDP2 "
                     "(DTensor detected). replicate and fully_shard are "
-                    "mutually exclusive for the same parameter."
+                    "mutually exclusive for the same parameter. Use "
+                    "replicate_tp() only for TP-only DTensor parameters."
                 )
             if p.requires_grad:
                 self.params.append(p)
@@ -127,13 +173,19 @@ class _ReplicatedGroup:
             for p in self._pending:
                 if p.grad is None:
                     continue
-                buckets[(p.grad.dtype, p.grad.device)].append(p)
+                grad = p.grad._local_tensor if hasattr(p.grad, "_local_tensor") else p.grad
+                buckets[(grad.dtype, grad.device)].append(p)
 
             for (dtype, device), plist in buckets.items():
                 with dist._coalescing_manager(group=self._group, device=device):
                     for p in plist:
+                        grad = (
+                            p.grad._local_tensor
+                            if hasattr(p.grad, "_local_tensor")
+                            else p.grad.data
+                        )
                         dist.all_reduce(
-                            p.grad.data, op=dist.ReduceOp.AVG, group=self._group
+                            grad, op=dist.ReduceOp.AVG, group=self._group
                         )
         finally:
             self._pending.clear()
@@ -201,10 +253,27 @@ def replicate(model: nn.Module, mesh: DeviceMesh) -> nn.Module:
     """
     if hasattr(model, "_replicated_group"):
         raise RuntimeError("replicate() has already been called on this model")
-    group = _ReplicatedGroup(model, mesh)
+    group = _ReplicatedGroup(model, mesh, allow_tp_dtensor=False)
     model._replicated_group = group
 
     # Expose no_sync at the model level to match FSDP2 UX.
+    if not hasattr(model, "no_sync"):
+        model.no_sync = group.no_sync
+    return model
+
+
+def replicate_tp(model: nn.Module, mesh: DeviceMesh) -> nn.Module:
+    """Install DDP-style replication for TP-only DTensor parameters.
+
+    This is the TP-aware companion to :func:`dmuon.dedicate_params_ddp_tp`.
+    It keeps the conservative FSDP-DTensor rejection in :func:`replicate`
+    intact while allowing tensor-parallel DTensors to all-reduce their local
+    gradient shards over the data-parallel mesh.
+    """
+    if hasattr(model, "_replicated_group"):
+        raise RuntimeError("replicate_tp() has already been called on this model")
+    group = _ReplicatedGroup(model, mesh, allow_tp_dtensor=True)
+    model._replicated_group = group
     if not hasattr(model, "no_sync"):
         model.no_sync = group.no_sync
     return model

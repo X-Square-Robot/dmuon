@@ -1,7 +1,6 @@
 """Utility functions."""
 
-import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Optional
 
 import torch
@@ -125,13 +124,7 @@ def _iter_groups(model: nn.Module):
 
 @contextmanager
 def _profile_range(name: str):
-    if bool(int(os.environ.get("DMUON_TORCH_PROFILE_MARKERS", "0") or 0)):
-        from torch.profiler import record_function
-
-        with record_function(name):
-            yield
-    else:
-        yield
+    yield
 
 
 def _group_profile_name(g) -> str:
@@ -160,6 +153,7 @@ def _ordered_post_step_groups(model: nn.Module) -> list:
         if gid not in seen:
             seen.add(gid)
             order.append(g)
+
     return order
 
 
@@ -180,6 +174,10 @@ def _dispatch_post_step_sync(g) -> None:
     group_name = _group_profile_name(g)
     with _profile_range(f"dmuon.post_step_sync.{group_name}"):
         if isinstance(g, DedicatedParamGroupDDP):
+            scatter = getattr(g, "tp_scatter_delta", None)
+            if scatter is not None:
+                with _profile_range("dmuon.tp_scatter_delta.sync"):
+                    scatter()
             with _profile_range("dmuon.ddp_post_step_broadcast.sync"):
                 g.post_step_broadcast_sync()
         else:
@@ -191,19 +189,33 @@ def _dispatch_post_step_sync(g) -> None:
                 g.replicate_broadcast_sync()
 
 
-def _dispatch_post_step_async(g) -> None:
+def _dispatch_post_step_async(g, phase_recorder=None) -> None:
     """Dispatch the post-step publish path for one group (async variant).
 
     FSDP2/HSDP+TP groups run TP scatter before replicate broadcast on the
     same stream, so replicate peers only see TP-correct ``_owned_data``.
     DDP groups fan owner data across the DP group and leave the event for
     the next pre-forward wait.
+
+    ``phase_recorder`` is an optional callable returning a context manager for
+    CUDA-event profiling of the sub-phases.  It is intentionally lightweight so
+    the optimizer can distinguish TP scatter, true replicate broadcast, and
+    DDP publish time without coupling this utility to the optimizer class.
     """
+    def _phase(name: str):
+        return nullcontext() if phase_recorder is None else phase_recorder(name)
+
     group_name = _group_profile_name(g)
     with _profile_range(f"dmuon.post_step_async.{group_name}"):
         if isinstance(g, DedicatedParamGroupDDP):
+            scatter_async = getattr(g, "tp_scatter_delta_async", None)
+            if scatter_async is not None:
+                with _profile_range("dmuon.tp_scatter_delta.async"):
+                    with _phase("tp_scatter_delta"):
+                        scatter_async()
             with _profile_range("dmuon.ddp_post_step_broadcast.async"):
-                g.post_step_broadcast_async()
+                with _phase("ddp_post_step_broadcast"):
+                    g.post_step_broadcast_async()
         else:
             # T2d: async TP scatter (O2 overlap per tp_design.md §4.2) —
             # dispatch on ``replicate_broadcast_stream`` without waiting; the
@@ -211,10 +223,14 @@ def _dispatch_post_step_async(g) -> None:
             scatter_async = getattr(g, "tp_scatter_delta_async", None)
             if scatter_async is not None:
                 with _profile_range("dmuon.tp_scatter_delta.async"):
-                    scatter_async()
+                    with _phase("tp_scatter_delta"):
+                        scatter_async()
             with _profile_range("dmuon.replicate_broadcast.async"):
-                g.replicate_broadcast_async()
-
+                if getattr(getattr(g, "comm_ctx", None), "replicate_group", None) is None:
+                    g.replicate_broadcast_async()
+                else:
+                    with _phase("replicate_broadcast"):
+                        g.replicate_broadcast_async()
 
 def _wait_post_step(g) -> None:
     if isinstance(g, DedicatedParamGroupDDP):
@@ -254,10 +270,8 @@ def broadcast_all_updates_async(model: nn.Module) -> None:
     (``_fsdp_param_group.py:469-474``).  First epoch falls through to
     the model-walk order.
 
-    Fallback-to-sync is per-group and transparent: a group with
-    ``_replicate_sync_fallback=True`` resolves inside
-    ``replicate_broadcast_async`` (dispatch + wait inline); the caller
-    sees no pending state for it.
+    The async path keeps one pending event per group; the next forward drains
+    the event before reading the group's data.
     """
     model_order = list(_iter_groups(model))
     # TP scatter uses collectives on the TP process group.  Every rank in that
@@ -276,32 +290,9 @@ def broadcast_all_updates_async(model: nn.Module) -> None:
             _dispatch_post_step_async(g)
         return
 
-    for g in _ordered_post_step_groups(model):
+    groups = _ordered_post_step_groups(model)
+    for g in groups:
         _dispatch_post_step_async(g)
-
-
-def update_replicate_fallback(model: nn.Module) -> None:
-    """Phase C.4 + T2e: advance BOTH the replicate-broadcast and TP-scatter
-    async→sync fallback state machines on every group.  Cheap no-op when
-    the profile env var is off (every group's wait-time sample stays 0.0
-    and the state machine short-circuits)."""
-    for g in _iter_groups(model):
-        update_fn = getattr(g, "_update_replicate_fallback", None)
-        if update_fn is not None:
-            update_fn()
-        tp_update = getattr(g, "_update_tp_scatter_fallback", None)
-        if tp_update is not None:
-            tp_update()
-
-
-def reset_replicate_fallback(model: nn.Module) -> None:
-    """Clear the Phase C.4 async→sync fallback flag on every group.
-
-    Intended for users who want to re-enable async after fixing a slow-IB
-    condition.  Safe to call from the training loop.
-    """
-    for g in _iter_groups(model):
-        g.reset_replicate_fallback()
 
 
 def wait_all_post_step_broadcasts(model: nn.Module) -> None:

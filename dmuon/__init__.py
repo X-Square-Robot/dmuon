@@ -1,8 +1,9 @@
 """DMuon: Dedicated parameter ownership for distributed training with matrix optimizers.
 
-DMuon enables efficient use of Muon and other matrix optimizers with PyTorch FSDP2.
-Each parameter is assigned to a single owner rank that stores the complete parameter
-and performs Newton-Schulz orthogonalization locally — zero extra communication, 1/R compute.
+DMuon enables efficient use of Muon and other matrix optimizers with PyTorch DDP,
+FSDP2, HSDP, and Tensor Parallelism.  Each matrix parameter is assigned to a
+single owner rank that materializes the logical matrix for the optimizer update
+and publishes the result back to the active distributed placement.
 
 Usage::
 
@@ -25,22 +26,15 @@ Usage::
 
 __version__ = "0.2.0"
 
-from ._backends.ddp import replicate
+from ._backends.ddp import replicate, replicate_tp
 from ._backends.fsdp2 import install_patch
 from ._core.comm import DedicatedCommContext
-from ._replicate_profile import replicate_profile_report
-from .api import dedicate_params, dedicate_params_ddp
+from .api import dedicate_params, dedicate_params_ddp, dedicate_params_ddp_tp
 from .checkpoint import (
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
     set_optimizer_state_dict,
-)
-from .diagnostics import (
-    format_param_group_summary,
-    format_post_step_group_summary,
-    summarize_param_groups,
-    summarize_post_step_groups,
 )
 from .grad_clip import (
     MuonGradClipStats,
@@ -65,7 +59,6 @@ from .utils import (
     get_owned_params,
     no_sync,
     prepare_muon_grads,
-    reset_replicate_fallback,
     wait_all_post_step_broadcasts,
     wait_all_reduces,
     wait_all_replicate_broadcasts,
@@ -77,7 +70,10 @@ install_patch()
 __all__ = [
     "dedicate_params",
     "dedicate_params_ddp",
+    "dedicate_params_ddp_tp",
     "replicate",
+    "replicate_tp",
+    "install_patch",
     "Muon",
     "NewtonSchulz",
     "newton_schulz",
@@ -98,16 +94,10 @@ __all__ = [
     "wait_all_post_step_broadcasts",
     "broadcast_all_updates",
     "broadcast_all_updates_async",
-    "reset_replicate_fallback",
-    "replicate_profile_report",
     "get_model_state_dict",
     "set_model_state_dict",
     "get_optimizer_state_dict",
     "set_optimizer_state_dict",
-    "summarize_param_groups",
-    "format_param_group_summary",
-    "summarize_post_step_groups",
-    "format_post_step_group_summary",
     "YOU_COEFFICIENTS",
     "POLAR_EXPRESS_COEFFICIENTS",
 ]

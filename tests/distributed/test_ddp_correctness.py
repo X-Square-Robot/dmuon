@@ -345,19 +345,12 @@ def test_param_groups_lower_and_step():
     assert actual == expected
     assert len(optimizer._muon_group_dps) == 2
     assert len(optimizer._adamw_group_params) == 2
-    summary = dmuon.summarize_param_groups(model, optimizer, max_rows=20)
-    assert summary["num_groups"] == 4
-    groups = {group["group_name"]: group for group in summary["groups"]}
-    assert set(groups) == {item[0] for item in expected}
-    assert groups["action/muon"]["lr"] == 0.04
-    assert groups["action/muon"]["dedicated_param_count"] > 0
-    assert groups["action/adamw"]["adamw_param_count"] > 0
-    assert any(
-        row["route"] == "muon" and row["group_name"] == "action/muon"
-        for row in summary["parameters"]
-    )
-    formatted = dmuon.format_param_group_summary(summary)
-    assert "action/muon" in formatted and "action/adamw" in formatted
+    group_idx = {
+        group["group_name"]: idx for idx, group in enumerate(optimizer.param_groups)
+    }
+    assert set(group_idx) == {item[0] for item in expected}
+    assert optimizer._muon_group_dps[group_idx["action/muon"]]
+    assert optimizer._adamw_group_params[group_idx["action/adamw"]]
     optim_sd = dmuon.get_optimizer_state_dict(
         model, optimizer, cpu_offload=True, rank0_only=False
     )

@@ -1,8 +1,8 @@
 # 示例：TP + DP 训练
 
 一个在 2D 设备网格上把张量并行（TP）和数据并行（DP）组合起来的完整
-示例。DMuon 通过 `DTensor` **自动检测** TP-sharded 参数——用户无需
-传任何 TP-specific 参数。
+示例。DMuon 通过 `DTensor` **自动检测** TP-sharded 参数，因此必需的
+设置仍然只需要传给 FSDP2 同一份 DP mesh 切片。
 
 ---
 
@@ -72,10 +72,13 @@ FSDP2 的分片契约。
 optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, adamw_lr=1e-3)
 ```
 
-**没有 TP-specific 参数。** 唯一和 TP 通信相关的是 `replicate_async`
-（默认 `True`）：post-step 的 scatter + replicate broadcast 是否要和
-下一 iter 的 forward compute 并发。sync 与 async 两个路径在 3D HSDP×TP
-下产生 **bit-identical** 的 loss 轨迹。
+大多数 TP 训练不需要额外 optimizer 参数。高级场景可以在
+`dedicate_params()` 上设置 `tp_buffer_reuse=` 复用 TP gather/scatter
+scratch buffer，也可以在 `Muon` 上设置 `tp_distributed_gram=`，当 Gram
+factor payload 小于完整 update scatter 时走 TP-aware distributed Gram
+路径。`replicate_async` 是 DP/HSDP post-step publish 的 overlap 开关，
+不是 TP 专属开关；sync 与 async post-step publish 在已支持拓扑上的设计目标是
+保持相同 loss 轨迹。
 
 ## 内部流程
 

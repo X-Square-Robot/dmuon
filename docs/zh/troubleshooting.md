@@ -147,23 +147,12 @@
 ## 性能
 
 ??? warning "优化步骤很慢（小模型却 >>100 ms）"
-    **原因——降级为同步：** 某个 group 可能触发了异步→同步降级。检查方法：
-    ```bash
-    DMUON_REPLICATE_PROFILE=1 torchrun --nproc_per_node=... train.py
-    ```
-    训练结束时，`dmuon.replicate_profile_report(model)` 打印每 group
-    的等待时间表格。平均等待时间高的 group 可能已降级。
+    **原因：** owner 负载可能不均衡，或者 post-step publish 太大，
+    无法藏进下一轮 forward。
 
-    **修复：** 重置降级并排查 IB 带宽：
-    ```python
-    dmuon.reset_replicate_fallback(model)
-    ```
-    若 IB 较慢，调高阈值：
-    ```python
-    import dmuon.group as g
-    g.REPLICATE_WAIT_THRESHOLD_US = 500
-    ```
-    详见[性能分析与 Fallback](guides/profiling-and-fallback.md)。
+    **修复：** 先用 `dmuon.Muon(..., replicate_async=False/True)` 对比同步
+    与异步计时。如果只有少数 owner rank 慢，检查 dedicated 参数分配、
+    hook 边界和 owner 策略。
 
 ---
 
@@ -185,11 +174,7 @@
     **原因：** LPT（最长处理时间）分配可能将过多大参数分配给少数几个
     owner rank，导致显存不均衡。
 
-    **修复：** 分析均衡情况：
-    ```bash
-    DMUON_PROFILE_BALANCE=1 torchrun --nproc_per_node=... train.py
-    ```
-    若日志显示高不均衡，验证 `_extract_layer_id` 是否正确识别了模型的层
+    **修复：** 验证 `_extract_layer_id` 是否正确识别了模型的层
     结构。对于 ViT 风格的模型（FQN 中含 `blocks.N` 路径），确保
     `blocks.N` 出现在 FQN 中——否则所有参数可能折叠到同一个"层"键。
     详见[设计/架构](design/architecture.md)。
@@ -217,18 +202,6 @@
     **修复：** 这是已知限制。通过 `get_model_state_dict`（重建完整未分片
     张量）保存，然后用 `set_model_state_dict` 重新加载。跨拓扑变更时
     不要复用优化器状态字典——仅从模型权重重新开始。
-
----
-
-??? warning "网络改善后降级协议卡在同步模式"
-    **原因：** 某个 group 已永久设置 `_replicate_sync_fallback=True`，
-    不会自动重新启用异步。
-
-    **修复：**
-    ```python
-    dmuon.reset_replicate_fallback(model)
-    ```
-    解决网络问题后对模型调用一次即可。
 
 ---
 
@@ -272,6 +245,5 @@
 ## 参见
 
 - [常见问题](faq/index.md)
-- [性能分析与 Fallback](guides/profiling-and-fallback.md)
 - [HSDP 指南](guides/hsdp.md)
 - [API 文档](reference/api.md)

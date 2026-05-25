@@ -5,9 +5,8 @@ all_gather_stream / reduce_scatter_stream) and CUDA events for GPU-side
 synchronization instead of CPU-blocking work.wait().
 """
 
-import os
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import NamedTuple, Optional
 
 import torch
@@ -19,21 +18,115 @@ from dmuon._core.owner_rank import OwnerCoord
 
 from .param import DedicatedParam
 
-try:
-    from torch.distributed.tensor import DTensor as _DTensor
-except ImportError:
-    _DTensor = None
-
 
 @contextmanager
 def _profile_range(name: str):
-    if bool(int(os.environ.get("DMUON_TORCH_PROFILE_MARKERS", "0") or 0)):
-        from torch.profiler import record_function
+    yield
 
-        with record_function(name):
-            yield
-    else:
-        yield
+
+def _split_for_scatter(
+    tensor: torch.Tensor,
+    split_size: int,
+    *,
+    dim: int,
+    out_buffers: Optional[list[torch.Tensor]] = None,
+) -> list[torch.Tensor]:
+    """Return contiguous scatter shards while avoiding unnecessary copies.
+
+    TP owner scatter needs contiguous send tensors.  Splitting a contiguous
+    matrix along dim 0 already produces contiguous views, while dim 1 splits
+    generally do not.  The old path copied every shard unconditionally; for
+    row-sharded parameters that turned the owner-side split into avoidable
+    memory traffic inside post-step publish.
+    """
+    shards = list(tensor.split(split_size, dim=dim))
+    if out_buffers is not None:
+        if len(out_buffers) != len(shards):
+            raise ValueError(
+                f"out_buffers length {len(out_buffers)} does not match "
+                f"scatter shard count {len(shards)}"
+            )
+        for out, shard in zip(out_buffers, shards):
+            if tuple(out.shape) != tuple(shard.shape):
+                raise ValueError(
+                    f"out buffer shape {tuple(out.shape)} does not match "
+                    f"scatter shard shape {tuple(shard.shape)}"
+                )
+            out.copy_(shard)
+        return out_buffers
+    return [shard if shard.is_contiguous() else shard.contiguous() for shard in shards]
+
+
+def _tp_gather_buffer_reuse_enabled(comm_ctx: DedicatedCommContext) -> bool:
+    return comm_ctx.tp_gather_buffer_reuse_enabled()
+
+
+def _tp_scatter_buffer_reuse_enabled(comm_ctx: DedicatedCommContext) -> bool:
+    return comm_ctx.tp_scatter_buffer_reuse_enabled()
+
+
+def _tensor_payload_bytes(shape: torch.Size | tuple[int, ...], dtype: torch.dtype) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return int(numel * torch.empty((), dtype=dtype).element_size())
+
+
+def _param_payload_bytes(p: DedicatedParam) -> int:
+    return _tensor_payload_bytes(p._orig_size, p._orig_dtype)
+
+
+def _group_profile_name(group: object) -> str:
+    return str(getattr(group, "_debug_name", None) or f"group_{id(group):x}")
+
+
+def _cached_tensor(
+    owner: object,
+    attr: str,
+    *,
+    shape: torch.Size | tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    cached = getattr(owner, attr, None)
+    if (
+        cached is None
+        or tuple(cached.shape) != tuple(shape)
+        or cached.dtype != dtype
+        or cached.device != device
+    ):
+        cached = torch.empty(tuple(shape), dtype=dtype, device=device)
+        setattr(owner, attr, cached)
+    return cached
+
+
+def _cached_tensor_list(
+    owner: object,
+    attr: str,
+    *,
+    count: int,
+    shape: torch.Size | tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    cached = getattr(owner, attr, None)
+    valid = (
+        isinstance(cached, list)
+        and len(cached) == count
+        and all(
+            tuple(t.shape) == tuple(shape)
+            and t.dtype == dtype
+            and t.device == device
+            for t in cached
+        )
+    )
+    if not valid:
+        cached = [
+            torch.empty(tuple(shape), dtype=dtype, device=device)
+            for _ in range(count)
+        ]
+        setattr(owner, attr, cached)
+    return cached
 
 
 class ReplicateReduceState(NamedTuple):
@@ -50,11 +143,22 @@ class ReplicateReduceState(NamedTuple):
     event: Optional[torch.cuda.Event]
 
 
-# Phase C.4 fallback tuning — see ``hsdp_native_phaseC_plan.md §8``.
-# Exposed at module scope so tests + users can tweak the thresholds without
-# monkey-patching inside the group object.
-REPLICATE_WAIT_THRESHOLD_US: float = 100.0
-REPLICATE_FALLBACK_CONSECUTIVE_STEPS: int = 3
+def _adamw_replicate_allreduce_enabled(p: DedicatedParam) -> bool:
+    return bool(getattr(p, "_dmuon_adamw_replicate_allreduce", False))
+
+
+def _sharded_adamw_enabled(p: DedicatedParam) -> bool:
+    return bool(getattr(p, "uses_sharded_adamw", lambda: False)())
+
+
+def _needs_post_step_replicate_broadcast(p: DedicatedParam) -> bool:
+    # Production type-split AdamW uses DMuon owner update + post-step publish,
+    # matching Muon tensors.  Replicate-all-reduce mode lets every shard-owner
+    # replicate update locally, so there is no global-owner update to fan out.
+    return (
+        not _adamw_replicate_allreduce_enabled(p)
+        and not _sharded_adamw_enabled(p)
+    )
 
 
 class TPScatterState(NamedTuple):
@@ -139,6 +243,13 @@ class DedicatedParamGroup:
         # Stage-2 input + event alive until ``wait_for_reduce`` runs, mirroring
         # ``AllReduceState`` in ``_fsdp_param_group.py:115-117``.
         self._broadcast_event: Optional[torch.cuda.Event] = None
+        # FSDP2 only waits the previous reduce-scatter event between backward
+        # groups to keep its input buffer lifetime bounded; it does *not* wait
+        # the HSDP all-reduce tail there.  DMuon mirrors that split with this
+        # Stage-1 event: the rolling backward drain waits it to release
+        # shard-reduce-only grad refs, while the full Stage-2 tail remains
+        # pending until the optimizer/root-post-backward boundary.
+        self._stage1_reduce_event: Optional[torch.cuda.Event] = None
         self._post_reduce_event: Optional[torch.cuda.Event] = None
         self._replicate_reduce_state: Optional[ReplicateReduceState] = None
         self._muon_grad_ready_event: Optional[torch.cuda.Event] = None
@@ -157,31 +268,24 @@ class DedicatedParamGroup:
         #     ``AllGatherState`` (``_fsdp_param_group.py:105-107``).
         self._replicate_broadcast_event: Optional[torch.cuda.Event] = None
         self._replicate_broadcast_state: Optional[ReplicateBroadcastState] = None
-        # Per-group sync fallback flag.  Flipped by the Phase C.4 fallback
-        # monitor after N consecutive slow waits; once set, all subsequent
-        # async dispatches short-circuit to the Phase B sync path.  Reset
-        # only by user code via ``reset_replicate_fallback()``.
-        self._replicate_sync_fallback: bool = False
-        # Last observed wait blocked-time on the default stream, set by
-        # the Phase C.4/C.7 profile path.  0.0 means "no timing in the
-        # last iteration" (profiler disabled or not yet consumed).
-        self._last_replicate_wait_us: float = 0.0
-        # Fallback state machine — count of consecutive slow waits.
-        self._replicate_slow_wait_count: int = 0
-
         # T2d: TP scatter state — mirrors ``_replicate_broadcast_state``
         # and pins transient TP-owner send shards until the scatter event is
         # visible. Async uses it for lifetime + deferred waiting; sync uses it
         # for lifetime, since the current stream already waits on the event.
         # Consumed together with the replicate broadcast state in
-        # ``_pre_forward_wait``. See ``tp_design.md`` §4.2 (O2) + §5 fallback.
+        # ``_pre_forward_wait``. See ``tp_design.md`` §4.2 (O2).
         self._tp_scatter_state: Optional[TPScatterState] = None
         self._tp_gather_event: Optional[torch.cuda.Event] = None
         self._tp_gather_refs: list[torch.Tensor] = []
-        self._tp_sync_fallback: bool = False
-        self._last_tp_scatter_wait_us: float = 0.0
-        self._tp_scatter_slow_wait_count: int = 0
-
+        self._tp_gather_pending_full_grads: list[
+            tuple[
+                DedicatedParam,
+                list[torch.Tensor],
+                torch.Tensor,
+                int,
+                Optional[torch.Tensor],
+            ]
+        ] = []
         # Partial accumulator across ``no_sync`` micro-batches (per-param, on
         # the shard-owner rank).  Set during grad-accum when
         # ``replicate_grads_enabled`` is False; flushed into the next Stage-2
@@ -202,8 +306,7 @@ class DedicatedParamGroup:
 
         # Post-backward fast-path tracking: reset in _pre_forward, set True when
         # reduce+reshard runs (either via _DedicatedPostBackward.backward fast path
-        # or via the autograd-engine root callback). Used by the fallback to skip
-        # groups that already ran.
+        # or via the autograd-engine root callback).
         self._post_backward_fired: bool = False
 
         # NOTE: Phase 2 removed _forward_time_params. It used to snapshot the
@@ -227,8 +330,11 @@ class DedicatedParamGroup:
         # ``dp_group`` is the shard group (in Phase B the replicate coord is
         # handled separately via ``replicate_group``).
         self._total_numel_by_owner: dict[OwnerCoord, int] = {
-            owner: sum(p.numel for p in owner_params)
+            owner: sum(
+                p.numel for p in owner_params if not _sharded_adamw_enabled(p)
+            )
             for owner, owner_params in self._by_owner.items()
+            if any(not _sharded_adamw_enabled(p) for p in owner_params)
         }
         if self._dp_group is not None:
             self._global_owner_ranks: dict[OwnerCoord, int] = {
@@ -266,6 +372,8 @@ class DedicatedParamGroup:
                 offset = 0
                 dsts: list[torch.Tensor] = []
                 for p in self._by_owner[owner]:
+                    if _sharded_adamw_enabled(p):
+                        continue
                     p.bind_to_packed_buffer(packed, offset)
                     dsts.append(packed[offset : offset + p.numel])
                     offset += p.numel
@@ -276,7 +384,7 @@ class DedicatedParamGroup:
     # ---- unshard (broadcast) — dispatch phase ----
 
     @dynamo_disable
-    def unshard(self):
+    def unshard(self, *, prefetch: bool = False):
         """Dispatch broadcasts on broadcast_stream. Does NOT wait.
 
         Phase 2: each owner has one persistent packed buffer; params are
@@ -292,7 +400,10 @@ class DedicatedParamGroup:
         consume any still-pending async replicate broadcast here too so
         the copy-in below always reads fresh ``_owned_data``.
         """
-        self._pre_forward_wait()
+        if prefetch:
+            self._pre_forward_prefetch_publish()
+        else:
+            self._pre_forward_wait()
         if self._is_unsharded:
             return  # still unsharded from forward (reshard_after_forward=False)
         if self._broadcast_event is not None:
@@ -305,6 +416,9 @@ class DedicatedParamGroup:
 
         dp_group = self._dp_group
         local_shard_rank = dp_group.rank()
+        sharded_adamw_params = [
+            p for p in self.params if _sharded_adamw_enabled(p)
+        ]
         with torch.cuda.stream(broadcast_stream):
             # Alloc + owner copy-in BEFORE coalescing: these ops execute
             # immediately on broadcast_stream. Wrapped in no_grad +
@@ -337,13 +451,52 @@ class DedicatedParamGroup:
                 ):
                     torch._foreach_copy_(dsts, srcs)
 
+            # DMuon-managed sharded AdamW base params: every shard rank owns a
+            # flat shard and all-gathers the full forward view.  This keeps
+            # embeddings/heads on the DMuon communication surface instead of
+            # handing them back to FSDP2 or a single owner broadcast.
+            for p in sharded_adamw_params:
+                assert p._sharded_adamw_full_padded is not None
+                assert p._sharded_adamw_comm_shard is not None
+                assert p._sharded_adamw_data is not None
+                with (
+                    torch.no_grad(),
+                    torch.autograd._unsafe_preserve_version_counter(
+                        p._sharded_adamw_full_padded
+                    ),
+                ):
+                    alloc_storage(p._sharded_adamw_full_padded)
+                    p._sharded_adamw_comm_shard.copy_(p._sharded_adamw_data)
+
+            group_name = _group_profile_name(self)
             with dist._coalescing_manager(group=dp_group, device=self.device):
                 for owner_coord, packed_buf in self._packed_buf_by_owner.items():
-                    dist.broadcast(
-                        packed_buf,
-                        src=self._global_owner_ranks[owner_coord],
-                        group=dp_group,
+                    profile_name = (
+                        f"dmuon.unshard_broadcast.bucket."
+                        f"owner{owner_coord[0]}_{owner_coord[1]}."
+                        f"bytes{int(packed_buf.numel() * packed_buf.element_size())}."
+                        f"params{len(self._by_owner[owner_coord])}.{group_name}"
                     )
+                    with _profile_range(profile_name):
+                        dist.broadcast(
+                            packed_buf,
+                            src=self._global_owner_ranks[owner_coord],
+                            group=dp_group,
+                        )
+            if sharded_adamw_params:
+                with dist._coalescing_manager(group=dp_group, device=self.device):
+                    for p in sharded_adamw_params:
+                        profile_name = (
+                            f"dmuon.unshard_all_gather.sharded_adamw."
+                            f"bytes{int(p._sharded_adamw_full_padded.numel() * p._sharded_adamw_full_padded.element_size())}."
+                            f"{p.param_name}.{group_name}"
+                        )
+                        with _profile_range(profile_name):
+                            dist.all_gather_into_tensor(
+                                p._sharded_adamw_full_padded,
+                                p._sharded_adamw_comm_shard,
+                                group=dp_group,
+                            )
 
         self._broadcast_event = broadcast_stream.record_event()
 
@@ -397,6 +550,17 @@ class DedicatedParamGroup:
                 torch.autograd._unsafe_preserve_version_counter(packed_buf),
             ):
                 free_storage(packed_buf)
+        for p in self.params:
+            if not _sharded_adamw_enabled(p):
+                continue
+            full_padded = getattr(p, "_sharded_adamw_full_padded", None)
+            if full_padded is None:
+                continue
+            with (
+                torch.no_grad(),
+                torch.autograd._unsafe_preserve_version_counter(full_padded),
+            ):
+                free_storage(full_padded)
         self._is_unsharded = False
 
     # ---- gradient reduction — dispatch phase ----
@@ -412,11 +576,13 @@ class DedicatedParamGroup:
         (``_fsdp_collectives.py:555-588``):
 
         1. Stage-1 reduce runs on ``reduce_stream``;
-        2. When Stage-2 applies, ``replicate_broadcast_stream`` waits on
-           ``reduce_stream`` via ``wait_stream``, then dispatches the
+        2. When Stage-2 applies, ``replicate_reduce_stream`` waits on
+           ``reduce_stream`` via event dependency, then dispatches the
            replicate reduce on itself;
-        3. ``_post_reduce_event`` is recorded on whichever stream is the
-           pipeline's tail, so a single event wait covers both stages.
+        3. ``_stage1_reduce_event`` records the shard-reduce completion for
+           FSDP2-style backward buffer-safety waits, while
+           ``_post_reduce_event`` records the full pipeline tail for optimizer
+           use.
 
         Gate semantics (mirrors FSDP2's two bool gates at
         ``_fsdp_param_group.py:185-189``):
@@ -434,8 +600,7 @@ class DedicatedParamGroup:
                 if not p._is_unsharded or p._unsharded_param.grad is None:
                     continue
                 grad = p._unsharded_param.grad.data
-                if _DTensor is not None and isinstance(grad, _DTensor):
-                    grad = grad._local_tensor
+                grad = p.local_grad_for_reduce(grad)
                 if p._accumulated_grad is not None:
                     p._accumulated_grad.add_(grad)
                 else:
@@ -458,15 +623,14 @@ class DedicatedParamGroup:
             if p._accumulated_grad is not None and p._is_unsharded:
                 if p._unsharded_param.grad is not None:
                     grad = p._unsharded_param.grad.data
-                    if _DTensor is not None and isinstance(grad, _DTensor):
-                        grad = grad._local_tensor
+                    grad = p.local_grad_for_reduce(grad)
                     grad.add_(p._accumulated_grad)
                 else:
                     p._unsharded_param.grad = p._accumulated_grad.clone()
                 p._accumulated_grad = None
 
         reduce_stream = self.comm_ctx.reduce_stream
-        replicate_stream = self.comm_ctx.replicate_broadcast_stream
+        replicate_stream = self.comm_ctx.replicate_reduce_stream
         replicate_group = self.comm_ctx.replicate_group
         has_replicate = replicate_group is not None and self.replicate_grads_enabled
 
@@ -474,70 +638,100 @@ class DedicatedParamGroup:
         reduce_stream.wait_stream(torch.cuda.current_stream())
 
         self._pending_reduce = []
-        # ``_stage2_pending``: per-(grad_buf, param) records; only shard-owner
-        # ranks populate this list.  Consumed on the replicate stream below.
+        # ``stage2_pending``: per-(grad_buf, param) records; only shard-owner
+        # ranks populate this list for owner-managed params.  Sharded AdamW
+        # params populate ``sharded_stage2_pending`` on every shard rank after
+        # reduce-scatter, then use replicate all-reduce for HSDP.
         stage2_pending: list[tuple[torch.Tensor, DedicatedParam]] = []
+        sharded_stage2_pending: list[tuple[torch.Tensor, DedicatedParam]] = []
         dp_group = self._dp_group
         my_shard_rank = dp_group.rank()
+
+        group_name = str(getattr(self, "_debug_name", None) or f"group_{id(self):x}")
 
         # Stage 1 — shard reduce.  Coalesce all reduces into a single fused
         # NCCL kernel.  Grad tensor refs are saved on ``_pending_reduce`` so
         # that ``reshard()`` freeing ``_unsharded_param``'s storage does not
         # dangle the post-reduce view.
-        with torch.cuda.stream(reduce_stream):
-            with dist._coalescing_manager(group=dp_group, device=self.device):
-                for p in self.params:
-                    if not p._is_unsharded or p._unsharded_param.grad is None:
-                        continue
-                    grad = p._unsharded_param.grad.data
-                    if _DTensor is not None and isinstance(grad, _DTensor):
-                        grad = grad._local_tensor
-                    grad = grad.contiguous()
-                    dist.reduce(
-                        grad,
-                        dst=self._global_owner_ranks[p.owner_rank],
-                        op=dist.ReduceOp.AVG,
-                        group=dp_group,
-                    )
-                    p._unsharded_param.grad = None
-                    self._pending_reduce.append((grad.view(-1), [p]))
-                    # Only the shard-owner rank holds the post-Stage-1 grad
-                    # and therefore participates in Stage-2.
-                    if has_replicate and my_shard_rank == p.owner_shard:
-                        stage2_pending.append((grad, p))
+        with _profile_range(f"dmuon.stage1_shard_reduce.{group_name}"):
+            with torch.cuda.stream(reduce_stream):
+                with dist._coalescing_manager(
+                    group=dp_group, device=self.device
+                ):
+                    for p in self.params:
+                        if _sharded_adamw_enabled(p):
+                            continue
+                        if not p._is_unsharded or p._unsharded_param.grad is None:
+                            continue
+                        grad = p._unsharded_param.grad.data
+                        grad = p.local_grad_for_reduce(grad)
+                        grad = grad.contiguous()
+                        dist.reduce(
+                            grad,
+                            dst=self._global_owner_ranks[p.owner_rank],
+                            op=dist.ReduceOp.AVG,
+                            group=dp_group,
+                        )
+                        p._unsharded_param.grad = None
+                        self._pending_reduce.append((grad.view(-1), [p]))
+                        # Only the shard-owner rank holds the post-Stage-1 grad
+                        # and therefore participates in Stage-2.
+                        if has_replicate and my_shard_rank == p.owner_shard:
+                            stage2_pending.append((grad, p))
+
+                sharded_work = [
+                    p
+                    for p in self.params
+                    if _sharded_adamw_enabled(p)
+                    and p._is_unsharded
+                    and p._unsharded_param.grad is not None
+                ]
+                if sharded_work:
+                    with dist._coalescing_manager(
+                        group=dp_group, device=self.device
+                    ):
+                        for p in sharded_work:
+                            assert p._sharded_adamw_reduce_input is not None
+                            assert p._sharded_adamw_comm_shard is not None
+                            grad = p._unsharded_param.grad.data
+                            grad = p.local_grad_for_reduce(grad)
+                            flat_grad = grad.contiguous().view(-1)
+                            reduce_input = p._sharded_adamw_reduce_input
+                            reduce_input.zero_()
+                            reduce_input[: flat_grad.numel()].copy_(flat_grad)
+                            p._sharded_adamw_grad = torch.empty_like(
+                                p._sharded_adamw_comm_shard
+                            )
+                            dist.reduce_scatter_tensor(
+                                p._sharded_adamw_grad,
+                                reduce_input,
+                                op=dist.ReduceOp.AVG,
+                                group=dp_group,
+                            )
+                            p._unsharded_param.grad = None
+                            if has_replicate:
+                                sharded_stage2_pending.append(
+                                    (p._sharded_adamw_grad, p)
+                                )
 
         stage1_event = reduce_stream.record_event()
+        self._stage1_reduce_event = stage1_event
 
         # Stage 2 — replicate reduce.  Only shard-owner ranks dispatch; the
         # non-shard-owner grads are already "garbage" after Stage 1 (undefined
         # per NCCL spec).  The pipeline's tail event is recorded on whichever
         # stream ran last.
-        if has_replicate and stage2_pending:
-            replicate_stream.wait_stream(reduce_stream)
-            with torch.cuda.stream(replicate_stream):
-                # Accumulator flush: if a prior micro-batch ran with
-                # ``replicate_grads_enabled=False``, this param's shard-only
-                # partial is living in ``_partial_reduce_by_param``.  Fold it
-                # into the Stage-1 output before the Stage-2 reduce.
-                for grad, p in stage2_pending:
-                    partial = self._partial_reduce_by_param.pop(id(p), None)
-                    if partial is not None:
-                        grad.add_(partial)
-                with dist._coalescing_manager(
-                    group=replicate_group, device=self.device
-                ):
-                    for grad, p in stage2_pending:
-                        dist.reduce(
-                            grad,
-                            dst=p._owner_replicate_global_rank,
-                            op=dist.ReduceOp.AVG,
-                            group=replicate_group,
-                        )
-            stage2_event = replicate_stream.record_event()
+        combined_stage2_pending = stage2_pending + sharded_stage2_pending
+        if has_replicate and combined_stage2_pending:
+            stage2_event = self._launch_stage2_replicate_reduce(
+                combined_stage2_pending,
+                wait_event=stage1_event,
+                group_name=group_name,
+            )
             # Keep the Stage-1 tensor + Stage-2 event alive until
             # ``wait_for_reduce`` runs — mirrors FSDP2 AllReduceState.
             self._replicate_reduce_state = ReplicateReduceState(
-                replicate_input=stage2_pending[0][0],
+                replicate_input=combined_stage2_pending[0][0],
                 event=stage2_event,
             )
             self._post_reduce_event = stage2_event
@@ -558,6 +752,112 @@ class DedicatedParamGroup:
             self._post_reduce_event = stage1_event
         else:
             self._post_reduce_event = stage1_event
+
+    def _launch_stage2_replicate_reduce(
+        self,
+        stage2_pending: list[tuple[torch.Tensor, DedicatedParam]],
+        *,
+        wait_event: Optional[torch.cuda.Event],
+        group_name: str,
+    ) -> torch.cuda.Event:
+        replicate_group = self.comm_ctx.replicate_group
+        assert replicate_group is not None
+        replicate_stream = self.comm_ctx.replicate_reduce_stream
+        with _profile_range(f"dmuon.stage2_replicate_reduce.{group_name}"):
+            if wait_event is not None:
+                replicate_stream.wait_event(wait_event)
+            with torch.cuda.stream(replicate_stream):
+                # Accumulator flush: if a prior micro-batch ran with
+                # ``replicate_grads_enabled=False``, this param's shard-only
+                # partial is living in ``_partial_reduce_by_param``.  Fold it
+                # into the Stage-1 output before the Stage-2 reduce.
+                for grad, p in stage2_pending:
+                    partial = self._partial_reduce_by_param.pop(id(p), None)
+                    if partial is not None:
+                        grad.add_(partial)
+                with dist._coalescing_manager(
+                    group=replicate_group, device=self.device
+                ):
+                    for grad, p in stage2_pending:
+                        if (
+                            _adamw_replicate_allreduce_enabled(p)
+                            or _sharded_adamw_enabled(p)
+                        ):
+                            dist.all_reduce(
+                                grad,
+                                op=dist.ReduceOp.AVG,
+                                group=replicate_group,
+                            )
+                        else:
+                            dist.reduce(
+                                grad,
+                                dst=p._owner_replicate_global_rank,
+                                op=dist.ReduceOp.AVG,
+                                group=replicate_group,
+                            )
+        return replicate_stream.record_event()
+
+    def _retain_pending_reduce_after_stage1(self, p: DedicatedParam) -> bool:
+        """Whether this rank must keep ``p``'s Stage-1 grad ref alive.
+
+        After Stage-1 completes, non-shard-owner ranks no longer need their
+        reduce input tensors.  Shard-owner ranks must keep them until Stage-2
+        finishes because the replicate reduce may still be reading them.  The
+        final global owner (or the local AdamW all-reduce owner) also needs the
+        tensor for ``wait_for_reduce()`` to materialize ``_reduced_grad``.
+        """
+        local_adamw_owner = (
+            _adamw_replicate_allreduce_enabled(p)
+            and p._owned_data is not None
+        )
+        if p.is_owner or local_adamw_owner:
+            return True
+        replicate_group = self.comm_ctx.replicate_group
+        if replicate_group is None:
+            return False
+        return self._dp_group.rank() == p.owner_shard
+
+    def _compact_pending_reduce_after_stage1(self) -> None:
+        if not self._pending_reduce:
+            return
+        self._pending_reduce = [
+            (grad_buf, plist)
+            for grad_buf, plist in self._pending_reduce
+            if grad_buf is not None
+            and plist
+            and self._retain_pending_reduce_after_stage1(plist[0])
+        ]
+
+    @dynamo_disable
+    def wait_for_stage1_reduce(
+        self, stream: Optional[torch.cuda.Stream] = None
+    ) -> Optional[torch.cuda.Event]:
+        """Wait only for the Stage-1 shard reduce and trim dead grad refs.
+
+        This is the DMuon equivalent of FSDP2's inter-group
+        ``reduce_scatter_state.event`` wait.  It bounds the lifetime of
+        shard-reduce input buffers during backward, but deliberately avoids
+        waiting the HSDP Stage-2 replicate reduce.  The Stage-2 tail is a true
+        optimizer dependency and is drained by :meth:`wait_for_reduce` at the
+        optimizer/root-post-backward boundary.
+        """
+        if self._stage1_reduce_event is None:
+            return None
+
+        target_stream = stream if stream is not None else torch.cuda.current_stream()
+
+        def _wait_and_compact() -> None:
+            target_stream.wait_event(self._stage1_reduce_event)
+            self._compact_pending_reduce_after_stage1()
+
+        if stream is None:
+            _wait_and_compact()
+        else:
+            with torch.cuda.stream(stream):
+                _wait_and_compact()
+
+        self._stage1_reduce_event = None
+        return None
 
     @dynamo_disable
     def wait_for_reduce(
@@ -590,7 +890,11 @@ class DedicatedParamGroup:
                 if grad_buf is None:
                     continue
                 p = plist[0]
-                if not p.is_owner:
+                local_adamw_owner = (
+                    _adamw_replicate_allreduce_enabled(p)
+                    and p._owned_data is not None
+                )
+                if not (p.is_owner or local_adamw_owner):
                     continue
                 new_grad = grad_buf.view(p._orig_size)
                 if p._reduced_grad is not None:
@@ -605,6 +909,7 @@ class DedicatedParamGroup:
                 _wait_and_unpack()
 
         self._post_reduce_event = None
+        self._stage1_reduce_event = None
         self._replicate_reduce_state = None
         self._muon_grad_ready_refs = [
             grad_buf
@@ -661,6 +966,7 @@ class DedicatedParamGroup:
         if not work:
             self._tp_gather_event = None
             self._tp_gather_refs = []
+            self._tp_gather_pending_full_grads = []
             return None
 
         # Compatibility path: wait_for_reduce may have unpacked _reduced_grad
@@ -682,9 +988,11 @@ class DedicatedParamGroup:
 
         with torch.cuda.stream(reduce_stream):
             gather_refs: list[torch.Tensor] = []
-            gathered_full_grads: list[
-                tuple[DedicatedParam, list[torch.Tensor], torch.Tensor, int]
+            self._tp_gather_pending_full_grads = []
+            pending_full_grads: list[
+                tuple[DedicatedParam, list[torch.Tensor], torch.Tensor, int, Optional[torch.Tensor]]
             ] = []
+            reuse_buffers = _tp_gather_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
                 with dist._coalescing_manager(group=tp_group, device=self.device):
                     for p, local_grad in group_work:
@@ -695,9 +1003,27 @@ class DedicatedParamGroup:
                             # deferral).  gather_list entries must be separate
                             # tensors; we cat them post-gather along shard_dim.
                             shard_dim = p.shard_dim if p.shard_dim is not None else 0
-                            recv_bufs = [
-                                torch.empty_like(local_grad) for _ in range(tp_size)
-                            ]
+                            if reuse_buffers:
+                                recv_bufs = _cached_tensor_list(
+                                    p,
+                                    "_tp_gather_recv_bufs",
+                                    count=tp_size,
+                                    shape=local_grad.shape,
+                                    dtype=local_grad.dtype,
+                                    device=local_grad.device,
+                                )
+                                full_grad_buf = _cached_tensor(
+                                    p,
+                                    "_tp_full_grad_buf",
+                                    shape=p.full_shape,
+                                    dtype=local_grad.dtype,
+                                    device=local_grad.device,
+                                )
+                            else:
+                                recv_bufs = [
+                                    torch.empty_like(local_grad) for _ in range(tp_size)
+                                ]
+                                full_grad_buf = None
                             gather_refs.extend(recv_bufs)
                             gather_refs.append(local_grad)
                             dist.gather(
@@ -706,8 +1032,8 @@ class DedicatedParamGroup:
                                 dst=p._tp_owner_global_rank,
                                 group=p.tp_group,
                             )
-                            gathered_full_grads.append(
-                                (p, recv_bufs, local_grad, shard_dim)
+                            pending_full_grads.append(
+                                (p, recv_bufs, local_grad, shard_dim, full_grad_buf)
                             )
                         else:
                             gather_refs.append(local_grad)
@@ -718,19 +1044,33 @@ class DedicatedParamGroup:
                                 group=p.tp_group,
                             )
                             p._tp_full_grad = None
-            for p, recv_bufs, local_grad, shard_dim in gathered_full_grads:
-                recv_bufs[p.tp_group.rank()] = local_grad
-                p._tp_full_grad = torch.cat(recv_bufs, dim=shard_dim)
+            self._tp_gather_pending_full_grads = pending_full_grads
             self._tp_gather_refs = gather_refs
         self._tp_gather_event = reduce_stream.record_event()
         self._muon_grad_ready_event = self._tp_gather_event
         return self._tp_gather_event
+
+    def _materialize_tp_gathered_grads(self) -> None:
+        """Build TP-owner full grads after gather collectives have completed."""
+        pending = self._tp_gather_pending_full_grads
+        if not pending:
+            return
+        with _profile_range("dmuon.tp_gather_materialize_full_grads"):
+            for p, recv_bufs, local_grad, shard_dim, full_grad_buf in pending:
+                recv_bufs[p.tp_group.rank()] = local_grad
+                if full_grad_buf is None:
+                    p._tp_full_grad = torch.cat(recv_bufs, dim=shard_dim)
+                else:
+                    torch.cat(recv_bufs, dim=shard_dim, out=full_grad_buf)
+                    p._tp_full_grad = full_grad_buf
+        self._tp_gather_pending_full_grads = []
 
     def wait_for_tp_gather(self) -> None:
         """Wait until this group's TP gathered grads are visible to compute."""
         if self._tp_gather_event is None:
             return
         torch.cuda.current_stream().wait_event(self._tp_gather_event)
+        self._materialize_tp_gathered_grads()
         self._tp_gather_event = None
         self._tp_gather_refs = []
         self._muon_grad_ready_refs = []
@@ -760,6 +1100,12 @@ class DedicatedParamGroup:
 
         bcast_stream = self.comm_ctx.replicate_broadcast_stream
         bcast_stream.wait_stream(torch.cuda.current_stream())
+        # TP grad-gather prefetch uses ``reduce_stream`` while TP scatter uses
+        # ``replicate_broadcast_stream``.  Both issue collectives on the same
+        # TP process group, so preserve one global launch order across streams;
+        # otherwise a prefetched gather for group N+1 can race/reorder with
+        # group N's post-step scatter and corrupt the next forward.
+        bcast_stream.wait_stream(self.comm_ctx.reduce_stream)
 
         refs: list[torch.Tensor] = []
         updates: list[tuple[DedicatedParam, torch.Tensor]] = []
@@ -773,11 +1119,21 @@ class DedicatedParamGroup:
                 grouped_work.append((p.tp_group, [p]))
 
         with torch.cuda.stream(bcast_stream):
+            reuse_buffers = _tp_scatter_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
                 with dist._coalescing_manager(group=tp_group, device=self.device):
                     for p in group_work:
                         shard_dim = p.shard_dim if p.shard_dim is not None else 0
-                        recv_shard = torch.empty_like(p._owned_data)
+                        if reuse_buffers:
+                            recv_shard = _cached_tensor(
+                                p,
+                                "_tp_scatter_recv_buf",
+                                shape=p._owned_data.shape,
+                                dtype=p._owned_data.dtype,
+                                device=p._owned_data.device,
+                            )
+                        else:
+                            recv_shard = torch.empty_like(p._owned_data)
                         refs.append(recv_shard)
                         if p.is_tp_owner:
                             assert p._tp_full_delta is not None, (
@@ -791,13 +1147,22 @@ class DedicatedParamGroup:
                             # NS allocations reuse its storage before those
                             # copies have actually read it.
                             refs.append(p._tp_full_delta)
-                            splits = [
-                                s.contiguous()
-                                for s in p._tp_full_delta.split(
-                                    p._orig_size[shard_dim],
-                                    dim=shard_dim,
+                            split_buffers = None
+                            if reuse_buffers and shard_dim != 0:
+                                split_buffers = _cached_tensor_list(
+                                    p,
+                                    "_tp_scatter_split_bufs",
+                                    count=p.tp_group.size(),
+                                    shape=p._owned_data.shape,
+                                    dtype=p._owned_data.dtype,
+                                    device=p._owned_data.device,
                                 )
-                            ]
+                            splits = _split_for_scatter(
+                                p._tp_full_delta,
+                                p._orig_size[shard_dim],
+                                dim=shard_dim,
+                                out_buffers=split_buffers,
+                            )
                             refs.extend(splits)
                             dist.scatter(
                                 recv_shard,
@@ -871,19 +1236,8 @@ class DedicatedParamGroup:
         the NEXT iteration's :meth:`_pre_forward_wait` — mirrors the
         replicate-broadcast cross-call event chain.
 
-        Gate semantics:
-          * ``_tp_sync_fallback=True`` → degrade to sync; state stays IDLE.
-          * ``DMUON_TP_SCATTER_ASYNC`` unset/false → correctness-first sync
-            fallback; this keeps async replicate broadcast enabled while
-            avoiding rank-order/lifetime bugs in the experimental TP scatter.
-          * Double-dispatch (state still PENDING) → ``RuntimeError``.
+        Double-dispatch (state still PENDING) is a programming error.
         """
-        tp_async_enabled = os.environ.get(
-            "DMUON_TP_SCATTER_ASYNC", "0"
-        ).lower() not in {"0", "false", "no", "off"}
-        if self._tp_sync_fallback or not tp_async_enabled:
-            self.tp_scatter_delta()
-            return
         if self._tp_scatter_state is not None:
             group_name = getattr(self, "_debug_name", "<unknown>")
             raise RuntimeError(
@@ -923,7 +1277,11 @@ class DedicatedParamGroup:
         # Only ranks in some owner's shard column actually participate.  If
         # this rank is not in any owner's shard column for this group, skip
         # entirely — avoids dispatching an empty coalescing manager.
-        if not any(my_shard_rank == p.owner_shard for p in self.params):
+        if not any(
+            my_shard_rank == p.owner_shard
+            and _needs_post_step_replicate_broadcast(p)
+            for p in self.params
+        ):
             return
 
         bcast_stream = self.comm_ctx.replicate_broadcast_stream
@@ -933,6 +1291,8 @@ class DedicatedParamGroup:
             with dist._coalescing_manager(group=replicate_group, device=self.device):
                 for p in self.params:
                     if my_shard_rank != p.owner_shard:
+                        continue
+                    if not _needs_post_step_replicate_broadcast(p):
                         continue
                     # ``_owned_data`` is allocated on every shard-peer of
                     # the owner (see ``DedicatedParam.__init__``); the
@@ -968,11 +1328,8 @@ class DedicatedParamGroup:
 
         Gate semantics:
             - ``replicate_group is None`` → no-op (1D shard-only mode).
-            - ``_replicate_sync_fallback=True`` → degrade to the Phase B
-              sync path; caller observes no pending state after return.
             - Double dispatch (calling while a state is still PENDING) is
-              a programming error — detected by the
-              ``test_async_wait_semantics`` smoke (C.0).
+              a programming error.
 
         The wait point MUST be before ``unshard()``'s copy-in reads
         ``_owned_data``; checkpoint save paths must also drain pending
@@ -980,12 +1337,6 @@ class DedicatedParamGroup:
         """
         replicate_group = self.comm_ctx.replicate_group
         if replicate_group is None:
-            return
-
-        # Fallback path: sync dispatch + wait inline.  State stays IDLE.
-        if self._replicate_sync_fallback:
-            self.replicate_broadcast_sync()
-            self.wait_for_replicate_broadcast()
             return
 
         if self._replicate_broadcast_state is not None:
@@ -996,7 +1347,13 @@ class DedicatedParamGroup:
             )
 
         my_shard_rank = self._dp_group.rank()
-        if not any(my_shard_rank == p.owner_shard for p in self.params):
+        eligible_params = [
+            p
+            for p in self.params
+            if my_shard_rank == p.owner_shard
+            and _needs_post_step_replicate_broadcast(p)
+        ]
+        if not eligible_params:
             return
 
         bcast_stream = self.comm_ctx.replicate_broadcast_stream
@@ -1005,19 +1362,43 @@ class DedicatedParamGroup:
         # Pick one ``_owned_data`` tensor to pin via the state tuple.  Any
         # rank-participating param works; allocator arena is shared within
         # the coalescing manager below.
-        pin_ref: Optional[torch.Tensor] = None
+        pin_ref: Optional[torch.Tensor] = eligible_params[0]._owned_data
+        bucket_limit = self.comm_ctx.replicate_broadcast_bucket_bytes
+        if bucket_limit <= 0:
+            buckets = [eligible_params]
+        else:
+            buckets: list[list[DedicatedParam]] = []
+            current: list[DedicatedParam] = []
+            current_bytes = 0
+            for p in eligible_params:
+                payload_bytes = _param_payload_bytes(p)
+                if current and current_bytes + payload_bytes > bucket_limit:
+                    buckets.append(current)
+                    current = []
+                    current_bytes = 0
+                current.append(p)
+                current_bytes += payload_bytes
+            if current:
+                buckets.append(current)
+
+        group_name = _group_profile_name(self)
         with torch.cuda.stream(bcast_stream):
-            with dist._coalescing_manager(group=replicate_group, device=self.device):
-                for p in self.params:
-                    if my_shard_rank != p.owner_shard:
-                        continue
-                    if pin_ref is None:
-                        pin_ref = p._owned_data
-                    dist.broadcast(
-                        p._owned_data,
-                        src=p._owner_replicate_global_rank,
-                        group=replicate_group,
-                    )
+            for bucket_idx, bucket in enumerate(buckets):
+                bucket_bytes = sum(_param_payload_bytes(p) for p in bucket)
+                with _profile_range(
+                    f"dmuon.replicate_broadcast.bucket."
+                    f"idx{bucket_idx}.bytes{bucket_bytes}."
+                    f"params{len(bucket)}.{group_name}"
+                ):
+                    with dist._coalescing_manager(
+                        group=replicate_group, device=self.device
+                    ):
+                        for p in bucket:
+                            dist.broadcast(
+                                p._owned_data,
+                                src=p._owner_replicate_global_rank,
+                                group=replicate_group,
+                            )
 
         event = bcast_stream.record_event()
         assert pin_ref is not None  # guaranteed by the "any(...)" check above
@@ -1026,22 +1407,32 @@ class DedicatedParamGroup:
             event=event,
         )
 
+    def _pre_forward_prefetch_publish(self) -> None:
+        """Dispatch pending publish for a prefetched unshard without
+        blocking the current compute stream.
+
+        Actual forward entry uses :meth:`_pre_forward_wait` and clears the
+        async state.  A prefetch only orders this group's shard-dim broadcast
+        stream after the HSDP publish event, so the caller can continue
+        running the current layer while the next group's publish/unshard
+        pipeline progresses on communication streams.
+        """
+
+        bcast_stream = self.comm_ctx.broadcast_stream
+        tp_state = self._tp_scatter_state
+        if tp_state is not None:
+            bcast_stream.wait_event(tp_state.event)
+        state = self._replicate_broadcast_state
+        if state is not None:
+            bcast_stream.wait_event(state.event)
+
     @dynamo_disable
     def _pre_forward_wait(self) -> None:
-        """Phase C.3: consume any pending async replicate broadcast before
+        """Consume any pending async replicate broadcast before
         the shard-dim unshard's copy-in reads ``_owned_data``.
 
-        No-op when the state is IDLE (either 1D shard-only mode, or sync
-        fallback, or no prior async dispatch this iteration).
-
-        When :envvar:`DMUON_REPLICATE_PROFILE` is set (Phase C.4 / C.7),
-        the wait is bracketed by CUDA events with ``enable_timing=True``
-        and ``_last_replicate_wait_us`` is populated.  The timing path
-        forces a CPU sync on the current stream, so it costs one
-        round-trip per group per step and is NOT safe to leave on in
-        production; it is meant for fallback monitoring + profiling.
+        No-op when the state is idle.
         """
-        group_name = getattr(self, "_debug_name", None) or f"group_{id(self):x}"
         # T2d: drain the async TP scatter state first.  The scatter is
         # what writes ``_owned_data`` on every DP-owner TP rank; the
         # replicate broadcast fans that value out.  In pure-DP mode (no
@@ -1052,107 +1443,16 @@ class DedicatedParamGroup:
         # (and its pinned TP-owner send refs) can be released.
         tp_state = self._tp_scatter_state
         if tp_state is not None:
-            with _profile_range(f"dmuon.pre_forward_wait.tp_scatter.{group_name}"):
-                profile_enabled = bool(
-                    int(os.environ.get("DMUON_REPLICATE_PROFILE", "0") or 0)
-                )
-                if profile_enabled:
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
-                    start.record()
-                    torch.cuda.current_stream().wait_event(tp_state.event)
-                    end.record()
-                    end.synchronize()
-                    self._last_tp_scatter_wait_us = start.elapsed_time(end) * 1000.0
-                else:
-                    torch.cuda.current_stream().wait_event(tp_state.event)
+            torch.cuda.current_stream().wait_event(tp_state.event)
             self._tp_scatter_state = None
 
         state = self._replicate_broadcast_state
         if state is None:
             return
 
-        with _profile_range(f"dmuon.pre_forward_wait.replicate.{group_name}"):
-            profile_enabled = bool(
-                int(os.environ.get("DMUON_REPLICATE_PROFILE", "0") or 0)
-            )
-            if profile_enabled:
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                torch.cuda.current_stream().wait_event(state.event)
-                end.record()
-                # ``elapsed_time`` requires both events to be complete; the
-                # current-stream synchronize is the cheapest way to enforce it
-                # (only waits on the two timing events on the default stream).
-                end.synchronize()
-                self._last_replicate_wait_us = start.elapsed_time(end) * 1000.0  # ms→μs
-                from dmuon import _replicate_profile
-
-                _replicate_profile.record_wait_from_group(
-                    self, self._last_replicate_wait_us
-                )
-            else:
-                torch.cuda.current_stream().wait_event(state.event)
+        torch.cuda.current_stream().wait_event(state.event)
 
         self._replicate_broadcast_state = None
-
-    # ---- Phase C.4 fallback monitor -------------------------------------
-
-    def _update_replicate_fallback(self) -> None:
-        """Read ``_last_replicate_wait_us`` (populated by the profile path
-        in :meth:`_pre_forward_wait`) and advance the fallback state
-        machine.
-
-        Trips ``_replicate_sync_fallback`` after
-        :data:`REPLICATE_FALLBACK_CONSECUTIVE_STEPS` consecutive waits
-        above :data:`REPLICATE_WAIT_THRESHOLD_US`.  Single-direction:
-        once tripped, stays tripped until
-        :meth:`reset_replicate_fallback` is called.
-        """
-        if self._replicate_sync_fallback:
-            return  # already degraded; nothing to do
-        if self._last_replicate_wait_us <= 0.0:
-            return  # no sample this step (profiler off or no dispatch)
-        if self._last_replicate_wait_us > REPLICATE_WAIT_THRESHOLD_US:
-            self._replicate_slow_wait_count += 1
-        else:
-            self._replicate_slow_wait_count = 0
-        if self._replicate_slow_wait_count >= REPLICATE_FALLBACK_CONSECUTIVE_STEPS:
-            self._replicate_sync_fallback = True
-        # Drain the sample so a step without fresh data does not re-use
-        # the last value.
-        self._last_replicate_wait_us = 0.0
-
-    def _update_tp_scatter_fallback(self) -> None:
-        """T2e: tracks async TP scatter wait-time and flips
-        ``_tp_sync_fallback`` after ``REPLICATE_FALLBACK_CONSECUTIVE_STEPS``
-        consecutive slow waits (same thresholds as the replicate broadcast
-        fallback; tp_design.md §5)."""
-        if self._tp_sync_fallback:
-            return
-        if self._last_tp_scatter_wait_us <= 0.0:
-            return
-        if self._last_tp_scatter_wait_us > REPLICATE_WAIT_THRESHOLD_US:
-            self._tp_scatter_slow_wait_count += 1
-        else:
-            self._tp_scatter_slow_wait_count = 0
-        if self._tp_scatter_slow_wait_count >= REPLICATE_FALLBACK_CONSECUTIVE_STEPS:
-            self._tp_sync_fallback = True
-        self._last_tp_scatter_wait_us = 0.0
-
-    def reset_replicate_fallback(self) -> None:
-        """Manually clear the fallback flag.  Intended for user code that
-        wants to re-enable async after fixing the slow-IB condition."""
-        self._replicate_sync_fallback = False
-        self._replicate_slow_wait_count = 0
-        self._last_replicate_wait_us = 0.0
-
-    def reset_tp_scatter_fallback(self) -> None:
-        """Manually clear the async TP scatter fallback flag."""
-        self._tp_sync_fallback = False
-        self._tp_scatter_slow_wait_count = 0
-        self._last_tp_scatter_wait_us = 0.0
 
     # ---- backward prefetch ----
 
@@ -1176,11 +1476,12 @@ class DedicatedParamGroup:
         target_group = self.comm_ctx.post_forward_order[target_index]
         if not target_group._post_forward_indices:
             return  # target already backward'd — prefetch would read stale data
-        target_group.unshard()  # dispatch only — no wait
+        target_group.unshard(prefetch=True)  # dispatch only — no wait
 
     @dynamo_disable
     def _record_post_forward(self) -> None:
         """Record this group's position in forward order for backward prefetch."""
         post_forward_index = len(self.comm_ctx.post_forward_order)
         self.comm_ctx.post_forward_order.append(self)
+        self._last_post_forward_index = post_forward_index
         self._post_forward_indices.append(post_forward_index)

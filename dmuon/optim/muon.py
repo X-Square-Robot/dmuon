@@ -4,14 +4,14 @@ Combines Newton-Schulz orthogonalization on dedicated parameters with
 AdamW on symmetric (FSDP2-managed) parameters in a single optimizer.
 """
 
-import os
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
 
-from .. import _balance_profile
 from ..grad_clip import (
     MuonGradClipStats,
     _clip_ready_muon_grad_norm_,
@@ -22,10 +22,20 @@ from ..utils import (
     broadcast_all_updates,
     prepare_group_muon_grads,
     prepare_muon_grads,
-    update_replicate_fallback,
     wait_group_muon_grads,
 )
-from .newton_schulz import NewtonSchulz
+from .newton_schulz import (
+    DEFAULT_COEFFICIENTS,
+    DEFAULT_RESTART_ITERATIONS,
+    NewtonSchulz,
+    gram_newton_schulz_factors,
+)
+
+
+_TP_GRAM_FACTOR_WIRE_DTYPE = torch.float16
+_TP_GRAM_FACTOR_WIRE_ELEMENT_SIZE = torch.empty(
+    (), dtype=_TP_GRAM_FACTOR_WIRE_DTYPE
+).element_size()
 
 
 class Muon(Optimizer):
@@ -70,6 +80,20 @@ class Muon(Optimizer):
         nesterov: If True (default), use Nesterov momentum lookahead
             before NS orthogonalization: ``ns_input = grad + μ * buf``.
             Recommended by original Muon paper and used by Moonlight.
+        replicate_async: If True (default), publish owner updates asynchronously
+            and consume the events in the next forward. If False, drain the
+            publish path inside ``step()`` for deterministic timing.
+        record_step_profile: If True, record CUDA-event timing for optimizer
+            phases and expose it via ``consume_last_step_profile()``.
+        group_prepare_ahead: If True, prepare the next group's reduced grads
+            while the current group's optimizer math runs.
+        tp_distributed_gram: Enable the TP-aware distributed Gram path for
+            TP-sharded matrices.
+        tp_distributed_gram_policy: Policy for the distributed Gram path;
+            ``"beneficial"`` only uses it when the factor payload is expected
+            to be smaller than scattering the full update.
+        tp_distributed_gram_max_factor_to_scatter_ratio: Maximum factor-payload
+            to full-scatter byte ratio allowed by the ``"beneficial"`` policy.
 
     Example::
 
@@ -105,6 +129,11 @@ class Muon(Optimizer):
         ns_backend: Union[str, NewtonSchulz] = "gram",
         nesterov: bool = True,
         replicate_async: bool = True,
+        record_step_profile: bool = False,
+        group_prepare_ahead: bool = True,
+        tp_distributed_gram: bool = False,
+        tp_distributed_gram_policy: str = "beneficial",
+        tp_distributed_gram_max_factor_to_scatter_ratio: float = 0.5,
     ):
         if isinstance(ns_backend, str):
             ns_backend = NewtonSchulz(backend=ns_backend)
@@ -125,6 +154,13 @@ class Muon(Optimizer):
         # ``_pre_forward_wait`` hook; when False, the full fan-out is
         # waited synchronously at the end of step().
         self._replicate_async = replicate_async
+        self._record_step_profile = bool(record_step_profile)
+        self._group_prepare_ahead = bool(group_prepare_ahead)
+        self._tp_distributed_gram = bool(tp_distributed_gram)
+        self._tp_distributed_gram_policy = str(tp_distributed_gram_policy).lower()
+        self._tp_distributed_gram_max_factor_to_scatter_ratio = float(
+            tp_distributed_gram_max_factor_to_scatter_ratio
+        )
 
         # Discover all dedicated params, and the subset owned by this rank.
         comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
@@ -191,8 +227,10 @@ class Muon(Optimizer):
 
         self._dummy_params: list[nn.Parameter] = []
         self._muon_group_dps: dict[int, list] = {}
+        self._adamw_group_dps: dict[int, list] = {}
         self._adamw_group_params: dict[int, list[nn.Parameter]] = {}
         self._dp_to_muon_group_idx: dict[int, int] = {}
+        self._dp_to_adamw_group_idx: dict[int, int] = {}
         self._adamw_param_to_group_idx: dict[int, int] = {}
 
         optimizer_groups = self._build_optimizer_param_groups(
@@ -208,10 +246,6 @@ class Muon(Optimizer):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay)
         super().__init__(optimizer_groups, defaults)
 
-        self._profile_step_idx = 0
-        self._profile_param_timer: _balance_profile.ParamTimer = (
-            _balance_profile.ParamTimer()
-        )
         self._step_profile_enabled = False
         self._last_step_profile: dict[str, object] = {}
         self._last_step_profile_events: list[
@@ -253,6 +287,45 @@ class Muon(Optimizer):
         if secondary is not None and secondary in group:
             return group[secondary]
         return default
+
+    @staticmethod
+    def _dedicated_route_for_group(group: dict) -> str:
+        route = group.get(
+            "dmuon_route",
+            group.get("dmuon_optimizer", group.get("matrix_optimizer", "muon")),
+        )
+        route = str(route).strip().lower()
+        aliases = {
+            "base": "adamw",
+            "base_optimizer": "adamw",
+            "base_sharded": "sharded_adamw",
+            "base_sharded_adamw": "sharded_adamw",
+            "sharded": "sharded_adamw",
+            "sharded_collective": "sharded_adamw",
+            "matrix": "muon",
+            "matrix_optimizer": "muon",
+        }
+        route = aliases.get(route, route)
+        if route not in {"muon", "adamw", "sharded_adamw"}:
+            raise ValueError(
+                "dmuon.Muon param_groups dedicated route must be 'muon', "
+                f"'adamw', or 'sharded_adamw', got {route!r}"
+            )
+        return route
+
+    @staticmethod
+    def _dedicated_adamw_updates_on_this_rank(dp) -> bool:
+        if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
+            return getattr(dp, "_sharded_adamw_data", None) is not None
+        if getattr(dp, "_dmuon_adamw_replicate_allreduce", False):
+            return getattr(dp, "_owned_data", None) is not None
+        return bool(getattr(dp, "is_owner", False))
+
+    @staticmethod
+    def _dedicated_adamw_replicate_allreduce_requested() -> bool:
+        """Dedicated AdamW follows DMuon owner-update + publish in mainline."""
+
+        return False
 
     @staticmethod
     def _normalize_group_params(params) -> list[torch.Tensor]:
@@ -352,7 +425,45 @@ class Muon(Optimizer):
         adamw_weight_decay: float,
         adamw_eps: float,
     ) -> list[dict]:
-        muon_refs = [self._param_ref_for_dp(dp) for dp in self._dedicated_params]
+        muon_refs: list[torch.Tensor] = []
+        owned_muon_dps = []
+        all_muon_dps = []
+        dedicated_adamw_refs: list[torch.Tensor] = []
+        owned_adamw_dps = []
+        all_adamw_dps = []
+
+        for dp in self._all_dedicated_params:
+            route = self._dedicated_route_for_group(
+                {"dmuon_route": getattr(dp, "_dmuon_route", "muon")}
+            )
+            dp._dmuon_route = route
+            if route == "muon":
+                all_muon_dps.append(dp)
+                if getattr(dp, "is_owner", False):
+                    owned_muon_dps.append(dp)
+                    muon_refs.append(self._param_ref_for_dp(dp))
+                continue
+
+            if (
+                route == "sharded_adamw"
+                and getattr(dp, "_sharded_adamw_data", None) is None
+            ):
+                raise RuntimeError(
+                    f"DMuon param {getattr(dp, 'param_name', '<unknown>')} "
+                    "has a sharded_adamw route hint but was not constructed "
+                    "with sharded AdamW storage. Pass route_hint_fn to "
+                    "dedicate_params before constructing Muon."
+                )
+            dp._dmuon_adamw_replicate_allreduce = (
+                route == "adamw"
+                and self._dedicated_adamw_replicate_allreduce_requested()
+                and getattr(dp, "replicate_group", None) is not None
+            )
+            all_adamw_dps.append(dp)
+            dedicated_adamw_refs.append(self._param_ref_for_dp(dp))
+            if self._dedicated_adamw_updates_on_this_rank(dp):
+                owned_adamw_dps.append(dp)
+
         groups = [
             self._make_muon_group(
                 params=muon_refs,
@@ -362,7 +473,7 @@ class Muon(Optimizer):
                 weight_decay=weight_decay,
             ),
             self._make_adamw_group(
-                params=list(self._fsdp_params),
+                params=[*self._fsdp_params, *dedicated_adamw_refs],
                 semantic_name="default",
                 lr=adamw_lr,
                 betas=adamw_betas,
@@ -370,10 +481,13 @@ class Muon(Optimizer):
                 eps=adamw_eps,
             ),
         ]
-        self._muon_group_dps[0] = list(self._dedicated_params)
+        self._muon_group_dps[0] = owned_muon_dps
+        self._adamw_group_dps[1] = owned_adamw_dps
         self._adamw_group_params[1] = list(self._fsdp_params)
-        for dp in self._all_dedicated_params:
+        for dp in all_muon_dps:
             self._dp_to_muon_group_idx[id(dp)] = 0
+        for dp in all_adamw_dps:
+            self._dp_to_adamw_group_idx[id(dp)] = 1
         for p in self._fsdp_params:
             self._adamw_param_to_group_idx[id(p)] = 1
         return groups
@@ -427,7 +541,11 @@ class Muon(Optimizer):
             muon_refs: list[torch.Tensor] = []
             owned_muon_dps = []
             all_muon_dps = []
+            adamw_refs: list[torch.Tensor] = []
+            owned_adamw_dps = []
+            all_adamw_dps = []
             adamw_params: list[nn.Parameter] = []
+            dedicated_route = self._dedicated_route_for_group(user_group)
 
             for param in raw_params:
                 if not isinstance(param, torch.Tensor):
@@ -446,17 +564,43 @@ class Muon(Optimizer):
                 param_id = id(param)
                 if param_id in param_to_dp:
                     dp = param_to_dp[param_id]
-                    assignment_key = ("muon", id(dp))
+                    assignment_key = ("dedicated", id(dp))
                     if assignment_key in assigned:
                         raise ValueError(
                             f"trainable parameter appears in multiple DMuon "
                             f"param_groups: {assigned[assignment_key]} and {semantic_name}"
                         )
                     assigned[assignment_key] = semantic_name
-                    muon_refs.append(param)
-                    all_muon_dps.append(dp)
-                    if getattr(dp, "is_owner", False):
-                        owned_muon_dps.append(dp)
+                    if dedicated_route == "muon":
+                        dp._dmuon_route = "muon"
+                        dp._dmuon_adamw_replicate_allreduce = False
+                        muon_refs.append(param)
+                        all_muon_dps.append(dp)
+                        if getattr(dp, "is_owner", False):
+                            owned_muon_dps.append(dp)
+                    else:
+                        if (
+                            dedicated_route == "sharded_adamw"
+                            and getattr(dp, "_sharded_adamw_data", None) is None
+                        ):
+                            raise RuntimeError(
+                                f"DMuon param {getattr(dp, 'param_name', '<unknown>')} "
+                                "was assigned to sharded_adamw but was not "
+                                "constructed with a sharded_adamw route hint. "
+                                "Pass the route hint to dedicate_params before "
+                                "constructing Muon."
+                            )
+                        dp._dmuon_route = dedicated_route
+                        dp._dmuon_adamw_replicate_allreduce = (
+                            dedicated_route == "adamw"
+                            and
+                            self._dedicated_adamw_replicate_allreduce_requested()
+                            and getattr(dp, "replicate_group", None) is not None
+                        )
+                        adamw_refs.append(param)
+                        all_adamw_dps.append(dp)
+                        if self._dedicated_adamw_updates_on_this_rank(dp):
+                            owned_adamw_dps.append(dp)
                 elif param_id in adamw_param_by_id:
                     p = adamw_param_by_id[param_id]
                     assignment_key = ("adamw", id(p))
@@ -494,7 +638,7 @@ class Muon(Optimizer):
             adamw_group_idx = len(optimizer_groups)
             optimizer_groups.append(
                 self._make_adamw_group(
-                    params=adamw_params,
+                    params=[*adamw_params, *adamw_refs],
                     semantic_name=semantic_name,
                     lr=self._group_value(user_group, "adamw_lr", "lr", adamw_lr),
                     betas=self._group_value(
@@ -509,6 +653,9 @@ class Muon(Optimizer):
                     eps=self._group_value(user_group, "adamw_eps", None, adamw_eps),
                 )
             )
+            self._adamw_group_dps[adamw_group_idx] = owned_adamw_dps
+            for dp in all_adamw_dps:
+                self._dp_to_adamw_group_idx[id(dp)] = adamw_group_idx
             self._adamw_group_params[adamw_group_idx] = adamw_params
             for p in adamw_params:
                 self._adamw_param_to_group_idx[id(p)] = adamw_group_idx
@@ -520,7 +667,7 @@ class Muon(Optimizer):
                 continue
             param_id = id(param)
             if param_id in param_to_dp:
-                key = ("muon", id(param_to_dp[param_id]))
+                key = ("dedicated", id(param_to_dp[param_id]))
             elif param_id in adamw_param_by_id:
                 key = ("adamw", id(adamw_param_by_id[param_id]))
             else:
@@ -551,10 +698,7 @@ class Muon(Optimizer):
         return self._last_muon_grad_clip_stats
 
     def _profile_requested(self) -> bool:
-        return bool(int(os.environ.get("DMUON_STEP_PROFILE", "0") or 0))
-
-    def _tp_prepare_prefetch_enabled(self) -> bool:
-        return bool(int(os.environ.get("DMUON_TP_PREPARE_PREFETCH", "1") or 1))
+        return self._record_step_profile
 
     def _profile_begin_step(self) -> None:
         self._step_profile_enabled = (
@@ -570,29 +714,281 @@ class Muon(Optimizer):
     def _profile_event_start(self, name: str):
         if not self._step_profile_enabled:
             return None
-        record_ctx = None
-        if bool(int(os.environ.get("DMUON_TORCH_PROFILE_MARKERS", "0") or 0)):
-            record_ctx = torch.profiler.record_function(f"dmuon.optimizer.{name}")
-            record_ctx.__enter__()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        return name, start, end, record_ctx
+        return name, start, end
 
     def _profile_event_end(self, token) -> None:
         if token is None:
             return
-        _name, _start, end, record_ctx = token
+        _name, _start, end = token
         end.record()
         self._last_step_profile_events.append(token)
-        if record_ctx is not None:
-            record_ctx.__exit__(None, None, None)
+
+    @contextmanager
+    def _profile_phase(self, name: str):
+        token = self._profile_event_start(name)
+        try:
+            yield
+        finally:
+            self._profile_event_end(token)
 
     def _profile_add(self, key: str, value: int | float) -> None:
         if not self._step_profile_enabled:
             return
         current = self._last_step_profile.get(key, 0)
         self._last_step_profile[key] = current + value
+
+    def _tp_distributed_gram_enabled(self) -> bool:
+        return self._tp_distributed_gram
+
+    def _tp_distributed_gram_supported(self, dp) -> bool:
+        return self._tp_distributed_gram_rejection_reason(dp) is None
+
+    def _tp_distributed_gram_rejection_reason(self, dp) -> Optional[str]:
+        if self._ns.backend != "gram":
+            return "non_gram_backend"
+        if not (dp.is_dtensor and dp.tp_group is not None):
+            return "non_tp_param"
+        shard_dim = dp.shard_dim
+        if shard_dim not in (0, 1):
+            return "unsupported_shard_dim"
+        if len(dp.full_shape) < 2:
+            return "not_matrix"
+        rows = int(dp.full_shape[0])
+        cols = 1
+        for dim in dp.full_shape[1:]:
+            cols *= int(dim)
+        transposed = rows > cols
+        oriented_shard_dim = 1 - shard_dim if transposed else shard_dim
+        if oriented_shard_dim != 1:
+            return "unsupported_orientation"
+
+        policy = self._tp_distributed_gram_policy
+        if policy in {"all", "force", "always"}:
+            return None
+        if policy in {"0", "false", "no", "off", "none"}:
+            return "policy_disabled"
+
+        full_numel = rows * cols
+        factor_dim = cols if transposed else rows
+        # Compare logical payload sizes.  The group communication factor is
+        # similar for both alternatives, so it cancels out for selection.
+        scatter_bytes = full_numel * int(dp._owned_data.element_size())
+        factor_bytes = (
+            self._tp_gram_factor_segment_count()
+            * factor_dim
+            * factor_dim
+            * _TP_GRAM_FACTOR_WIRE_ELEMENT_SIZE
+        )
+        max_ratio = self._tp_distributed_gram_max_factor_to_scatter_ratio
+        if max_ratio <= 0:
+            return "ratio_threshold_disabled"
+        if factor_bytes >= scatter_bytes:
+            return "factor_not_smaller"
+        if (factor_bytes / scatter_bytes) > max_ratio:
+            return "factor_ratio_too_high"
+        return None
+
+    def _tp_gram_factor_segment_count(self) -> int:
+        coefficients = self._ns.coefficients
+        if coefficients is None:
+            coefficients = DEFAULT_COEFFICIENTS
+        restart_iterations = self._ns.restart_iterations
+        if restart_iterations is None:
+            restart_iterations = DEFAULT_RESTART_ITERATIONS
+        return 1 + sum(
+            1
+            for iteration in restart_iterations
+            if iteration != 0 and 0 <= iteration < len(coefficients)
+        )
+
+    def _build_tp_distributed_gram_descriptor(
+        self,
+        dp,
+        state,
+        lr,
+        mu,
+        wd,
+    ) -> dict[str, object]:
+        assert dp._reduced_grad is not None
+        assert dp._owned_data is not None
+        rows = int(dp.full_shape[0])
+        cols = 1
+        for dim in dp.full_shape[1:]:
+            cols *= int(dim)
+        transposed = rows > cols
+        factor_dim = cols if transposed else rows
+        assert dp.tp_group is not None
+        assert dp._tp_owner_global_rank is not None
+
+        local_grad = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1)
+        if "tp_local_momentum_buffer" not in state:
+            state["tp_local_momentum_buffer"] = local_grad.clone()
+        else:
+            state["tp_local_momentum_buffer"].mul_(mu).add_(local_grad)
+        local_buf = state["tp_local_momentum_buffer"]
+        local_ns_input = (
+            local_grad.add(local_buf, alpha=mu) if self._nesterov else local_buf
+        )
+
+        ns_input_full: Optional[torch.Tensor] = None
+        if dp.is_tp_owner:
+            assert dp._tp_full_grad is not None, (
+                f"{getattr(dp, 'param_name', '?')}: tp_gather_grads did "
+                "not populate _tp_full_grad on TP owner"
+            )
+            full_grad = dp._tp_full_grad.view(dp._tp_full_grad.shape[0], -1)
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = full_grad.clone()
+            else:
+                state["momentum_buffer"].mul_(mu).add_(full_grad)
+            full_buf = state["momentum_buffer"]
+            ns_input_full = (
+                full_grad.add(full_buf, alpha=mu) if self._nesterov else full_buf
+            )
+
+            assert ns_input_full is not None
+            profile_token = self._profile_event_start("ns_compute")
+            try:
+                factor_segments, actual_transposed, normalizer = gram_newton_schulz_factors(
+                    ns_input_full,
+                    steps=self._ns_steps,
+                    coefficients=self._ns.coefficients,
+                    restart_iterations=self._ns.restart_iterations,
+                    deterministic=self._ns.deterministic,
+                )
+                for factor in factor_segments:
+                    if factor.dtype != _TP_GRAM_FACTOR_WIRE_DTYPE:
+                        raise RuntimeError(
+                            "TP distributed Gram factor wire dtype changed from "
+                            f"{_TP_GRAM_FACTOR_WIRE_DTYPE} to {factor.dtype}; update "
+                            "the payload selector and receiver allocation "
+                            "before enabling this path."
+                        )
+            finally:
+                self._profile_event_end(profile_token)
+            assert actual_transposed == transposed
+            self._profile_add("ns_matrix_count", 1)
+            self._profile_add("ns_input_numel", int(ns_input_full.numel()))
+        else:
+            normalizer = torch.empty(
+                (),
+                device=dp._owned_data.device,
+                dtype=torch.float32,
+            )
+            factor_segments = tuple(
+                torch.empty(
+                    (factor_dim, factor_dim),
+                    device=dp._owned_data.device,
+                    dtype=_TP_GRAM_FACTOR_WIRE_DTYPE,
+                )
+                for _ in range(self._tp_gram_factor_segment_count())
+            )
+
+        return {
+            "dp": dp,
+            "rows": rows,
+            "cols": cols,
+            "lr": lr,
+            "wd": wd,
+            "transposed": transposed,
+            "normalizer": normalizer,
+            "gram_factor_segments": factor_segments,
+            "local_ns_input": local_ns_input,
+        }
+
+    def _broadcast_tp_gram_factor_descriptor_batch(
+        self, descriptors: list[dict[str, object]]
+    ) -> None:
+        grouped: list[tuple[dist.ProcessGroup, list[dict[str, object]]]] = []
+        for desc in descriptors:
+            dp = desc["dp"]
+            for group, items in grouped:
+                if group is dp.tp_group:
+                    items.append(desc)
+                    break
+            else:
+                grouped.append((dp.tp_group, [desc]))
+
+        profile_token = self._profile_event_start("tp_gram_factor_broadcast")
+        try:
+            for tp_group, group_descs in grouped:
+                device = group_descs[0]["dp"]._owned_data.device
+                with dist._coalescing_manager(group=tp_group, device=device):
+                    for desc in group_descs:
+                        dp = desc["dp"]
+                        dist.broadcast(
+                            desc["normalizer"],
+                            src=dp._tp_owner_global_rank,
+                            group=tp_group,
+                        )
+                        for factor in desc["gram_factor_segments"]:
+                            dist.broadcast(
+                                factor,
+                                src=dp._tp_owner_global_rank,
+                                group=tp_group,
+                            )
+        finally:
+            self._profile_event_end(profile_token)
+
+        total_numel = 0
+        for desc in descriptors:
+            total_numel += int(desc["normalizer"].numel())
+            total_numel += sum(
+                int(factor.numel()) for factor in desc["gram_factor_segments"]
+            )
+        self._profile_add("tp_gram_factor_broadcast_numel", total_numel)
+        # Keep legacy profile key for old dashboard/analysis scripts.
+        self._profile_add("tp_gram_q_broadcast_numel", total_numel)
+
+    def _apply_tp_distributed_gram_descriptor(
+        self, desc: dict[str, object]
+    ) -> None:
+        dp = desc["dp"]
+        rows = desc["rows"]
+        cols = desc["cols"]
+        lr = desc["lr"]
+        wd = desc["wd"]
+        transposed = desc["transposed"]
+        normalizer = desc["normalizer"]
+        factor_segments = desc["gram_factor_segments"]
+        local_ns_input = desc["local_ns_input"]
+        profile_token = self._profile_event_start("tp_gram_local_update")
+        try:
+            local_update = local_ns_input.float()
+            if transposed:
+                local_update = local_update.T
+            local_update = (local_update / normalizer).half().contiguous()
+            for factor in factor_segments:
+                local_update = factor @ local_update
+            if transposed:
+                local_update = local_update.T
+        finally:
+            self._profile_event_end(profile_token)
+
+        scale = 0.2 * (max(rows, cols) ** 0.5)
+        if wd > 0:
+            dp._owned_data.mul_(1.0 - lr * wd)
+        dp._owned_data.add_(
+            local_update.view(dp._owned_data.shape).to(
+                device=dp._owned_data.device,
+                dtype=dp._owned_data.dtype,
+            ),
+            alpha=-lr * scale,
+        )
+
+        dp._tp_full_grad = None
+        dp._tp_full_delta = None
+        dp._reduced_grad = None
+        dp._tp_wd_factor = 1.0
+        self._profile_add("tp_gram_local_update_numel", int(local_update.numel()))
+
+    def _step_tp_distributed_gram_param(self, dp, state, lr, mu, wd) -> None:
+        desc = self._build_tp_distributed_gram_descriptor(dp, state, lr, mu, wd)
+        self._broadcast_tp_gram_factor_descriptor_batch([desc])
+        self._apply_tp_distributed_gram_descriptor(desc)
 
     def consume_last_step_profile(self) -> dict[str, object]:
         """Return the last step's CUDA event timings after the caller synced."""
@@ -604,7 +1000,7 @@ class Muon(Optimizer):
             self._last_step_profile_events = []
             return profile
         event_totals: dict[str, float] = {}
-        for name, start, end, _record_ctx in self._last_step_profile_events:
+        for name, start, end in self._last_step_profile_events:
             event_totals[name] = event_totals.get(name, 0.0) + float(
                 start.elapsed_time(end)
             )
@@ -672,79 +1068,9 @@ class Muon(Optimizer):
                 loss = closure()
 
         self._profile_begin_step()
-        use_group_prepare_prefetch = (
-            self._replicate_async
-            and self._has_tp_dedicated
-            and self._tp_prepare_prefetch_enabled()
-        )
-        if _balance_profile.enabled():
-            timer = _balance_profile.StepTimer()
-            if self._replicate_async:
-                update_replicate_fallback(self.model)
-                if not use_group_prepare_prefetch:
-                    with timer.phase("prepare_muon_grads"):
-                        profile_token = self._profile_event_start("prepare_muon_grads")
-                        try:
-                            self._ensure_grads_ready()
-                        finally:
-                            self._profile_event_end(profile_token)
-                with timer.phase("group_pipeline"):
-                    profile_token = self._profile_event_start("group_pipeline")
-                    try:
-                        self._step_muon_and_dispatch_groups_async()
-                    finally:
-                        self._profile_event_end(profile_token)
-            else:
-                with timer.phase("prepare_muon_grads"):
-                    profile_token = self._profile_event_start("prepare_muon_grads")
-                    try:
-                        self._ensure_grads_ready()
-                    finally:
-                        self._profile_event_end(profile_token)
-                with timer.phase("muon"):
-                    profile_token = self._profile_event_start("muon")
-                    try:
-                        self._step_muon()
-                    finally:
-                        self._profile_event_end(profile_token)
-            with timer.phase("adamw"):
-                profile_token = self._profile_event_start("adamw")
-                try:
-                    self._step_adamw()
-                finally:
-                    self._profile_event_end(profile_token)
-            if not self._replicate_async:
-                # Phase C.4: flip any slow group to sync BEFORE dispatching the
-                # next broadcast so the new decision takes effect immediately.
-                update_replicate_fallback(self.model)
-                with timer.phase("replicate_broadcast"):
-                    profile_token = self._profile_event_start("replicate_broadcast")
-                    try:
-                        broadcast_all_updates(self.model)
-                    finally:
-                        self._profile_event_end(profile_token)
-
-            owned_numel = sum(dp._owned_data.numel() for dp in self._dedicated_params)
-            timer.report(
-                self._profile_step_idx,
-                extra={
-                    "n_owned": len(self._dedicated_params),
-                    "owned_numel": owned_numel,
-                },
-            )
-            if _balance_profile.per_param_enabled():
-                self._profile_param_timer.report(self._profile_step_idx)
-                self._profile_param_timer = _balance_profile.ParamTimer()
-            self._profile_step_idx += 1
-            self._grads_ready = False
-            return loss
+        use_group_prepare_prefetch = self._replicate_async
 
         if self._replicate_async:
-            # Phase C.4 fallback must be advanced before dispatching this
-            # step's post-update collectives so a tripped group degrades
-            # immediately.  Then pipeline each group: update it, enqueue its
-            # post-step scatter/broadcast, and continue with later groups.
-            update_replicate_fallback(self.model)
             if not use_group_prepare_prefetch:
                 profile_token = self._profile_event_start("prepare_muon_grads")
                 try:
@@ -764,10 +1090,15 @@ class Muon(Optimizer):
             finally:
                 self._profile_event_end(profile_token)
 
-            # 2. Muon update on dedicated params
+            # 2. Dedicated updates on owner-managed params.
             profile_token = self._profile_event_start("muon")
             try:
                 self._step_muon()
+            finally:
+                self._profile_event_end(profile_token)
+            profile_token = self._profile_event_start("dedicated_adamw")
+            try:
+                self._step_dedicated_adamw()
             finally:
                 self._profile_event_end(profile_token)
 
@@ -779,16 +1110,9 @@ class Muon(Optimizer):
             self._profile_event_end(profile_token)
 
         if not self._replicate_async:
-            # 4. Advance the per-group async→sync fallback state machine
-            # (Phase C.4).  Reads ``_last_replicate_wait_us`` populated during
-            # the previous forward's ``_pre_forward_wait`` (only when
-            # ``DMUON_REPLICATE_PROFILE`` is set).  Must run BEFORE dispatch so
-            # a just-tripped flag affects this iteration.
-            update_replicate_fallback(self.model)
-
-            # 5. Fan updated _owned_data from global owner to replicate peers.
+            # 4. Fan updated _owned_data from global owner to replicate peers.
             # Sync mode preserves the old full-step dispatch+wait contract.
-            profile_token = self._profile_event_start("replicate_broadcast")
+            profile_token = self._profile_event_start("post_step_publish")
             try:
                 broadcast_all_updates(self.model)
             finally:
@@ -806,30 +1130,55 @@ class Muon(Optimizer):
         """
         groups = _ordered_post_step_groups(self.model)
         needs_prepare = not self._grads_ready
-        if needs_prepare and groups:
-            prepare_group_muon_grads(groups[0], use_reduce_stream=True)
+        prepare_ahead = self._group_prepare_ahead
+        prepared_until = -1
+
+        def _prepare_group(index: int) -> None:
+            nonlocal prepared_until
+            if not needs_prepare or index <= prepared_until:
+                return
+            prepare_group_muon_grads(groups[index], use_reduce_stream=True)
+            prepared_until = index
 
         for group_idx, group in enumerate(groups):
-            if needs_prepare and group_idx + 1 < len(groups):
-                prepare_group_muon_grads(groups[group_idx + 1], use_reduce_stream=True)
+            _prepare_group(group_idx)
+            if prepare_ahead and group_idx + 1 < len(groups):
+                _prepare_group(group_idx + 1)
             if needs_prepare:
                 wait_group_muon_grads(group)
 
-            owned_params = [
+            group_params = list(getattr(group, "params", ()))
+            owned_muon_params = [
                 dp
-                for dp in getattr(group, "params", ())
+                for dp in group_params
                 if getattr(dp, "is_owner", False)
+                and id(dp) in self._dp_to_muon_group_idx
             ]
-            if owned_params:
+            owned_adamw_params = [
+                dp
+                for dp in group_params
+                if id(dp) in self._dp_to_adamw_group_idx
+                and self._dedicated_adamw_updates_on_this_rank(dp)
+            ]
+            if owned_muon_params:
                 profile_token = self._profile_event_start("muon")
                 try:
-                    self._step_muon(owned_params, wait_for_tp_gather=False)
+                    self._step_muon(owned_muon_params, wait_for_tp_gather=False)
+                finally:
+                    self._profile_event_end(profile_token)
+            if owned_adamw_params:
+                profile_token = self._profile_event_start("dedicated_adamw")
+                try:
+                    self._step_dedicated_adamw(
+                        owned_adamw_params,
+                        wait_for_tp_gather=False,
+                    )
                 finally:
                     self._profile_event_end(profile_token)
 
-            profile_token = self._profile_event_start("replicate_broadcast")
+            profile_token = self._profile_event_start("post_step_publish")
             try:
-                _dispatch_post_step_async(group)
+                _dispatch_post_step_async(group, phase_recorder=self._profile_phase)
             finally:
                 self._profile_event_end(profile_token)
 
@@ -879,8 +1228,8 @@ class Muon(Optimizer):
         wd = group["weight_decay"]
         dedicated_params = list(dedicated_params)
 
-        pt = self._profile_param_timer
-        per_param = _balance_profile.per_param_enabled()
+        tp_gram_descriptors: list[dict[str, object]] = []
+        tp_gram_param_ids: set[int] = set()
 
         # T2: if any TP-sharded param is present, ``tp_gather_grads`` on
         # ``reduce_stream`` produced ``_tp_full_grad`` for the TP owner.
@@ -892,15 +1241,44 @@ class Muon(Optimizer):
         ):
             torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
 
+        if self._tp_distributed_gram_enabled():
+            for dp in dedicated_params:
+                if dp._reduced_grad is None:
+                    continue
+                is_tp = dp.is_dtensor and dp.tp_group is not None
+                if not is_tp:
+                    continue
+                rejection_reason = self._tp_distributed_gram_rejection_reason(dp)
+                if rejection_reason is not None:
+                    self._profile_add(
+                        f"tp_gram_rejected_{rejection_reason}_count",
+                        1,
+                    )
+                    continue
+                dp_id = id(dp)
+                if dp_id not in self.state:
+                    self.state[dp_id] = {}
+                self._profile_add("tp_gram_selected_count", 1)
+                tp_gram_descriptors.append(
+                    self._build_tp_distributed_gram_descriptor(
+                        dp,
+                        self.state[dp_id],
+                        lr,
+                        mu,
+                        wd,
+                    )
+                )
+                tp_gram_param_ids.add(dp_id)
+            if tp_gram_descriptors:
+                self._broadcast_tp_gram_factor_descriptor_batch(tp_gram_descriptors)
+                for desc in tp_gram_descriptors:
+                    self._apply_tp_distributed_gram_descriptor(desc)
+
         for dp in dedicated_params:
             if dp._reduced_grad is None:
                 continue
-
-            if per_param:
-                pt.start(
-                    getattr(dp, "param_name", "<unknown>"),
-                    tuple(dp._owned_data.shape),
-                )
+            if id(dp) in tp_gram_param_ids:
+                continue
 
             # TP path (All-to-All): only the TP owner runs NS on the
             # reassembled full matrix; other DP-owner TP ranks produced
@@ -923,8 +1301,6 @@ class Muon(Optimizer):
                 # It is cleared at the end of the scatter alongside
                 # ``_tp_full_grad`` / ``_tp_full_delta``.
                 dp._tp_wd_factor = (1.0 - lr * wd) if wd > 0 else 1.0
-                if per_param:
-                    pt.end()
                 continue
 
             if is_tp:
@@ -1000,56 +1376,128 @@ class Muon(Optimizer):
             if not is_tp:
                 dp._reduced_grad = None
 
-            if per_param:
-                pt.end()
-
     def _step_adamw(self):
         """AdamW update on FSDP2-managed symmetric params."""
         for group_idx, params in self._adamw_group_params.items():
             self._step_adamw_params(params, self.param_groups[group_idx])
 
+    def _step_dedicated_adamw(
+        self, params=None, *, wait_for_tp_gather: bool = True
+    ) -> None:
+        """AdamW update on dedicated owner-managed params."""
+        if params is None:
+            for group_idx, dedicated_params in self._adamw_group_dps.items():
+                self._step_dedicated_adamw_params(
+                    dedicated_params,
+                    self.param_groups[group_idx],
+                    wait_for_tp_gather=wait_for_tp_gather,
+                )
+            return
+
+        by_group: dict[int, list] = {}
+        for dp in params:
+            group_idx = self._dp_to_adamw_group_idx.get(id(dp))
+            if group_idx is None:
+                raise RuntimeError(
+                    f"DMuon dedicated param {getattr(dp, 'param_name', '<unknown>')} "
+                    "is not assigned to a dedicated AdamW param group"
+                )
+            by_group.setdefault(group_idx, []).append(dp)
+
+        for group_idx, dedicated_params in by_group.items():
+            self._step_dedicated_adamw_params(
+                dedicated_params,
+                self.param_groups[group_idx],
+                wait_for_tp_gather=wait_for_tp_gather,
+            )
+
+    def _step_dedicated_adamw_params(
+        self, dedicated_params, group: dict, *, wait_for_tp_gather: bool = True
+    ) -> None:
+        if wait_for_tp_gather and any(
+            dp.tp_group is not None for dp in dedicated_params
+        ):
+            torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
+
+        for dp in dedicated_params:
+            if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
+                grad = getattr(dp, "_sharded_adamw_grad", None)
+                param = getattr(dp, "_sharded_adamw_data", None)
+                if grad is None or param is None:
+                    continue
+                self._adamw_update_tensor(
+                    state_key=id(dp),
+                    param=param,
+                    grad=grad,
+                    group=group,
+                )
+                dp._sharded_adamw_grad = None
+                continue
+            if dp._reduced_grad is None:
+                continue
+            grad = dp._reduced_grad
+            param = dp._owned_data
+            if grad is None or param is None:
+                continue
+            self._adamw_update_tensor(
+                state_key=id(dp),
+                param=param,
+                grad=grad,
+                group=group,
+            )
+            dp._reduced_grad = None
+            dp._tp_full_grad = None
+            dp._tp_full_delta = None
+            dp._tp_wd_factor = 1.0
+
     def _step_adamw_params(self, params, group: dict) -> None:
         """Apply one AdamW subgroup's hyperparameters to managed params."""
+        for p in params:
+            if p.grad is None:
+                continue
+            grad = p.grad._local_tensor if hasattr(p.grad, "_local_tensor") else p.grad
+            param = p._local_tensor if hasattr(p, "_local_tensor") else p.data
+            self._adamw_update_tensor(
+                state_key=p,
+                param=param,
+                grad=grad,
+                group=group,
+            )
+            p.grad = None
+
+    def _adamw_update_tensor(self, *, state_key, param, grad, group: dict) -> None:
+        """Apply one AdamW update to a concrete local tensor."""
         lr = group["lr"]
         beta1, beta2 = group["betas"]
         wd = group["weight_decay"]
         eps = group["eps"]
 
-        for p in params:
-            if p.grad is None:
-                continue
+        state = self.state[state_key]
+        if len(state) == 0:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(param)
+            state["exp_avg_sq"] = torch.zeros_like(param)
 
-            grad = p.grad._local_tensor if hasattr(p.grad, "_local_tensor") else p.grad
-            param = p._local_tensor if hasattr(p, "_local_tensor") else p.data
+        state["step"] += 1
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
 
-            state = self.state[p]
-            if len(state) == 0:
-                state["step"] = 0
-                state["exp_avg"] = torch.zeros_like(param)
-                state["exp_avg_sq"] = torch.zeros_like(param)
+        # Decoupled weight decay
+        if wd > 0:
+            param.mul_(1.0 - lr * wd)
 
-            state["step"] += 1
-            exp_avg = state["exp_avg"]
-            exp_avg_sq = state["exp_avg_sq"]
+        # Adam moment updates
+        exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
-            # Decoupled weight decay
-            if wd > 0:
-                param.mul_(1.0 - lr * wd)
+        # Bias correction
+        bc1 = 1.0 - beta1 ** state["step"]
+        bc2 = 1.0 - beta2 ** state["step"]
+        step_size = lr / bc1
 
-            # Adam moment updates
-            exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-
-            # Bias correction
-            bc1 = 1.0 - beta1 ** state["step"]
-            bc2 = 1.0 - beta2 ** state["step"]
-            step_size = lr / bc1
-
-            # Update
-            denom = (exp_avg_sq.sqrt() / (bc2**0.5)).add_(eps)
-            param.addcdiv_(exp_avg, denom, value=-step_size)
-
-            p.grad = None
+        # Update
+        denom = (exp_avg_sq.sqrt() / (bc2**0.5)).add_(eps)
+        param.addcdiv_(exp_avg, denom, value=-step_size)
 
     def zero_grad(self, set_to_none: bool = True):
         """Clear gradients.
@@ -1065,6 +1513,8 @@ class Muon(Optimizer):
                 p.grad = None
             elif p.grad is not None:
                 p.grad.zero_()
-        for dp in self._dedicated_params:
+        for dp in self._all_dedicated_params:
             dp._reduced_grad = None
+            if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
+                dp._sharded_adamw_grad = None
             dp._accumulated_grad = None

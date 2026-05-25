@@ -89,7 +89,6 @@ plugins:
             HSDP (Multi-Node): HSDP 训练（多机）
             Custom Hook Boundaries: 自定义 Hook 边界
             Z2 vs Z3 Modes: Z2 与 Z3 模式
-            Profiling & Fallback: 性能分析与 Fallback
             Integration Recipes: 集成方案
             Tensor Parallelism: 张量并行
             Checkpointing: 检查点
@@ -155,7 +154,6 @@ nav:
     - HSDP (Multi-Node): guides/hsdp.md
     - Custom Hook Boundaries: guides/custom-hook-boundaries.md
     - Z2 vs Z3 Modes: guides/z2-z3-modes.md
-    - Profiling & Fallback: guides/profiling-and-fallback.md
     - Integration Recipes: guides/integration-recipes.md
     - Tensor Parallelism: guides/tp-support.md
     - Checkpointing: guides/checkpoint.md

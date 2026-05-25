@@ -32,7 +32,10 @@ sys.path.insert(
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as tmp
-from torch.distributed import init_device_mesh
+try:
+    from torch.distributed import init_device_mesh
+except ImportError:
+    from torch.distributed.device_mesh import init_device_mesh
 
 
 def _worker(rank: int, world_size: int, tmp_dir: str) -> None:
@@ -66,14 +69,17 @@ def _worker(rank: int, world_size: int, tmp_dir: str) -> None:
         # expect 5 + tp.
         local_grad = torch.full(local_shape, float(10 * my_dp + my_tp))
 
-        # Stage ② DP reduce (AVG). ``dst`` in torch.distributed.reduce is a
+        # Stage ② DP reduce. Gloo does not support ReduceOp.AVG, so use SUM
+        # and divide on the owner. ``dst`` in torch.distributed.reduce is a
         # global rank; the sub-mesh group at this rank may not contain
         # global 0, so convert the in-group rank 0 to the global rank.
         dp_owner_global = dist.get_global_rank(dp_group, 0)
         dist.reduce(
-            local_grad, dst=dp_owner_global, op=dist.ReduceOp.AVG, group=dp_group
+            local_grad, dst=dp_owner_global, op=dist.ReduceOp.SUM, group=dp_group
         )
         is_dp_owner = my_dp == 0
+        if is_dp_owner:
+            local_grad.div_(mesh["dp"].size())
 
         checks: dict = {"rank": rank, "my_dp": my_dp, "my_tp": my_tp}
 

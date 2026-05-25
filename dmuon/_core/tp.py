@@ -25,7 +25,10 @@ with PyTorch DTensor evolution.
 from __future__ import annotations
 
 import torch.nn as nn
-from torch.distributed import DeviceMesh
+try:
+    from torch.distributed import DeviceMesh
+except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
+    from torch.distributed.device_mesh import DeviceMesh
 
 try:
     from torch.distributed.tensor import DTensor

@@ -101,7 +101,7 @@ for layer in model.layers:
     fully_shard(layer, mesh=mesh["dp"])
 fully_shard(model, mesh=mesh["dp"])
 
-# Optimizer — nothing TP-specific to pass
+# Optimizer — TP works with the default settings
 optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, adamw_lr=1e-3)
 ```
 
@@ -157,9 +157,48 @@ optimizer = dmuon.Muon(model, lr=0.02)
 
 ---
 
+## DDP + TP
+
+When the data-parallel dimension should stay fully replicated while TP stays
+inside each replica, use the TP-aware DDP entry points instead of the FSDP2
+path:
+
+```python
+parallelize_module(model, mesh["tp"], plan)                 # TP first
+dmuon.dedicate_params_ddp_tp(model, mesh["dp"], predicate=...)
+dmuon.replicate_tp(model, mesh["dp"])                       # non-dedicated params
+optimizer = dmuon.Muon(model, lr=0.02)
+```
+
+`dedicate_params_ddp_tp()` installs the TP gather → owner update → TP scatter
+path for dedicated matrices.  `replicate_tp()` handles non-dedicated TP
+parameters by broadcasting their TP-local shards across the DP mesh.  Plain
+`dedicate_params_ddp()` still rejects TP-sharded dedicated parameters because
+it does not install the TP-aware replicated-gradient path.
+
+---
+
+## Runtime knobs
+
+Most TP runs use the defaults.  The advanced knobs are explicit constructor
+arguments rather than environment variables:
+
+* `dedicate_params(..., tp_buffer_reuse=...)` controls whether TP gather and/or
+  scatter scratch buffers are reused.  Accepted values are `False`, `True`,
+  `"gather"`, `"scatter"`, and `"all"`.
+* `Muon(..., tp_distributed_gram=True)` enables the TP-aware distributed Gram
+  path for TP-sharded matrices.  With the default
+  `tp_distributed_gram_policy="beneficial"`, DMuon only uses it when the Gram
+  factor payload is expected to be smaller than scattering the full update.
+* `Muon(..., replicate_async=...)` controls DP/HSDP post-step publish overlap.
+  It is not TP-specific, but TP scatter participates in the same post-step
+  publish schedule.
+
+---
+
 ## Sync vs async post-step
 
-`Muon` exposes one TP-relevant flag:
+`Muon` exposes `replicate_async` for post-step publish timing:
 
 ```python
 # Default — async scatter + replicate broadcast; each group's post-step
@@ -221,12 +260,6 @@ TP group.
   merge** (`SMALL_PARAM_THRESHOLD`).  Each TP-sharded parameter makes
   its own gather/scatter round-trip even when < 5M numel; in practice
   these are rare.
-* **DDP backend × TP-sharded dedicated params is not supported.**
-  `dedicate_params_ddp()` rejects this combination.  Use the FSDP2/HSDP
-  path described above for TP-sharded parameters.
-
----
-
 ## See also
 
 * [HSDP guide](hsdp.md) — replicate × shard setup; composes with TP

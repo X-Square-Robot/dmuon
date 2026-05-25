@@ -315,7 +315,6 @@ def main() -> int:
             "loss_tol": loss_tol,
             "digest_tol": digest_tol,
             "param_tol": param_tol,
-            "tp_scatter_async": os.environ.get("DMUON_TP_SCATTER_ASYNC", "0"),
             "ns_backend": os.environ.get("DMUON_PAIRED_NS_BACKEND", "gram"),
             "ns_kernel": os.environ.get("DMUON_PAIRED_NS_KERNEL", ""),
             "rows": rows,

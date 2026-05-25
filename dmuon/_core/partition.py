@@ -18,9 +18,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
 import torch.nn as nn
-from torch.distributed import DeviceMesh
+try:
+    from torch.distributed import DeviceMesh
+except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
+    from torch.distributed.device_mesh import DeviceMesh
 
-from .. import _balance_profile
 from .tp import get_tp_mesh, is_tp_sharded
 
 try:
@@ -125,11 +127,85 @@ def _param_logical_numel(param: nn.Parameter) -> int:
     return param.numel()
 
 
+def _param_logical_shape(param: nn.Parameter) -> tuple[int, ...]:
+    """Return the logical tensor shape used by owner assignment costing."""
+    return tuple(int(dim) for dim in getattr(param, "shape", ()))
+
+
+def _prod(values) -> int:
+    result = 1
+    for value in values:
+        result *= int(value)
+    return int(result)
+
+
+def _looks_like_base_optimizer_param(param_name: str, shape: tuple[int, ...]) -> bool:
+    """Heuristic for all-trainable type-split owner costing.
+
+    ``dedicate_params`` runs before the optimizer sees semantic param groups,
+    so owner assignment cannot know the exact Muon-vs-AdamW route.  The
+    production all-trainable policy routes embeddings, heads, norms, biases
+    and scalar/vector tensors to AdamW, while projection matrices go to Muon.
+    This name/shape heuristic mirrors that split closely enough for LPT to
+    avoid placing cheap-but-huge AdamW tensors and expensive projection
+    matrices on the same owner.
+    """
+
+    if len(shape) < 2:
+        return True
+    lowered = param_name.lower()
+    base_tokens = (
+        "embed",
+        "embedding",
+        "lm_head",
+        "norm",
+        "layernorm",
+        "ln_",
+        ".ln",
+        "bias",
+        "rope",
+        "rotary",
+    )
+    return any(token in lowered for token in base_tokens)
+
+
+def _matrix_optimizer_cost_units(param_name: str, param: nn.Parameter) -> int:
+    """Shape-aware LPT cost for owner-side matrix optimizer work.
+
+    Numel-only LPT looked balanced in diagnostics while real GPU optimizer
+    time still varied by ~4x.  Matrix optimizers are dominated by the smaller
+    matrix dimension and backend shape, not just element count.  This estimate
+    intentionally uses coarse units; only rank ordering and relative owner
+    load matter for assignment.
+    """
+
+    shape = _param_logical_shape(param)
+    numel = max(1, _param_logical_numel(param))
+    if _looks_like_base_optimizer_param(param_name, shape):
+        return max(1, numel // 1_000_000)
+    if len(shape) < 2:
+        return max(1, numel // 1_000_000)
+
+    rows = int(shape[0])
+    cols = _prod(shape[1:])
+    small = max(1, min(rows, cols))
+    big = max(rows, cols)
+    # Matches the rough Gram-NS cost model used by balance profiling:
+    # per NS step ~= small * (rows*cols + 2*big*small).  Use five steps,
+    # then add a lower-order byte term so similarly shaped tensors still keep
+    # communication/publish pressure visible in LPT.
+    ns_flops = 5 * small * (rows * cols + 2 * big * small)
+    compute_units = max(1, ns_flops // 1_000_000_000)
+    byte_units = max(1, numel // 4_000_000)
+    return int(compute_units + byte_units)
+
+
 def compute_balanced_assignment(
     model: nn.Module,
     mesh: DeviceMesh,
     predicate: Callable[[str, nn.Parameter], bool],
     replicate_mesh: Optional[DeviceMesh] = None,
+    owner_strategy: str = "lpt",
     tp_owner_strategy: str = "lpt",
     assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
     max_owners_per_group: Optional[int] = None,
@@ -159,6 +235,9 @@ def compute_balanced_assignment(
             When given, LPT runs over ``G*R`` owner slots and the returned
             dp_owners map each param to a ``(shard, replicate)`` tuple.
             When ``None``, dp_owners uses plain ``int`` as before.
+        owner_strategy: Strategy for assigning DP/HSDP owner slots. ``"lpt"``
+            is the production default. ``"round_robin"`` and ``"rank0"`` are
+            diagnostic baselines for load-balance ablations.
         tp_owner_strategy: Strategy for picking a TP rank as owner of each
             TP-sharded parameter.  Only ``"lpt"`` is supported publicly.
             Legacy ``"rank0"`` is intentionally rejected to avoid silently
@@ -182,6 +261,11 @@ def compute_balanced_assignment(
         (s, r) for s in range(shard_size) for r in range(replicate_size)
     ]
 
+    if owner_strategy not in {"lpt", "round_robin", "rank0"}:
+        raise ValueError(
+            f"Unsupported owner_strategy: {owner_strategy!r}; "
+            "expected 'lpt', 'round_robin', or 'rank0'."
+        )
     if tp_owner_strategy != "lpt":
         raise ValueError(
             f"Unsupported tp_owner_strategy: {tp_owner_strategy!r}; "
@@ -199,10 +283,14 @@ def compute_balanced_assignment(
 
     # Collect candidates grouped by layer
     param_names: dict[nn.Parameter, str] = {}
-    layer_params: dict[Optional[str], list[tuple[nn.Parameter, str, int]]] = defaultdict(list)
-    for name, param in model.named_parameters():
+    param_order: dict[nn.Parameter, int] = {}
+    layer_params: dict[
+        Optional[str], list[tuple[nn.Parameter, str, int, int]]
+    ] = defaultdict(list)
+    for order, (name, param) in enumerate(model.named_parameters()):
         if predicate(name, param):
             param_names[param] = name
+            param_order[param] = order
             layer_id = (
                 assignment_group_key_fn(name, param)
                 if assignment_group_key_fn is not None
@@ -212,62 +300,86 @@ def compute_balanced_assignment(
             numel = (
                 _param_logical_numel(param) if tp_sharded else _param_numel(param)
             )
-            layer_params[layer_id].append((param, name, numel))
+            cost = _matrix_optimizer_cost_units(name, param)
+            layer_params[layer_id].append((param, name, numel, cost))
 
     # Build allocation units: large params standalone, small params merged per-layer
-    alloc_units: list[tuple[list[nn.Parameter], Optional[str], int]] = []
+    alloc_units: list[tuple[list[nn.Parameter], Optional[str], int, int]] = []
 
     for layer_id, params in layer_params.items():
         tp_params = [
-            (p, n, s) for p, n, s in params
+            (p, n, s, c) for p, n, s, c in params
             if is_tp_sharded(p, dp_mesh_dim_names)
         ]
         non_tp_params = [
-            (p, n, s) for p, n, s in params
+            (p, n, s, c) for p, n, s, c in params
             if not is_tp_sharded(p, dp_mesh_dim_names)
         ]
         small = [
-            (p, n, s) for p, n, s in non_tp_params
+            (p, n, s, c) for p, n, s, c in non_tp_params
             if s < SMALL_PARAM_THRESHOLD
         ]
         large = [
-            (p, n, s) for p, n, s in non_tp_params
+            (p, n, s, c) for p, n, s, c in non_tp_params
             if s >= SMALL_PARAM_THRESHOLD
         ]
 
-        for p, _n, s in tp_params:
+        for p, _n, s, c in tp_params:
             # TP-sharded params stay standalone.  A mixed packed allocation
             # cannot be reconstructed/scattered by the TP collective path.
-            alloc_units.append(([p], layer_id, s))
+            alloc_units.append(([p], layer_id, s, c))
 
-        for p, _n, s in large:
-            alloc_units.append(([p], layer_id, s))
+        for p, _n, s, c in large:
+            alloc_units.append(([p], layer_id, s, c))
 
         if small:
-            merged_params = [p for p, _, _ in small]
-            merged_numel = sum(s for _, _, s in small)
-            alloc_units.append((merged_params, layer_id, merged_numel))
+            merged_params = [p for p, _, _, _ in small]
+            merged_numel = sum(s for _, _, s, _ in small)
+            merged_cost = sum(c for _, _, _, c in small)
+            alloc_units.append((merged_params, layer_id, merged_numel, merged_cost))
 
-    # Sort by numel descending (LPT), then by stable parameter names.  Without
-    # the name tie-break, equal-size TP params may pick different owner ranks
-    # across independent processes, which breaks strict loss-alignment checks.
-    alloc_units.sort(
-        key=lambda x: (
-            -x[2],
-            "" if x[1] is None else str(x[1]),
-            ",".join(param_names.get(p, "") for p in x[0]),
+    if owner_strategy == "lpt":
+        # Sort by shape-aware optimizer cost descending (LPT), then by stable
+        # parameter names.
+        # Without the name tie-break, equal-size TP params may pick different
+        # owner ranks across independent processes, which breaks strict
+        # loss-alignment checks.
+        alloc_units.sort(
+            key=lambda x: (
+                -x[3],
+                -x[2],
+                "" if x[1] is None else str(x[1]),
+                ",".join(param_names.get(p, "") for p in x[0]),
+            )
         )
-    )
+    else:
+        # Diagnostic baselines follow module order so round-robin reflects the
+        # natural layer traversal rather than inheriting LPT's size ordering.
+        alloc_units.sort(
+            key=lambda x: min(param_order.get(p, 0) for p in x[0])
+        )
 
     # Greedy assignment with same-layer concurrency constraint.  Owner slots
     # are the full 2D grid; in shard-only mode every slot has replicate=0
     # so the grid collapses to ``shard_size`` entries and the search matches
     # the original 1D algorithm exactly.
+    #
+    # In HSDP the optimizer owner is a full ``(shard, replicate)`` coord, but
+    # the expensive inter-replicate collectives are scheduled per shard column.
+    # Balancing only the 2D owner slots can therefore still concentrate large
+    # AdamW-route tensors such as embeddings/lm_head onto one shard column.  We
+    # keep the same public ``lpt`` strategy while adding a column-load term so
+    # large buckets first spread across shard columns, then across replicate
+    # owner slots inside each column.
     rank_loads: dict[OwnerCoord, int] = {slot: 0 for slot in slots}
+    rank_cost_loads: dict[OwnerCoord, int] = {slot: 0 for slot in slots}
+    shard_column_loads: dict[int, int] = {s: 0 for s in range(shard_size)}
+    shard_column_cost_loads: dict[int, int] = {s: 0 for s in range(shard_size)}
     assignment: dict[nn.Parameter, OwnerCoord] = {}
     layer_usage: dict[Optional[str], set[OwnerCoord]] = defaultdict(set)
+    round_robin_index = 0
 
-    for params_list, layer_id, total_numel in alloc_units:
+    for params_list, layer_id, total_numel, total_cost in alloc_units:
         used_slots = layer_usage[layer_id]
         candidate_slots = slots
         if (
@@ -275,22 +387,29 @@ def compute_balanced_assignment(
             and len(used_slots) >= max_owners_per_group
         ):
             candidate_slots = sorted(used_slots)
-        best_slot = min(
-            candidate_slots,
-            key=lambda s: (s in used_slots, rank_loads[s]),
-        )
+        if owner_strategy == "rank0":
+            best_slot = slots[0]
+        elif owner_strategy == "round_robin":
+            best_slot = candidate_slots[round_robin_index % len(candidate_slots)]
+            round_robin_index += 1
+        else:
+            best_slot = min(
+                candidate_slots,
+                key=lambda s: (
+                    s in used_slots,
+                    shard_column_cost_loads[s[0]] if is_hsdp else 0,
+                    rank_cost_loads[s],
+                    shard_column_loads[s[0]] if is_hsdp else 0,
+                    rank_loads[s],
+                ),
+            )
         for p in params_list:
             assignment[p] = best_slot
         rank_loads[best_slot] += total_numel
+        rank_cost_loads[best_slot] += total_cost
+        shard_column_loads[best_slot[0]] += total_numel
+        shard_column_cost_loads[best_slot[0]] += total_cost
         layer_usage[layer_id].add(best_slot)
-
-    _balance_profile.dump_assignment(
-        alloc_units=alloc_units,
-        assignment=assignment,
-        rank_loads=rank_loads,
-        shard_size=shard_size,
-        replicate_size=replicate_size,
-    )
 
     # Preserve 1D dp_owners shape when no replicate mesh is configured, so
     # existing call sites, tests and checkpoints continue to see plain ints.
@@ -325,13 +444,17 @@ def compute_balanced_assignment(
         tie_offset = _tp_tie_offset(dp_owner, tp_size)
         for p in sorted(
             params,
-            key=lambda p: (-_param_logical_numel(p), param_names.get(p, "")),
+            key=lambda p: (
+                -_matrix_optimizer_cost_units(param_names.get(p, ""), p),
+                -_param_logical_numel(p),
+                param_names.get(p, ""),
+            ),
         ):
             owner = min(
                 range(tp_size),
                 key=lambda idx: (tp_loads[idx], (idx - tie_offset) % tp_size),
             )
             tp_owners[p] = owner
-            tp_loads[owner] += _param_logical_numel(p)
+            tp_loads[owner] += _matrix_optimizer_cost_units(param_names.get(p, ""), p)
 
     return AssignmentResult(dp_owners=dp_owners, tp_owners=tp_owners)

@@ -50,7 +50,6 @@ import dmuon  # noqa: E402
 from dmuon.utils import (  # noqa: E402
     _ordered_post_step_groups,
     prepare_muon_grads,
-    update_replicate_fallback,
     wait_all_replicate_broadcasts,
 )
 
@@ -240,7 +239,6 @@ def main() -> int:
                 )
 
             optimizer._step_adamw()
-            update_replicate_fallback(model)
             _dispatch_post_step_for_observation(model, mode)
 
             after_dispatch = _sum_stats(_local_stats(model))
@@ -248,17 +246,8 @@ def main() -> int:
                 raise AssertionError(
                     f"TP scatter state missing after post-step dispatch: {after_dispatch}"
                 )
-            group_summary = dmuon.summarize_post_step_groups(model, max_rows=32)
-            if not group_summary["groups"]:
-                raise AssertionError("post-step group summary is empty")
-            if not any(
-                group["order_source"] == "recorded_forward"
-                for group in group_summary["groups"]
-            ):
-                raise AssertionError(
-                    "post-step dispatch did not observe recorded forward order: "
-                    f"{dmuon.format_post_step_group_summary(group_summary)}"
-                )
+            if not _ordered_post_step_groups(model):
+                raise AssertionError("post-step group order is empty")
             if after_dispatch["pinned_tp_send_refs"] == 0:
                 raise AssertionError(
                     "TP owner send split refs were not pinned through scatter event: "

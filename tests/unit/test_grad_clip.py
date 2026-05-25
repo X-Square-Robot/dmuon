@@ -7,6 +7,8 @@ import torch
 
 from dmuon.grad_clip import (
     MuonGradClipStats,
+    _iter_muon_grad_entries,
+    _local_total_norm,
     clip_grad_norm_,
     register_muon_grad_clip_strategy,
 )
@@ -78,6 +80,19 @@ def test_clip_grad_norm_stats_only_does_not_scale() -> None:
     assert stats.max_norm is None
     assert not stats.clipped
     assert torch.equal(grad, torch.tensor([6.0, 8.0]))
+
+
+def test_local_total_norm_accumulates_in_float32_for_collectives() -> None:
+    bf16_grad = torch.tensor([3.0, 4.0], dtype=torch.bfloat16)
+    opt = FakeOptimizer([FakeDP(bf16_grad)])
+
+    total = _local_total_norm(tuple(), 2.0, opt, foreach=False)
+    assert total.dtype is torch.float32
+
+    entries = tuple(_iter_muon_grad_entries(opt))
+    total = _local_total_norm(entries, 2.0, opt, foreach=False)
+    assert total.dtype is torch.float32
+    assert total.item() == pytest.approx(5.0)
 
 
 def test_clip_grad_norm_uses_tp_full_grad_on_tp_owner_only() -> None:

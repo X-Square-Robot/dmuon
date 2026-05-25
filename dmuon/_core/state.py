@@ -137,8 +137,8 @@ class DedicatedState:
 
         # Phase C.3: consume any pending async replicate broadcast from
         # the previous step BEFORE ``unshard`` reads ``_owned_data``.
-        # ``_pre_forward_wait`` is a no-op when the group is in IDLE
-        # state (1D mode, sync fallback, or already-consumed event).
+        # ``_pre_forward_wait`` is a no-op when the group is idle
+        # (1D mode or already-consumed event).
         self.group._pre_forward_wait()
         self.group.unshard()            # no-op if already unsharded or prefetched
         self.group.wait_for_unshard()   # no-op if already unsharded
@@ -146,9 +146,9 @@ class DedicatedState:
         # During activation-checkpoint recompute this hook runs inside backward;
         # the next forward layer is not the next layer consumed by backward.
         if self._next_group is not None and not _is_backward_pass():
-            self._next_group.unshard()  # no-op if already unsharded
-        # Reset fast-path flag for this forward — backward (fast path or root
-        # callback fallback) will set it True.
+            self._next_group.unshard(prefetch=True)  # no-op if already unsharded
+        # Reset fast-path flag for this forward; backward will set it True
+        # either from the fast path or from the root callback.
         self.group._post_backward_fired = False
         if torch.is_grad_enabled():
             # Register post-backward hook on inputs (reduce + reshard after backward)
@@ -170,35 +170,40 @@ class DedicatedState:
             output = self._register_pre_backward(output)
         return output
 
-    # ---- post-backward fast path + fallback ------------------------------
+    # ---- post-backward fast path + root callback -------------------------
 
     @dynamo_disable
     def _run_post_backward(self) -> None:
         """Execute reduce + reshard. Idempotent per forward.
 
         Called either from _DedicatedPostBackward.backward (fast path) or from
-        the autograd-engine root callback (fallback, when no input required
-        gradient or was reachable through backward).
+        the autograd-engine root callback when no input required gradient or
+        was reachable through backward.
 
         Phase 2: autograd writes .grad directly onto the persistent
         ``_unsharded_param`` object, so no forward-time snapshot / transfer
         step is needed — ``reduce_grads`` reads ``.grad`` in place.
 
         Rolling reduce drain (1-outstanding): before dispatching this group's
-        reduce, wait on the previously-dispatched group's ``_pending_reduce``
-        so per-rank backward memory caps at ~2 groups' full gradients instead
-        of accumulating all N groups until ``wait_all_reduces`` /
-        :func:`_root_post_backward_final_callback` at the end of backward.
-        ``wait_for_reduce`` is idempotent — a no-op when the previous group
-        has already been drained — so this is safe even when callers (e.g.
-        gradient-accumulation paths or the inner-engine root callback under
-        ``use_reentrant=True``) interleave drains and dispatches.
+        reduce, wait only on the previously-dispatched group's Stage-1
+        shard-reduce event.  This mirrors FSDP2's inter-group
+        ``reduce_scatter_state.event`` wait: it bounds the lifetime of
+        shard-reduce input buffers, but does not wait the HSDP Stage-2
+        replicate reduce/all-reduce tail.  The full reduce tail remains an
+        optimizer dependency and is drained by the root callback or optimizer
+        prepare path.
         """
         if self.group._post_backward_fired:
             return
         prev = self.comm_ctx.last_reduced_group
         if prev is not None and prev is not self.group:
-            prev.wait_for_reduce()
+            wait_stage1 = getattr(prev, "wait_for_stage1_reduce", None)
+            if wait_stage1 is not None:
+                wait_stage1()
+            else:
+                # DDP and older backends have no Stage-2 split, so the full
+                # reduce wait is equivalent to FSDP2's buffer-safety wait.
+                prev.wait_for_reduce()
         self.group.reduce_grads()
         self.group.reshard()
         self.comm_ctx.last_reduced_group = self.group
@@ -244,7 +249,7 @@ class DedicatedState:
                 new_kwargs = dict(kwargs)
                 new_kwargs[k] = wrapped
                 return args, new_kwargs
-        # Shallow scan found nothing — rely on root callback fallback.
+        # Shallow scan found nothing; rely on the root callback.
         return args, kwargs
 
     def _register_pre_backward(self, output):
@@ -291,13 +296,11 @@ def _root_post_backward_final_callback(comm_ctx: DedicatedCommContext) -> None:
     1. Force-fire post_backward on any group whose fast path did not run
        (e.g. when no input tensor required gradient, so
        ``_DedicatedPostBackward.backward`` never executed).
-    2. Drain the rolling 1-outstanding reduce window: the last group whose
-       reduce was dispatched still has a live ``_pending_reduce`` (held by
-       the rolling-drain protocol — see :meth:`_run_post_backward`).  Walk
-       every registered group and call ``wait_for_reduce`` to release the
-       grad buffer back to the caching allocator before the optimizer step.
-       ``wait_for_reduce`` is idempotent, so already-drained groups are
-       cheap no-ops.
+    2. Drain the full reduce tails before the optimizer step.  The per-layer
+       rolling drain in :meth:`_run_post_backward` only waits Stage-1 for
+       buffer safety, following FSDP2.  Here we wait the complete Stage-1 +
+       Stage-2 pipeline so owner-side gradients are materialized before the
+       optimizer reads them.
 
     The two passes are intentionally separated: step 1's ``_run_post_backward``
     calls may dispatch new reduces (updating ``last_reduced_group``), so the
@@ -308,8 +311,13 @@ def _root_post_backward_final_callback(comm_ctx: DedicatedCommContext) -> None:
             if state.group._post_backward_fired:
                 continue
             state._run_post_backward()
-        for state in comm_ctx.all_states:
-            state.group.wait_for_reduce()
+        delay_stage2 = any(
+            bool(getattr(state.group, "_delay_stage2_to_optimizer", False))
+            for state in comm_ctx.all_states
+        )
+        if not delay_stage2:
+            for state in comm_ctx.all_states:
+                state.group.wait_for_reduce()
         comm_ctx.last_reduced_group = None
     finally:
         comm_ctx.post_backward_final_callback_queued = False

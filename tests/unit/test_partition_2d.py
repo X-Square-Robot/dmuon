@@ -135,6 +135,35 @@ def test_2d_load_balance(shard, replicate, num_layers):
     )
 
 
+def test_hsdp_lpt_balances_large_root_params_across_shard_columns():
+    """Large non-layer tensors should not collapse onto one shard column.
+
+    HSDP owner coords are 2D, but stage-2 reduce and post-step replicate
+    publish are per shard column.  A plain 2D slot LPT can put two equal-size
+    root tensors on different replicate coords of the same shard, which looks
+    balanced per owner but serializes the inter-node bytes on one column.
+    """
+    shard_mesh = FakeDeviceMesh(4)
+    replicate_mesh = FakeDeviceMesh(2)
+    model = nn.Module()
+    model.embed_tokens = nn.Embedding(1024, 8192)
+    model.lm_head = nn.Linear(8192, 1024, bias=False)
+
+    assignment = compute_balanced_assignment(
+        model,
+        shard_mesh,
+        predicate=lambda _n, _p: True,
+        replicate_mesh=replicate_mesh,
+    ).dp_owners
+
+    embed_owner = assignment[model.embed_tokens.weight]
+    head_owner = assignment[model.lm_head.weight]
+    assert embed_owner[0] != head_owner[0], (
+        f"large root params should use different shard columns, got "
+        f"embed={embed_owner}, lm_head={head_owner}"
+    )
+
+
 # --- Same-layer concurrency in 2D ------------------------------------------
 
 

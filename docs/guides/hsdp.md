@@ -117,53 +117,14 @@ The whole sequence is bit-identical whether you set `replicate_async=True` or `F
 | Mode | `replicate_async` | When to use | Risk |
 |---|---|---|---|
 | **Sync (Phase B)** | `False` | Debugging, checkpoint inspection, any time you want deterministic timing | None — always correct |
-| **Async (Phase C, default)** | `True` | Production training, large models, multi-node | If replicate bandwidth is much slower than forward compute the broadcast cannot hide; a fallback protocol auto-degrades to sync after 3 consecutive slow waits (see below) |
+| **Async (Phase C, default)** | `True` | Production training, large models, multi-node | If replicate bandwidth is much slower than forward compute the broadcast cannot hide; switch to sync mode for deterministic debugging |
 
-### The Fallback Protocol
+### Async behavior
 
-If `DMUON_REPLICATE_PROFILE=1` is set, DMuon measures the blocked-wait time at each `_pre_forward_wait` and auto-degrades a group to sync after **3 consecutive waits > 100 μs**. Once tripped, the flag is single-direction; reset via:
-
-```python
-dmuon.reset_replicate_fallback(model)
-```
-
-Tune the thresholds from Python if needed:
-
-```python
-import dmuon._backends.fsdp2.group as g
-g.REPLICATE_WAIT_THRESHOLD_US = 250.0      # default 100.0
-g.REPLICATE_FALLBACK_CONSECUTIVE_STEPS = 5 # default 3
-```
-
----
-
-## Profile the Broadcast
-
-Turn on the per-group profile once you are sanity-checking a new cluster or model:
-
-```bash
-DMUON_REPLICATE_PROFILE=1 torchrun --nproc_per_node=4 train.py
-```
-
-In the training loop, call the report from rank 0:
-
-```python
-import dmuon
-# ... training ...
-dmuon.replicate_profile_report()   # rank-0 only; no-op elsewhere
-```
-
-Sample output:
-
-```
-==============================================================================
-[DMUON_REPLICATE_PROFILE] per-group wait time summary (μs)
-==============================================================================
-                         group     n      mean       p50       p90       p99       max
-                layers.0.mlp    100     14.22     13.80     18.40     22.30     25.10
-                layers.1.mlp    100     18.70     17.90     24.10     28.40     31.80
-                ...
-```
+In async mode, post-step replicate broadcasts are launched on the dedicated
+replicate stream and consumed by each group's next forward entry.  This keeps
+the public runtime simple: choose `replicate_async=True` for the overlap path,
+or `False` when you want deterministic step boundaries for debugging.
 
 `p90 < 100 μs` across groups typically means async is hiding well. If `p99` is wide, look at (a) replicate bandwidth (IB saturation), (b) forward compute time — async hiding needs *some* compute to hide behind.
 
@@ -260,7 +221,10 @@ Asymmetric combinations (DMuon-Z2 + FSDP2-Z3, or vice versa) are valid and occas
 : LPT partitioning balances owner load across **shard ranks**, but a rank still holds the full param + grad + state for each of its owned params. Tune `SMALL_PARAM_THRESHOLD` in `dmuon.partition` or increase `shard_size`.
 
 **IB seems saturated during `optimizer.step` window**
-: Check `DMUON_REPLICATE_PROFILE=1` output. If `p90 > 100 μs` and fallback keeps tripping, either widen the threshold (tune `REPLICATE_WAIT_THRESHOLD_US`) or accept sync mode.
+: Compare `replicate_async=True` and `False`, then inspect a torch profile for
+  whether the post-step publish is hidden by the next forward.  If it cannot
+  hide, reduce the post-step publish payload or use sync mode for the
+  diagnostic run.
 
 ---
 
@@ -271,6 +235,5 @@ Asymmetric combinations (DMuon-Z2 + FSDP2-Z3, or vice versa) are valid and occas
 - [Checkpointing](checkpoint.md) — state-dict semantics
 - [Custom Hook Boundaries](custom-hook-boundaries.md) — align DMuon hook boundaries with your model structure
 - [Z2 vs Z3 Modes](z2-z3-modes.md) — packed-buffer lifecycle and memory/comm tradeoff
-- [Profiling & Fallback](profiling-and-fallback.md) — detailed broadcast profiling and fallback tuning
 - [Integration Recipes](integration-recipes.md) — HuggingFace Trainer, torchtitan, and other framework hooks
 - [API Reference](../reference/api.md) — full `dedicate_params` and `Muon` signatures
