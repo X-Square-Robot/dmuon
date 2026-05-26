@@ -136,6 +136,8 @@ class Muon(Optimizer):
         tp_distributed_gram: bool = False,
         tp_distributed_gram_policy: str = "beneficial",
         tp_distributed_gram_max_factor_to_scatter_ratio: float = 0.5,
+        post_step_prefetch_groups: int = 0,
+        post_step_prefetch_sharded_adamw: bool = False,
     ):
         if isinstance(ns_backend, str):
             ns_backend = NewtonSchulz(backend=ns_backend)
@@ -163,6 +165,8 @@ class Muon(Optimizer):
         self._tp_distributed_gram_max_factor_to_scatter_ratio = float(
             tp_distributed_gram_max_factor_to_scatter_ratio
         )
+        self._post_step_prefetch_groups = max(0, int(post_step_prefetch_groups))
+        self._post_step_prefetch_sharded_adamw = bool(post_step_prefetch_sharded_adamw)
 
         # Discover all dedicated params, and the subset owned by this rank.
         comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
@@ -342,6 +346,13 @@ class Muon(Optimizer):
         """Dedicated AdamW follows DMuon owner-update + publish in mainline."""
 
         return False
+
+    @staticmethod
+    def _group_has_sharded_adamw_params(group) -> bool:
+        return any(
+            getattr(dp, "_dmuon_route", None) == "sharded_adamw"
+            for dp in getattr(group, "params", ())
+        )
 
     @staticmethod
     def _normalize_group_params(params) -> list[torch.Tensor]:
@@ -1197,6 +1208,15 @@ class Muon(Optimizer):
                 _dispatch_post_step_async(group, phase_recorder=self._profile_phase)
             finally:
                 self._profile_event_end(profile_token)
+            should_prefetch = (
+                self._post_step_prefetch_groups
+                and group_idx < self._post_step_prefetch_groups
+            ) or (
+                self._post_step_prefetch_sharded_adamw
+                and self._group_has_sharded_adamw_params(group)
+            )
+            if should_prefetch:
+                group.unshard(prefetch=True)
 
         if needs_prepare:
             self._grads_ready = True
