@@ -205,7 +205,7 @@ fully_shard(layer, mesh=dp_mesh)                 # FSDP2 third
 
 ## See Also
 
-- [HSDP Guide](../guides/hsdp.md) — full 2D mesh walkthrough, async mode, fallback
+- [HSDP Guide](../guides/hsdp.md) — full 2D mesh walkthrough and async mode
 - [Custom Hook Boundaries](../guides/custom-hook-boundaries.md) — ViT, MoE, non-standard architectures
 - [Z2 vs Z3 Modes](../guides/z2-z3-modes.md) — memory/communication tradeoff
 - [API Reference](../reference/api.md) — complete `dedicate_params` and `Muon` signatures

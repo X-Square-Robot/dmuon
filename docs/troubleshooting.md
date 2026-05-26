@@ -158,20 +158,13 @@
 ## Performance
 
 ??? warning "Optimizer step is slow (>>100 ms for a small model)"
-    **Cause:** a group may have tripped the async→sync fallback.  Enable
-    profiling and check the per-group wait table:
-    ```bash
-    DMUON_REPLICATE_PROFILE=1 torchrun --nproc_per_node=... train.py
-    ```
-    Then call `dmuon.replicate_profile_report(model)` at the end of training.
+    **Cause:** owner load may be imbalanced, or the post-step publish may be
+    too large to hide behind the next forward pass.
 
-    **Fix:**
-    ```python
-    dmuon.reset_replicate_fallback(model)
-    import dmuon.group as g
-    g.REPLICATE_WAIT_THRESHOLD_US = 500  # raise threshold if IB is slow
-    ```
-    See [Profiling & Fallback](guides/profiling-and-fallback.md).
+    **Fix:** first compare sync and async timing with
+    `dmuon.Muon(..., replicate_async=False/True)`.  If only a few owner ranks
+    are slow, inspect the dedicated parameter assignment and consider a more
+    even hook boundary or owner strategy.
 
 ---
 
@@ -196,11 +189,7 @@
     **Cause:** LPT (Longest Processing Time) partition may assign too many
     large parameters to a few owner ranks, causing memory imbalance.
 
-    **Fix:** profile the balance:
-    ```bash
-    DMUON_PROFILE_BALANCE=1 torchrun --nproc_per_node=... train.py
-    ```
-    If the log shows high imbalance, verify that `_extract_layer_id` correctly
+    **Fix:** verify that `_extract_layer_id` correctly
     identifies your model's layer structure.  For ViT-style models with
     `blocks.N` paths, ensure `blocks.N` appears in the FQN — otherwise all
     parameters may collapse to the same "layer" key.  See
@@ -225,18 +214,6 @@
     **Fix:** known limitation.  Save via `get_model_state_dict` (full unsharded
     tensors) and use `set_model_state_dict` to reload.  Do not reuse optimizer
     state dicts across topology changes — restart from model weights only.
-
----
-
-??? warning "Fallback protocol stuck in sync mode after network improvement"
-    **Cause:** a group has permanently tripped `_replicate_sync_fallback=True`
-    and will not re-enable async automatically.
-
-    **Fix:**
-    ```python
-    dmuon.reset_replicate_fallback(model)
-    ```
-    Call once per model after resolving the network issue.
 
 ---
 
@@ -282,6 +259,5 @@
 ## See also
 
 - [FAQ](faq/index.md)
-- [Profiling & Fallback](guides/profiling-and-fallback.md)
 - [HSDP guide](guides/hsdp.md)
 - [API Reference](reference/api.md)

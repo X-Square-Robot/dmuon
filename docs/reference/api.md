@@ -10,28 +10,6 @@
 
 ---
 
-## Module constants
-
-Two module-level knobs in `dmuon.group` let you tune the async→sync fallback
-protocol without touching the optimizer constructor.  Import and mutate before
-training starts:
-
-```python
-import dmuon._backends.fsdp2.group as g
-
-g.REPLICATE_WAIT_THRESHOLD_US = 250   # default: 100 μs; raise on fast IB networks
-g.REPLICATE_FALLBACK_CONSECUTIVE_STEPS = 5  # default: 3; steps before flipping to sync
-```
-
-| Name | Default | Description |
-|---|---|---|
-| `REPLICATE_WAIT_THRESHOLD_US` | `100.0` | Per-layer replicate-broadcast wait above which a step is counted as "slow". |
-| `REPLICATE_FALLBACK_CONSECUTIVE_STEPS` | `3` | Consecutive slow steps required before a group permanently switches to sync broadcast. |
-
-Reset a group that has fallen back: `dmuon.reset_replicate_fallback(model)`.
-
----
-
 ## Setup
 
 ### dedicate_params
@@ -43,6 +21,41 @@ a single owner rank and registers the per-layer forward/backward hooks.  See
 customization points.
 
 ::: dmuon.dedicate_params
+
+---
+
+### dedicate_params_ddp
+
+DDP-path setup for dedicated parameters when the data-parallel model is
+replicated instead of FSDP2-sharded.
+
+::: dmuon.dedicate_params_ddp
+
+---
+
+### dedicate_params_ddp_tp
+
+DDP-path setup for dedicated parameters when tensor parallelism is active
+inside each replicated data-parallel group.
+
+::: dmuon.dedicate_params_ddp_tp
+
+---
+
+### replicate
+
+DDP-style replication helper for non-dedicated parameters.
+
+::: dmuon.replicate
+
+---
+
+### replicate_tp
+
+TP-aware companion to `dedicate_params_ddp_tp()` for non-dedicated
+`DTensor` parameters.
+
+::: dmuon.replicate_tp
 
 ---
 
@@ -61,8 +74,10 @@ import path.
 ### Muon
 
 The primary optimizer class.  Manages Muon (Newton-Schulz + momentum) on
-dedicated parameters and AdamW on FSDP2-managed symmetric parameters in a
-single object.  Compatible with `torch.optim.lr_scheduler`.
+matrix-routed dedicated parameters and AdamW on the base path in a single
+object.  The base path can be ordinary FSDP2-managed parameters or
+DMuon-managed sharded AdamW parameters selected via `route_hint_fn`.
+Compatible with `torch.optim.lr_scheduler`.
 
 ::: dmuon.Muon
 
@@ -146,9 +161,20 @@ FSDP2's reduce-scatter within the block.  See
 
 ---
 
+### prepare_muon_grads
+
+Prepare all pending Muon gradients after backward.  This is broader than a
+plain reduce wait because TP-sharded parameters may also need a TP gather before
+Muon can run.
+
+::: dmuon.prepare_muon_grads
+
+---
+
 ### wait_all_reduces
 
-Drain pending async gradient reduces.  Called automatically by `Muon.step()`.
+Backward-compatible alias for `prepare_muon_grads()`.  Called automatically by
+`Muon.step()`.
 
 ::: dmuon.wait_all_reduces
 
@@ -166,8 +192,7 @@ Prefer the async variant unless debugging.
 ### broadcast_all_updates_async
 
 Async post-step replicate broadcast (default in `Muon`).  Each layer's event
-is consumed at the start of the next forward pass.  See
-[Profiling & Fallback](../guides/profiling-and-fallback.md).
+is consumed at the start of the next forward pass.
 
 ::: dmuon.broadcast_all_updates_async
 
@@ -182,21 +207,35 @@ Drain every group's pending async replicate broadcast.  Call before reading
 
 ---
 
-### reset_replicate_fallback
+### wait_all_post_step_broadcasts
 
-Re-enable async broadcast on groups that permanently switched to sync.  Safe
-to call from the training loop after fixing a slow-IB condition.
+Compatibility alias for `wait_all_replicate_broadcasts()`.
 
-::: dmuon.reset_replicate_fallback
+::: dmuon.wait_all_post_step_broadcasts
 
 ---
 
-### replicate_profile_report
+### clip_grad_norm_
 
-Print per-group wait-time summary to stdout (rank 0 only).  Requires
-`DMUON_REPLICATE_PROFILE=1`.  Call at the end of training.
+Clip gradients for DMuon-owned Muon parameters.
 
-::: dmuon.replicate_profile_report
+::: dmuon.clip_grad_norm_
+
+---
+
+### register_muon_grad_clip_strategy
+
+Register a custom strategy for `clip_grad_norm_()`.
+
+::: dmuon.register_muon_grad_clip_strategy
+
+---
+
+### MuonGradClipStats
+
+Return type for DMuon gradient clipping.
+
+::: dmuon.MuonGradClipStats
 
 ---
 

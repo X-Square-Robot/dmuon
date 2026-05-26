@@ -50,8 +50,14 @@ def install_patch():
     if _installed:
         return
 
-    import torch.distributed.fsdp._fully_shard._fsdp_init as _fsdp_init
-    import torch.distributed.fsdp._fully_shard._fully_shard as _fully_shard_mod
+    try:
+        import torch.distributed.fsdp._fully_shard._fsdp_init as _fsdp_init
+        import torch.distributed.fsdp._fully_shard._fully_shard as _fully_shard_mod
+    except ModuleNotFoundError:
+        # Older local test environments may not ship FSDP2 internals.  Keep
+        # import dmuon usable; actual FSDP2 users will still fail when they
+        # import/call fully_shard from an unsupported PyTorch build.
+        return
 
     _original_fn = _fsdp_init._get_managed_states
 
@@ -70,8 +76,11 @@ def uninstall_patch():
     if not _installed:
         return
 
-    import torch.distributed.fsdp._fully_shard._fsdp_init as _fsdp_init
-    import torch.distributed.fsdp._fully_shard._fully_shard as _fully_shard_mod
+    try:
+        import torch.distributed.fsdp._fully_shard._fsdp_init as _fsdp_init
+        import torch.distributed.fsdp._fully_shard._fully_shard as _fully_shard_mod
+    except ModuleNotFoundError:
+        return
 
     _fsdp_init._get_managed_states = _original_fn
     _fully_shard_mod._get_managed_states = _original_fn

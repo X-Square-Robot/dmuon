@@ -2,7 +2,8 @@
 
 Complete example using Tensor Parallelism (TP) combined with Data
 Parallelism (DP) on a 2D device mesh.  DMuon detects TP-sharded
-parameters automatically via `DTensor` — no TP-specific API.
+parameters automatically via `DTensor`, so the required setup still uses
+the same DP mesh slice you pass to FSDP2.
 
 ---
 
@@ -72,10 +73,14 @@ FSDP2's sharding contract.
 optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, adamw_lr=1e-3)
 ```
 
-No TP-specific knobs.  The only TP-related flag is `replicate_async`
-(default `True`): whether the post-step scatter + replicate broadcast
-overlap with the next iteration's forward compute.  Both sync and async
-produce **bit-identical** loss trajectories on 3D HSDP×TP.
+Most TP runs need no extra optimizer knobs.  Advanced runs can set
+`tp_buffer_reuse=` on `dedicate_params()` to reuse TP gather/scatter
+scratch buffers, and `tp_distributed_gram=` on `Muon` to use the
+TP-aware distributed Gram path when its factor payload is smaller than
+the full update scatter.  `replicate_async` is the DP/HSDP post-step
+publish overlap switch; it is not TP-only.  Sync and async post-step
+publish are designed to preserve the same loss trajectory on supported
+topologies.
 
 ## What Happens Under the Hood
 

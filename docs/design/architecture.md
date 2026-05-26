@@ -193,7 +193,9 @@ After `optimizer.step()`, the global owner has new `_owned_data`. This must be s
 - **Dispatch** (`replicate_broadcast_async`): fires the NCCL broadcast on `replicate_broadcast_stream` immediately after `optimizer.step()`, records a `ReplicateBroadcastState` holding an event + tensor ref. Returns immediately.
 - **Wait** (`_pre_forward_wait`): consumed by the **next iteration's** `_pre_forward` hook, just before `unshard()` reads `_owned_data`. If the IB transfer completed during forward compute of prior layers, the wait is effectively zero.
 
-The fallback protocol auto-degrades to sync mode after 3 consecutive waits exceeding 100 µs (tunable via `REPLICATE_WAIT_THRESHOLD_US` and `REPLICATE_FALLBACK_CONSECUTIVE_STEPS`), protecting correctness under slow IB conditions.
+If the replicate-axis transfer cannot hide behind the next forward pass, use
+`replicate_async=False` to run the same communication synchronously while
+debugging the network or hook boundary.
 
 ### Priority Assignment
 
@@ -205,7 +207,7 @@ Shard-dim collectives (`broadcast_stream`, `reduce_stream`) use CUDA stream prio
 
 ### The Monkey-Patch Mechanism
 
-On `import dmuon`, `patch.install_patch()` wraps `_get_managed_states` in FSDP2's init path. The patched version adds any parameter carrying `_dedicated_owner_rank` to `ignored_params` before delegating to the original function:
+On `import dmuon`, `dmuon.install_patch()` wraps `_get_managed_states` in FSDP2's init path. The patched version adds any parameter carrying `_dedicated_owner_rank` to `ignored_params` before delegating to the original function:
 
 ```python
 def _patched_get_managed_states(modules, ignored_params=None):
@@ -218,7 +220,7 @@ def _patched_get_managed_states(modules, ignored_params=None):
     return _original_fn(modules, ignored_params)
 ```
 
-This means subsequent `fully_shard()` calls silently skip dedicated parameters. No change to FSDP2 internals — the patch touches a single private function and is fully reversible via `dmuon.patch.uninstall_patch()`.
+This means subsequent `fully_shard()` calls silently skip dedicated parameters. No change to FSDP2 internals — the patch touches a single private function and is installed automatically by importing `dmuon`.
 
 ### Why This Is Not an Adapter
 
@@ -313,6 +315,5 @@ torchrun --nproc_per_node=4 tests/distributed/test_hsdp_async_correctness.py
 - [HSDP Guide](../guides/hsdp.md) — full HSDP API reference and tuning
 - [Custom Hook Boundaries](../guides/custom-hook-boundaries.md) — `hook_boundary_predicate` in practice
 - [Z2 vs Z3 Modes](../guides/z2-z3-modes.md) — packed-buffer lifecycle and memory/comm tradeoffs
-- [Profiling & Fallback](../guides/profiling-and-fallback.md) — replicate broadcast profiling and fallback tuning
 - [API Reference](../reference/api.md) — `dedicate_params` and `Muon` full signatures
 - [Communication Cost Analysis](../reference/communication-cost.md) — per-byte analysis of every collective

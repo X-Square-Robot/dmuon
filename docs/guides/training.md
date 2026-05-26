@@ -50,11 +50,14 @@ assignment = dmuon.dedicate_params(
 
 ### Writing the Predicate
 
-The `predicate` function decides which parameters use Muon (dedicated) vs AdamW (symmetric). It receives the fully-qualified parameter name and the parameter tensor:
+The `predicate` function decides which parameters enter DMuon's dedicated
+ownership runtime.  In the default setup, selected parameters use Muon and
+unselected parameters remain on the normal FSDP2/AdamW path.  The predicate
+receives the fully-qualified parameter name and the parameter tensor:
 
 ```python
 def predicate(name: str, param: nn.Parameter) -> bool:
-    return ...  # True = dedicated (Muon), False = symmetric (AdamW)
+    return ...  # True = DMuon-managed Muon, False = FSDP2/AdamW
 ```
 
 **Common patterns:**
@@ -95,6 +98,33 @@ def predicate(name: str, param: nn.Parameter) -> bool:
 - **2D matrices only** — 1D parameters (LayerNorm, bias) should use AdamW
 - **Large enough for NS** — Very small matrices don't benefit from Newton-Schulz. A rough threshold: `numel > 100k`
 - **Embedding/head layers** — Usually kept under AdamW (they don't fit the NS optimization geometry well)
+
+### Advanced: Type-Split Routing
+
+For large scaling runs where DMuon should own communication for all trainable
+parameters, pass a broader `predicate` and a `route_hint_fn`.  Route
+`"muon"` keeps large matrix parameters on the matrix-optimizer path; route
+`"sharded_adamw"` keeps non-Muon trainable parameters on a DMuon-managed
+sharded AdamW path.  This avoids mixing FSDP2 collectives and DMuon collectives
+inside the same training step.
+
+```python
+def route_hint(name, param):
+    if param.ndim == 2 and "proj" in name:
+        return "muon"
+    return "sharded_adamw"
+
+dmuon.dedicate_params(
+    model,
+    mesh,
+    predicate=lambda n, p: p.requires_grad,
+    route_hint_fn=route_hint,
+)
+```
+
+The default `predicate=lambda n, p: "proj" in n and p.ndim == 2` remains the
+simpler integration path.  Use type-split routing only when you want DMuon to
+own placement and collectives for the non-Muon trainable parameters as well.
 
 ### Inspecting the Assignment
 
@@ -182,15 +212,7 @@ raise during optimizer construction.
 
 Schedulers and checkpoints work through `optimizer.param_groups` as usual. The
 visible group names become `base/muon`, `base/adamw`, `action/muon`, and
-`action/adamw`.
-
-Use the diagnostics helper to audit the actual split:
-
-```python
-summary = dmuon.summarize_param_groups(model, optimizer, max_rows=80)
-if dist.get_rank() == 0:
-    print(dmuon.format_param_group_summary(summary))
-```
+`action/adamw`, which is the public surface for auditing the route split.
 
 ### Hyperparameter Guide
 
@@ -217,7 +239,7 @@ for step, batch in enumerate(dataloader):
         print(f"step {step}: loss={loss.item():.4f}")
 ```
 
-1. `optimizer.step()` internally: (a) waits for all async gradient reduces to complete, (b) runs Muon on dedicated params, (c) runs AdamW on FSDP2 params.
+1. `optimizer.step()` internally: (a) waits for async gradient reduces to complete, (b) runs Muon on routed matrix params, and (c) runs AdamW on either FSDP2-managed params or DMuon-managed sharded AdamW params, depending on the route setup.
 
 The training loop is identical to standard PyTorch. No special hooks or context managers needed.
 
@@ -312,7 +334,7 @@ for layer in model.layers:
 fully_shard(model, mesh=hsdp)
 ```
 
-See the dedicated [HSDP guide](hsdp.md) for the full API, sync vs async mode, the fallback protocol, and profiling.
+See the dedicated [HSDP guide](hsdp.md) for the full API and sync vs async mode.
 
 For the DMuon-Z2 vs DMuon-Z3 packed-buffer lifecycle choice applicable under both FSDP and HSDP, see [Z2 vs Z3 Modes](z2-z3-modes.md).
 
@@ -321,7 +343,6 @@ For the DMuon-Z2 vs DMuon-Z3 packed-buffer lifecycle choice applicable under bot
 - [HSDP (Multi-Node)](hsdp.md) — 2D mesh training with async broadcast
 - [Custom Hook Boundaries](custom-hook-boundaries.md) — Control which module receives DMuon's forward/backward hooks
 - [Z2 vs Z3 Modes](z2-z3-modes.md) — Packed-buffer lifecycle and memory/comm tradeoff
-- [Profiling & Fallback](profiling-and-fallback.md) — Measure broadcast latency and tune the async fallback protocol
 - [Tensor Parallelism](tp-support.md) — Using DMuon with TP
 - [Checkpointing](checkpoint.md) — Save and load training state
 - [Gradient Accumulation](grad-accumulation.md) — Effective batch size scaling

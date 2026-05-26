@@ -24,6 +24,7 @@ import logging
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 from dmuon.optim.syrk_dispatch import (
@@ -439,6 +440,332 @@ def gram_newton_schulz(
 
     if transposed:
         X = X.T
+    return X.to(original_dtype)
+
+
+def gram_newton_schulz_factors(
+    G: Tensor,
+    steps: int = 5,
+    eps: float = 1e-7,
+    coefficients: Optional[list[list[float]]] = None,
+    restart_iterations: Optional[list[int]] = None,
+    deterministic: bool = False,
+) -> tuple[tuple[Tensor, ...], bool, Tensor]:
+    """Return Gram-space NS left-factor segments for ``G``.
+
+    ``gram_newton_schulz(G)`` applies one Gram multiplier segment per restart
+    window to the normalized and possibly transposed view of ``G``.  Returning
+    the segments instead of pre-composing them preserves the same fp16
+    matrix-multiplication order as the original implementation.
+
+    These factors are unrelated to attention Q projections.  The internal
+    variable name ``Q`` follows the Gram-NS algebra, where the update is formed
+    by left-multiplying the normalized matrix by one or more Gram factors.  The
+    TP path can broadcast these smaller Gram factors and let every TP rank
+    apply them to its local sequence/column shard instead of scattering the
+    full update.
+
+    Returns:
+        ``(factor_segments, transposed, normalizer)`` where ``normalizer`` is
+        ``G.norm()+eps`` under the same orientation rule as
+        :func:`gram_newton_schulz`.
+    """
+    if coefficients is None:
+        coefficients = DEFAULT_COEFFICIENTS
+    if restart_iterations is None:
+        restart_iterations = DEFAULT_RESTART_ITERATIONS
+
+    X = G.float()
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.T
+    normalizer = X.norm() + eps
+    X = (X / normalizer).half().contiguous()
+
+    m = X.shape[0]
+    _use_syrk = _HAS_SYRK and X.is_cuda and not deterministic
+    if _use_syrk:
+        R = torch.empty(m, m, device=X.device, dtype=X.dtype)
+        _syrk_or_cublas(X, R)
+    else:
+        R = X @ X.T
+
+    I = torch.eye(m, device=X.device, dtype=X.dtype) if not _use_syrk else None
+    factor: Optional[Tensor] = None
+    factor_segments: list[Tensor] = []
+    Z = torch.empty_like(R) if _use_syrk else None
+    factor_bufs = [torch.empty_like(R), torch.empty_like(R)] if _use_syrk else [None, None]
+    factor_idx = 0
+    RZ_buf = torch.empty_like(R) if _use_syrk else None
+    R_new = torch.empty_like(R) if _use_syrk else None
+
+    for i, (a, b, c) in enumerate(coefficients):
+        if i in restart_iterations and i != 0:
+            assert factor is not None
+            factor_segments.append(factor.clone())
+            X = factor @ X
+            if _use_syrk:
+                _syrk_or_cublas(X, R)
+            else:
+                R = X @ X.T
+            factor = None
+
+        if _use_syrk:
+            _syrk_or_cublas(R, Z, C=R, alpha=c, beta=b)
+
+            if factor is None:
+                need_R_evolve = (
+                    i < len(coefficients) - 1 and (i + 1) not in restart_iterations
+                )
+                if not need_R_evolve:
+                    _syrk_or_cublas(
+                        R, factor_bufs[factor_idx], C=R, alpha=c, beta=b, diag_add=a
+                    )
+                else:
+                    factor_bufs[factor_idx].copy_(Z)
+                    factor_bufs[factor_idx].diagonal().add_(a)
+                factor = factor_bufs[factor_idx]
+            else:
+                factor_next = 1 - factor_idx
+                torch.addmm(
+                    factor,
+                    Z,
+                    factor.T,
+                    alpha=1.0,
+                    beta=a,
+                    out=factor_bufs[factor_next],
+                )
+                factor = factor_bufs[factor_next]
+                factor_idx = factor_next
+
+            if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:
+                _syrk_or_cublas(R, RZ_buf, B=Z, C=R, alpha=1.0, beta=a)
+                _syrk_or_cublas(RZ_buf, R_new, B=Z, C=RZ_buf, alpha=1.0, beta=a)
+                R = R_new
+        else:
+            Z_t = torch.addmm(R, R, R, alpha=c, beta=b)
+            if factor is None:
+                factor = Z_t + a * I
+            else:
+                factor = torch.addmm(factor, Z_t, factor, beta=a)
+            if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:
+                RZ_t = torch.addmm(R, R, Z_t, beta=a)
+                R = torch.addmm(RZ_t, Z_t, RZ_t, beta=a)
+
+    assert factor is not None
+    factor_segments.append(factor.clone())
+    return tuple(factor_segments), transposed, normalizer
+
+
+def gram_newton_schulz_q(*args, **kwargs):
+    """Backward-compatible alias for :func:`gram_newton_schulz_factors`.
+
+    The old name used ``Q`` from Gram-NS algebra.  Prefer
+    ``gram_newton_schulz_factors`` in new code to avoid confusion with
+    attention Q projections.
+    """
+
+    return gram_newton_schulz_factors(*args, **kwargs)
+
+
+def gram_newton_schulz_distributed_local(
+    G_local: Tensor,
+    group: Optional[dist.ProcessGroup],
+    *,
+    transposed: bool,
+    steps: int = 5,
+    eps: float = 1e-7,
+    coefficients: Optional[list[list[float]]] = None,
+    restart_iterations: Optional[list[int]] = None,
+) -> Tensor:
+    """Gram-space NS for a local column shard of the oriented matrix.
+
+    This is the math kernel for a Megatron-style TP shard-owner update path.
+    The full logical matrix is first oriented exactly like
+    :func:`gram_newton_schulz`: if ``transposed`` is true, ``G_local.T`` is the
+    local shard.  The oriented local shard must be a column shard of the full
+    oriented matrix.  The function reconstructs only the small Gram matrix via
+    TP all-reduce and returns the local shard of the full NS output.
+
+    It intentionally does not gather the full gradient, broadcast Q, or scatter
+    a full update.  The caller remains responsible for momentum, scaling, and
+    weight decay.
+    """
+    del steps
+    if coefficients is None:
+        coefficients = DEFAULT_COEFFICIENTS
+    if restart_iterations is None:
+        restart_iterations = DEFAULT_RESTART_ITERATIONS
+
+    def _sum_across_group(tensor: Tensor) -> Tensor:
+        if (
+            group is None
+            or not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_world_size(group=group) == 1
+        ):
+            return tensor
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+        return tensor
+
+    original_dtype = G_local.dtype
+    X = G_local.float()
+    if transposed:
+        X = X.T
+
+    local_norm2 = X.square().sum()
+    norm2 = _sum_across_group(local_norm2.reshape(()).clone())
+    normalizer = norm2.sqrt() + eps
+    X = (X / normalizer).half().contiguous()
+
+    def _global_gram(local_x: Tensor) -> Tensor:
+        gram = local_x @ local_x.T
+        if (
+            group is not None
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size(group=group) > 1
+        ):
+            # Gloo support for CPU fp16 reductions varies by build.  Reduce in
+            # fp32, then continue with the same fp16 Gram dtype as the local
+            # NS path.
+            reduced = gram.float()
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=group)
+            gram = reduced.to(gram.dtype)
+        return gram
+
+    R = _global_gram(X)
+    I = torch.eye(R.shape[0], device=R.device, dtype=R.dtype)
+    Q: Optional[Tensor] = None
+
+    for i, (a, b, c) in enumerate(coefficients):
+        if i in restart_iterations and i != 0:
+            assert Q is not None
+            X = Q @ X
+            R = _global_gram(X)
+            Q = None
+
+        Z_t = torch.addmm(R, R, R, alpha=c, beta=b)
+        if Q is None:
+            Q = Z_t + a * I
+        else:
+            Q = torch.addmm(Q, Z_t, Q, beta=a)
+        if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:
+            RZ_t = torch.addmm(R, R, Z_t, beta=a)
+            R = torch.addmm(RZ_t, Z_t, RZ_t, beta=a)
+
+    assert Q is not None
+    X = Q @ X
+    if transposed:
+        X = X.T
+    return X.to(original_dtype)
+
+
+def gram_newton_schulz_distributed_local_batched(
+    G_local: Tensor,
+    group: Optional[dist.ProcessGroup],
+    *,
+    transposed: bool,
+    steps: int = 5,
+    eps: float = 1e-7,
+    coefficients: Optional[list[list[float]]] = None,
+    restart_iterations: Optional[list[int]] = None,
+) -> Tensor:
+    """Batched variant of :func:`gram_newton_schulz_distributed_local`.
+
+    ``G_local`` must be a 3D tensor ``[batch, rows, cols]`` containing local
+    TP shards with identical logical orientation.  This helper is intentionally
+    narrow: it is the math primitive needed to replace many same-shaped
+    per-param Gram all-reduces with one packed all-reduce bucket.
+    """
+    del steps
+    if G_local.dim() != 3:
+        raise ValueError(
+            "gram_newton_schulz_distributed_local_batched expects a 3D "
+            f"[batch, rows, cols] tensor, got shape={tuple(G_local.shape)}"
+        )
+    if coefficients is None:
+        coefficients = DEFAULT_COEFFICIENTS
+    if restart_iterations is None:
+        restart_iterations = DEFAULT_RESTART_ITERATIONS
+
+    def _has_multi_rank_group() -> bool:
+        return (
+            group is not None
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size(group=group) > 1
+        )
+
+    original_dtype = G_local.dtype
+    X = G_local.float()
+    if transposed:
+        X = X.transpose(-2, -1)
+
+    local_norm2 = X.square().sum(dim=(-2, -1))
+    norm2 = local_norm2.clone()
+    if _has_multi_rank_group():
+        dist.all_reduce(norm2, op=dist.ReduceOp.SUM, group=group)
+    normalizer = norm2.sqrt().add_(eps).view(-1, 1, 1)
+    X = (X / normalizer).half().contiguous()
+
+    def _global_gram(local_x: Tensor) -> Tensor:
+        gram = torch.stack([x @ x.T for x in local_x], dim=0)
+        if _has_multi_rank_group():
+            reduced = gram.float()
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM, group=group)
+            gram = reduced.to(gram.dtype)
+        return gram
+
+    R = _global_gram(X)
+    eye = torch.eye(R.shape[-1], device=R.device, dtype=R.dtype)
+    Q: Optional[Tensor] = None
+
+    for i, (a, b, c) in enumerate(coefficients):
+        if i in restart_iterations and i != 0:
+            assert Q is not None
+            X = torch.stack([q_i @ x_i for q_i, x_i in zip(Q, X)], dim=0)
+            R = _global_gram(X)
+            Q = None
+
+        Z = torch.stack(
+            [torch.addmm(r_i, r_i, r_i, alpha=c, beta=b) for r_i in R],
+            dim=0,
+        )
+        if Q is None:
+            Q = Z + a * eye
+        else:
+            Q = torch.stack(
+                [
+                    torch.addmm(q_i, z_i, q_i, beta=a)
+                    for q_i, z_i in zip(Q, Z)
+                ],
+                dim=0,
+            )
+        if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:
+            R = torch.stack(
+                [
+                    torch.addmm(
+                        rz_i,
+                        z_i,
+                        rz_i,
+                        beta=a,
+                    )
+                    for z_i, rz_i in (
+                        (
+                            z_i,
+                            torch.addmm(r_i, r_i, z_i, beta=a),
+                        )
+                        for r_i, z_i in zip(R, Z)
+                    )
+                ],
+                dim=0,
+            )
+
+    assert Q is not None
+    X = torch.stack([q_i @ x_i for q_i, x_i in zip(Q, X)], dim=0)
+    if transposed:
+        X = X.transpose(-2, -1)
     return X.to(original_dtype)
 
 

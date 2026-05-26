@@ -142,18 +142,7 @@
 
 ---
 
-??? question "如何引用 DMuon？"
-    **DMuon 本身：**
-
-    ```bibtex
-    @misc{DMuon,
-      title   = {DMuon: Dedicated Parameter Ownership for Distributed Muon Training},
-      author  = {Xingchen Liu},
-      year    = {2026},
-      url     = {https://github.com/StarrickLiu/dmuon}
-    }
-    ```
-
+??? question "需要引用哪些相关工作？"
     **Gram Newton-Schulz**（使用默认 `"gram"` 后端时）：
 
     ```bibtex

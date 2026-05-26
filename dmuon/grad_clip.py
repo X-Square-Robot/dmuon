@@ -227,7 +227,10 @@ def _resolve_strategy(strategy: str | MuonGradClipStrategy) -> MuonGradClipStrat
 
 
 def _iter_muon_grad_entries(optimizer: Any):
+    muon_dp_ids = set(getattr(optimizer, "_dp_to_muon_group_idx", {}).keys())
     for idx, dp in enumerate(getattr(optimizer, "_dedicated_params", [])):
+        if muon_dp_ids and id(dp) not in muon_dp_ids:
+            continue
         is_tp = bool(getattr(dp, "is_dtensor", False) and getattr(dp, "tp_group", None) is not None)
         if is_tp:
             if not bool(getattr(dp, "is_tp_owner", False)):
@@ -285,7 +288,7 @@ def _local_total_norm(
 ) -> torch.Tensor:
     tensors = [entry.grad.detach() for entry in entries]
     if len(tensors) == 0:
-        return torch.zeros((), device=_accumulator_device(optimizer, entries))
+        return torch.zeros((), device=_accumulator_device(optimizer, entries), dtype=torch.float32)
     first_device = tensors[0].device
 
     norms: list[torch.Tensor] = []
@@ -299,7 +302,7 @@ def _local_total_norm(
         else:
             norms.extend([torch.linalg.vector_norm(t, norm_type) for t in device_tensors])
     return torch.linalg.vector_norm(
-        torch.stack([norm.to(first_device) for norm in norms]),
+        torch.stack([norm.to(device=first_device, dtype=torch.float32) for norm in norms]),
         norm_type,
     )
 

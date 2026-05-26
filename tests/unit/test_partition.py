@@ -4,11 +4,13 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pytest
+import torch
 import torch.nn as nn
 
 from dmuon._core.partition import (
     SMALL_PARAM_THRESHOLD,
     _extract_layer_id,
+    _matrix_optimizer_cost_units,
     compute_balanced_assignment,
 )
 
@@ -130,6 +132,57 @@ def test_balance(model):
     min_load = min(r for r in rank_loads if r > 0)
     imbalance = (max_load - min_load) / max_load
     assert imbalance < 0.05, f"Imbalance too high: {imbalance:.1%}, loads={rank_loads}"
+
+
+def test_rank0_owner_strategy_concentrates_work(model):
+    mesh = FakeDeviceMesh(8)
+    assignment = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate=lambda n, p: "proj" in n,
+        owner_strategy="rank0",
+    ).dp_owners
+
+    assert assignment
+    assert set(assignment.values()) == {0}
+
+
+def test_round_robin_owner_strategy_uses_all_ranks():
+    mesh = FakeDeviceMesh(8)
+    model = MiniModel(num_layers=4, hidden=1024, intermediate=8192)
+    assignment = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate=lambda n, p: "proj" in n,
+        owner_strategy="round_robin",
+    ).dp_owners
+
+    assert assignment
+    assert set(assignment.values()) == set(range(8))
+
+
+def test_shape_aware_cost_weights_projection_compute_above_embedding_bytes():
+    """LPT should not treat huge embeddings and projection matrices by numel only."""
+    embed = nn.Parameter(torch.empty(65536, 1024, device="meta"))
+    proj = nn.Parameter(torch.empty(4096, 4096, device="meta"))
+
+    assert embed.numel() > proj.numel()
+    assert (
+        _matrix_optimizer_cost_units("model.layers.0.self_attn.q_proj.weight", proj)
+        > _matrix_optimizer_cost_units("model.embed_tokens.weight", embed)
+    )
+
+
+def test_unknown_owner_strategy_rejected(model):
+    mesh = FakeDeviceMesh(8)
+
+    with pytest.raises(ValueError, match="Unsupported owner_strategy"):
+        compute_balanced_assignment(
+            model,
+            mesh,
+            predicate=lambda n, p: "proj" in n,
+            owner_strategy="bogus",
+        )
 
 
 def test_same_layer_different_ranks(model):

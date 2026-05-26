@@ -108,6 +108,26 @@ def _momentum_matrix_shape(dp: DedicatedParam) -> tuple[int, int]:
     return m, n
 
 
+def _tp_local_momentum_from_full(
+    full_buf: torch.Tensor,
+    dp: DedicatedParam,
+) -> torch.Tensor:
+    """Extract this TP rank's local momentum shard from a full momentum buffer."""
+
+    if getattr(dp, "tp_group", None) is None:
+        raise ValueError("_tp_local_momentum_from_full requires a TP-sharded param")
+    shard_dim = dp.shard_dim if dp.shard_dim is not None else 0
+    tp_rank = dp.tp_group.rank()
+    if shard_dim == 0:
+        local_rows = int(dp._orig_size[0])
+        return full_buf.narrow(0, tp_rank * local_rows, local_rows).contiguous()
+    if shard_dim == 1:
+        rows = int(dp.full_shape[0])
+        local_cols = int(dp._orig_size.numel() // rows)
+        return full_buf.narrow(1, tp_rank * local_cols, local_cols).contiguous()
+    raise ValueError(f"Unsupported TP momentum shard_dim={shard_dim}")
+
+
 def _broadcast_state_tensor(
     tensor, dp: DedicatedParam, *, cpu_offload: bool, keep: bool = True
 ) -> torch.Tensor:
@@ -172,6 +192,109 @@ def _broadcast_state_tensor(
         del buf
         return None
     return buf.cpu() if cpu_offload else buf
+
+
+def _broadcast_dedicated_adamw_tensor(
+    tensor, dp: DedicatedParam, *, cpu_offload: bool, keep: bool = True
+) -> torch.Tensor:
+    """Broadcast dedicated AdamW state from its local owner.
+
+    Dedicated AdamW is local-shard state for TP params and full-param state for
+    non-TP params, so it follows the DP/HSDP owner fan-out and intentionally
+    does not broadcast across the TP group.
+    """
+
+    dtype = (
+        tensor.dtype
+        if tensor is not None
+        else getattr(getattr(dp, "_owned_data", None), "dtype", dp._orig_dtype)
+    )
+    buf = torch.empty(dp._orig_size, dtype=dtype, device=dp.device)
+    if dp.is_owner and tensor is not None:
+        buf.copy_(tensor.to(dtype))
+    if (
+        dp.replicate_group is not None
+        and dp.dp_group.rank() == dp.owner_shard
+    ):
+        dist.broadcast(
+            buf,
+            src=dp._owner_replicate_global_rank,
+            group=dp.replicate_group,
+        )
+    dist.broadcast(buf, src=dp._owner_global_rank, group=dp.dp_group)
+    if not keep:
+        del buf
+        return None
+    return buf.cpu() if cpu_offload else buf
+
+
+def _broadcast_dedicated_adamw_step(dp: DedicatedParam, step: int | None) -> int:
+    if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
+        value = int(step or 0)
+        buf = torch.tensor([value], dtype=torch.int64, device=dp.device)
+        dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=dp.dp_group)
+        if dp.replicate_group is not None:
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=dp.replicate_group)
+        return int(buf.item())
+    value = int(step or 0) if dp.is_owner else 0
+    buf = torch.tensor([value], dtype=torch.int64, device=dp.device)
+    if (
+        dp.replicate_group is not None
+        and dp.dp_group.rank() == dp.owner_shard
+    ):
+        dist.broadcast(
+            buf,
+            src=dp._owner_replicate_global_rank,
+            group=dp.replicate_group,
+        )
+    dist.broadcast(buf, src=dp._owner_global_rank, group=dp.dp_group)
+    return int(buf.item())
+
+
+def _owns_dedicated_adamw_optimizer_state(dp: DedicatedParam) -> bool:
+    if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
+        return getattr(dp, "_sharded_adamw_data", None) is not None
+    if bool(getattr(dp, "_dmuon_adamw_replicate_allreduce", False)):
+        return getattr(dp, "_owned_data", None) is not None
+    return bool(getattr(dp, "is_owner", False))
+
+
+def _all_gather_sharded_adamw_tensor(
+    tensor, dp: DedicatedParam, *, cpu_offload: bool, keep: bool = True
+) -> torch.Tensor:
+    """All-gather one DMuon sharded-AdamW state tensor to full shape."""
+
+    dtype = (
+        tensor.dtype
+        if tensor is not None
+        else getattr(getattr(dp, "_sharded_adamw_data", None), "dtype", dp._orig_dtype)
+    )
+    chunk = int(getattr(dp, "_sharded_adamw_chunk_numel", 0) or 0)
+    numel = int(getattr(dp, "_sharded_adamw_numel", dp.numel))
+    local = torch.zeros(chunk, dtype=dtype, device=dp.device)
+    if tensor is not None:
+        local.copy_(tensor.to(dtype).view(-1))
+    gathered = torch.empty(chunk * dp.dp_group.size(), dtype=dtype, device=dp.device)
+    dist.all_gather_into_tensor(gathered, local, group=dp.dp_group)
+    if not keep:
+        del gathered
+        return None
+    full = gathered[:numel].view(dp._orig_size)
+    return full.cpu() if cpu_offload else full
+
+
+def _shard_full_tensor_for_sharded_adamw(
+    tensor: torch.Tensor, dp: DedicatedParam, *, dtype: torch.dtype
+) -> torch.Tensor:
+    chunk = int(getattr(dp, "_sharded_adamw_chunk_numel", 0) or 0)
+    valid = int(getattr(dp, "_sharded_adamw_valid_numel", 0) or 0)
+    shard_rank = int(dp.dp_group.rank())
+    start = shard_rank * chunk
+    out = torch.zeros(chunk, dtype=dtype, device=dp.device)
+    if valid:
+        flat = tensor.to(device=dp.device, dtype=dtype).reshape(-1)
+        out[:valid].copy_(flat[start : start + valid])
+    return out
 
 
 def _all_gather_fsdp_tensor(
@@ -346,6 +469,15 @@ def get_model_state_dict(
             if keep:
                 t = dp._orig_param.data
                 sd[fqn] = t.cpu() if cpu_offload else t.clone()
+        elif getattr(dp, "_dmuon_route", None) == "sharded_adamw":
+            t = _all_gather_sharded_adamw_tensor(
+                getattr(dp, "_sharded_adamw_data", None),
+                dp,
+                cpu_offload=cpu_offload,
+                keep=keep,
+            )
+            if keep:
+                sd[fqn] = t
         else:
             t = _broadcast_from_owner(dp, cpu_offload=cpu_offload, keep=keep)
             if keep:
@@ -399,6 +531,17 @@ def set_model_state_dict(
     for fqn, dp in fqn_to_dp.items():
         if fqn not in state_dict:
             continue
+        if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
+            local_ref = getattr(dp, "_sharded_adamw_data", None)
+            if local_ref is not None:
+                local_ref.copy_(
+                    _shard_full_tensor_for_sharded_adamw(
+                        state_dict[fqn],
+                        dp,
+                        dtype=local_ref.dtype,
+                    )
+                )
+            continue
         if dp._owned_data is not None:
             dp._owned_data.copy_(state_dict[fqn].to(dp._orig_dtype).to(dp.device))
         # DDP path: sync the live parameter too.
@@ -443,9 +586,10 @@ def get_optimizer_state_dict(
 ) -> dict:
     """Get optimizer state dict for a DMuon Muon optimizer.
 
-    Produces a dict with three sections:
+    Produces a dict with four state sections:
     - ``"fsdp"``: FSDP2 AdamW state (FQN-keyed, full tensors)
     - ``"dedicated"``: Muon momentum buffers (FQN-keyed, broadcast from owners)
+    - ``"dedicated_adamw"``: dedicated AdamW state for owner-managed base params
     - ``"param_groups"``: Hyperparameters for both groups
 
     Args:
@@ -474,20 +618,22 @@ def get_optimizer_state_dict(
     #    Must iterate ALL dedicated params (not just owned) so all ranks
     #    participate in each broadcast collective.
     all_dedicated = get_dedicated_params(model)
+    dp_to_muon_group = getattr(optimizer, "_dp_to_muon_group_idx", {})
+    muon_dps = [dp for dp in all_dedicated if id(dp) in dp_to_muon_group]
     dedicated_state: dict[str, dict[str, Any]] = {}
 
     # Check if any owner has momentum state (optimizer.step called at least once).
     # Use a flag broadcast to coordinate: if no owner has state, skip all broadcasts.
     any_has_state = any(
-        id(dp) in optimizer.state
-        for dp in all_dedicated
+        id(dp) in optimizer.state and "momentum_buffer" in optimizer.state[id(dp)]
+        for dp in muon_dps
         if _owns_dedicated_optimizer_state(dp)
     )
     has_state_tensor = torch.tensor([int(any_has_state)], device=next(iter(dp_fqns)).device)
     dist.all_reduce(has_state_tensor, op=dist.ReduceOp.MAX)
 
     if has_state_tensor.item() > 0:
-        for dp in all_dedicated:
+        for dp in muon_dps:
             fqn = dp_fqns[dp]
             dp_id = id(dp)
             if (
@@ -504,7 +650,48 @@ def get_optimizer_state_dict(
             if keep:
                 dedicated_state[fqn] = {"momentum_buffer": full_buf}
 
-    # 2. FSDP2 AdamW state: all-gather sharded state tensors.
+    # 2. Dedicated AdamW state: broadcast local owner state.
+    dedicated_adamw_state: dict[str, dict[str, Any]] = {}
+    dp_to_adamw_group = getattr(optimizer, "_dp_to_adamw_group_idx", {})
+    dedicated_adamw_dps = [
+        dp for dp in all_dedicated if id(dp) in dp_to_adamw_group
+    ]
+    any_has_adamw_state = any(
+        id(dp) in optimizer.state
+        for dp in dedicated_adamw_dps
+        if _owns_dedicated_adamw_optimizer_state(dp)
+    )
+    has_adamw_state_tensor = torch.tensor(
+        [int(any_has_adamw_state)], device=next(iter(dp_fqns)).device
+    )
+    dist.all_reduce(has_adamw_state_tensor, op=dist.ReduceOp.MAX)
+
+    if has_adamw_state_tensor.item() > 0:
+        for dp in dedicated_adamw_dps:
+            fqn = dp_fqns[dp]
+            owns_state = _owns_dedicated_adamw_optimizer_state(dp)
+            local_state = optimizer.state.get(id(dp), {}) if owns_state else {}
+            step = _broadcast_dedicated_adamw_step(
+                dp,
+                int(local_state.get("step", 0) or 0) if local_state else None,
+            )
+            entry: dict[str, Any] = {"step": step}
+            for key in ("exp_avg", "exp_avg_sq"):
+                tensor = local_state.get(key) if local_state else None
+                if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
+                    gathered = _all_gather_sharded_adamw_tensor(
+                        tensor, dp, cpu_offload=cpu_offload, keep=keep
+                    )
+                else:
+                    gathered = _broadcast_dedicated_adamw_tensor(
+                        tensor, dp, cpu_offload=cpu_offload, keep=keep
+                    )
+                if keep:
+                    entry[key] = gathered
+            if keep:
+                dedicated_adamw_state[fqn] = entry
+
+    # 3. FSDP2 AdamW state: all-gather sharded state tensors.
     dp_mesh = _get_dp_mesh(model)
     fsdp_state: dict[str, dict[str, Any]] = {}
 
@@ -535,7 +722,7 @@ def get_optimizer_state_dict(
         if keep:
             fsdp_state[fqn] = fsdp_entry
 
-    # 3. Param group hyperparameters (without tensor refs).
+    # 4. Param group hyperparameters (without tensor refs).
     if keep:
         param_groups = [
             {k: v for k, v in g.items() if k != "params"}
@@ -547,6 +734,7 @@ def get_optimizer_state_dict(
     return {
         "fsdp": fsdp_state,
         "dedicated": dedicated_state,
+        "dedicated_adamw": dedicated_adamw_state,
         "param_groups": param_groups,
     }
 
@@ -572,13 +760,53 @@ def set_optimizer_state_dict(
             if fqn not in fqn_to_dp:
                 continue
             dp = fqn_to_dp[fqn]
-            if _owns_dedicated_optimizer_state(dp) and "momentum_buffer" in state:
+            if "momentum_buffer" in state:
                 buf = state["momentum_buffer"].to(dp.device)
                 m, _n = _momentum_matrix_shape(dp)
                 buf = buf.view(m, -1)
-                optimizer.state[id(dp)] = {"momentum_buffer": buf}
+                opt_state = optimizer.state.setdefault(id(dp), {})
+                if _owns_dedicated_optimizer_state(dp):
+                    opt_state["momentum_buffer"] = buf
+                if getattr(dp, "tp_group", None) is not None and dp._owned_data is not None:
+                    opt_state["tp_local_momentum_buffer"] = _tp_local_momentum_from_full(
+                        buf.float(),
+                        dp,
+                    )
 
-    # 2. FSDP2 AdamW state: shard full tensors back to local shards.
+    # 2. Dedicated AdamW state: restore on local owners.
+    if "dedicated_adamw" in state_dict:
+        fqn_to_dp = {fqn: dp for dp, fqn in dp_fqns.items()}
+        for fqn, saved_state in state_dict["dedicated_adamw"].items():
+            dp = fqn_to_dp.get(fqn)
+            if dp is None or not _owns_dedicated_adamw_optimizer_state(dp):
+                continue
+            opt_state: dict[str, Any] = {}
+            for key, val in saved_state.items():
+                if (
+                    isinstance(val, torch.Tensor)
+                    and getattr(dp, "_dmuon_route", None) == "sharded_adamw"
+                    and key in {"exp_avg", "exp_avg_sq"}
+                ):
+                    local_ref = getattr(dp, "_sharded_adamw_data", None)
+                    if local_ref is None:
+                        continue
+                    opt_state[key] = _shard_full_tensor_for_sharded_adamw(
+                        val,
+                        dp,
+                        dtype=local_ref.dtype,
+                    )
+                elif isinstance(val, torch.Tensor):
+                    target = (
+                        getattr(dp, "_sharded_adamw_data", None)
+                        if getattr(dp, "_dmuon_route", None) == "sharded_adamw"
+                        else dp._owned_data
+                    )
+                    opt_state[key] = val.to(dp.device).to(target.dtype)
+                else:
+                    opt_state[key] = val
+            optimizer.state[id(dp)] = opt_state
+
+    # 3. FSDP2 AdamW state: shard full tensors back to local shards.
     if "fsdp" in state_dict:
         dp_mesh = _get_dp_mesh(model)
         # Build FQN -> FSDP param object mapping
@@ -616,7 +844,7 @@ def set_optimizer_state_dict(
                     opt_state[key] = val
             optimizer.state[p] = opt_state
 
-    # 3. Load param group hyperparameters.
+    # 4. Load param group hyperparameters.
     if "param_groups" in state_dict:
         saved_groups = state_dict["param_groups"]
         current_groups = optimizer.param_groups

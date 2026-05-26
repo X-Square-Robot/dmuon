@@ -154,18 +154,7 @@
 
 ---
 
-??? question "How do I cite DMuon?"
-    **DMuon itself:**
-
-    ```bibtex
-    @misc{DMuon,
-      title   = {DMuon: Dedicated Parameter Ownership for Distributed Muon Training},
-      author  = {Xingchen Liu},
-      year    = {2026},
-      url     = {https://github.com/StarrickLiu/dmuon}
-    }
-    ```
-
+??? question "What related work should I cite?"
     **Gram Newton-Schulz** (if using the default `"gram"` backend):
 
     ```bibtex

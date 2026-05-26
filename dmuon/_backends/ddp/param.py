@@ -34,6 +34,49 @@ import torch.nn as nn
 
 from dmuon._core.owner_rank import OwnerCoord, OwnerRankLike, normalize_owner_rank
 
+try:
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor._dtensor_spec import DTensorSpec
+except ImportError:
+    DTensor = None
+    DTensorSpec = None
+
+try:
+    from torch.distributed.tensor import Shard as _Shard
+except ImportError:
+    _Shard = None
+
+
+def _from_local_no_grad(tensor: torch.Tensor, spec: "DTensorSpec") -> "DTensor":
+    """Wrap a local tensor as DTensor without gradient tracking."""
+    return DTensor.from_local(tensor, spec.mesh, spec.placements, run_check=False)
+
+
+def _normalize_tp_local_grad(param: "DedicatedParamDDP", grad: torch.Tensor) -> torch.Tensor:
+    """Return the TP-local gradient shard expected by DDP reduce."""
+    orig_size = torch.Size(param._orig_size)
+    grad_size = torch.Size(grad.shape)
+    if grad_size == orig_size:
+        return grad
+
+    if (
+        param.tp_group is not None
+        and param.shard_dim is not None
+        and grad_size == torch.Size(param.full_shape)
+    ):
+        shard_dim = param.shard_dim
+        local_extent = orig_size[shard_dim]
+        start = param.tp_group.rank() * local_extent
+        return grad.narrow(shard_dim, start, local_extent)
+
+    if grad.numel() == orig_size.numel():
+        return grad.reshape(orig_size)
+
+    raise RuntimeError(
+        f"{param.param_name}: gradient shape {tuple(grad_size)} cannot be "
+        f"normalized to TP-local shape {tuple(orig_size)}"
+    )
+
 
 class DedicatedParamDDP:
     """DDP-path dedicated parameter.
@@ -52,6 +95,7 @@ class DedicatedParamDDP:
         dp_group: dist.ProcessGroup,
         device: torch.device,
         compute_dtype: Optional[torch.dtype] = None,
+        tp_owner_local_rank: int = 0,
     ):
         self.module = module
         self.param_name = param_name
@@ -68,23 +112,40 @@ class DedicatedParamDDP:
         self._owner_global_rank: int = dist.get_global_rank(dp_group, self.owner_shard)
         self._owner_replicate_global_rank: Optional[int] = None  # unused in 1D
 
-        # DDP path does not support DTensor on dedicated params (TP + DDP is
-        # out of scope). Keep the attribute for interface parity with
-        # DedicatedParam so downstream code (Muon, checkpoint) does not
-        # special-case.
-        self.is_dtensor: bool = False
-        self._tp_spec = None
+        self.is_dtensor: bool = DTensor is not None and isinstance(param, DTensor)
+        if self.is_dtensor:
+            self._tp_spec = param._spec
+            local_data = param._local_tensor
+        else:
+            self._tp_spec = None
+            local_data = param.data
 
-        local_data = param.data
         self._orig_size: torch.Size = local_data.size()
         self._orig_dtype: torch.dtype = local_data.dtype
         self._compute_dtype: Optional[torch.dtype] = compute_dtype
         self._requires_grad: bool = param.requires_grad
 
         self.numel: int = self._orig_size.numel()
-        self.shard_dim: Optional[int] = None
-        self.full_shape: torch.Size = self._orig_size
-        self.tp_group: Optional[dist.ProcessGroup] = None
+        self.shard_dim: Optional[int] = self._compute_shard_dim()
+        self.full_shape: torch.Size = self._compute_full_shape()
+        self.tp_group: Optional[dist.ProcessGroup] = self._compute_tp_group()
+        if self.tp_group is not None:
+            if not 0 <= tp_owner_local_rank < self.tp_group.size():
+                raise ValueError(
+                    f"{param_name}: tp_owner_local_rank={tp_owner_local_rank} "
+                    f"outside TP group size {self.tp_group.size()}"
+                )
+            self._tp_owner_local_rank: int = tp_owner_local_rank
+            self._tp_owner_global_rank: Optional[int] = dist.get_global_rank(
+                self.tp_group, self._tp_owner_local_rank
+            )
+            self.is_tp_owner: bool = (
+                self.tp_group.rank() == self._tp_owner_local_rank
+            )
+        else:
+            self._tp_owner_local_rank = 0
+            self._tp_owner_global_rank = None
+            self.is_tp_owner = False
 
         # Storage: every rank clones the current parameter value as the
         # authoritative copy for NS update. On non-owner ranks this is a
@@ -103,6 +164,36 @@ class DedicatedParamDDP:
 
         # Accumulated gradient for no_sync gradient accumulation (all ranks)
         self._accumulated_grad: Optional[torch.Tensor] = None
+
+        # TP full-matrix buffers.  Same duck-typed surface as the FSDP2
+        # DedicatedParam so Muon can reuse the TP gather / NS / scatter path.
+        self._tp_full_grad: Optional[torch.Tensor] = None
+        self._tp_full_delta: Optional[torch.Tensor] = None
+        self._tp_wd_factor: float = 1.0
+
+    # ---- cached-attr helpers ----------------------------------------------
+
+    def _compute_tp_group(self) -> Optional[dist.ProcessGroup]:
+        if self.is_dtensor and self._tp_spec is not None:
+            return self._tp_spec.mesh.get_group(mesh_dim=0)
+        return None
+
+    def _compute_shard_dim(self) -> Optional[int]:
+        if self.is_dtensor and self._tp_spec is not None and _Shard is not None:
+            for p in self._tp_spec.placements:
+                if isinstance(p, _Shard):
+                    return p.dim
+        return None
+
+    def _compute_full_shape(self) -> torch.Size:
+        if self.is_dtensor and self._tp_spec is not None and _Shard is not None:
+            shape = list(self._orig_size)
+            for p in self._tp_spec.placements:
+                if isinstance(p, _Shard):
+                    tp_size = self._tp_spec.mesh.size(0)
+                    shape[p.dim] *= tp_size
+            return torch.Size(shape)
+        return self._orig_size
 
     # ---- interface parity with DedicatedParam (all no-ops on DDP path) ----
 
@@ -129,6 +220,34 @@ class DedicatedParamDDP:
         # path the live parameter IS the unsharded view.
         return self._orig_param
 
+    def local_grad_for_reduce(self, grad: torch.Tensor) -> torch.Tensor:
+        """Convert a live parameter grad to the local tensor reduce expects."""
+        if self.is_dtensor and DTensor is not None and isinstance(grad, DTensor):
+            if (
+                self._tp_spec is not None
+                and tuple(grad._spec.placements) != tuple(self._tp_spec.placements)
+            ):
+                grad = grad.redistribute(placements=self._tp_spec.placements)
+            grad = grad._local_tensor
+        return _normalize_tp_local_grad(self, grad)
+
+    def clear_live_grad(self) -> None:
+        self._orig_param.grad = None
+
+    def copy_owned_to_live(self) -> None:
+        """Copy ``_owned_data`` into the live Tensor or DTensor local shard."""
+        if self.is_dtensor:
+            self._orig_param._local_tensor.copy_(self._owned_data)
+        else:
+            self._orig_param.data.copy_(self._owned_data)
+
+    def set_live_grad_from_local(self, grad: torch.Tensor) -> None:
+        """Install a local accumulated grad back onto the live parameter."""
+        if self.is_dtensor:
+            self._orig_param.grad = _from_local_no_grad(grad, self._tp_spec)
+        else:
+            self._orig_param.grad = grad
+
     # ---- gradient reduction ----
 
     def reduce_grad(self, async_op: bool = False) -> Optional[dist.Work]:
@@ -143,6 +262,7 @@ class DedicatedParamDDP:
         grad = self._orig_param.grad
         if grad is None:
             return None
+        grad = self.local_grad_for_reduce(grad)
         grad = grad.data.contiguous()
         return dist.reduce(
             grad,
@@ -156,8 +276,9 @@ class DedicatedParamDDP:
         """Owner caches the reduced gradient; all ranks clear ``.grad``."""
         grad = self._orig_param.grad
         if self.is_owner and grad is not None:
+            grad = self.local_grad_for_reduce(grad)
             self._reduced_grad = grad.data.clone()
-        self._orig_param.grad = None
+        self.clear_live_grad()
 
     def clear_reduced_grad(self) -> None:
         """Clear the owner-side reduced gradient after the optimizer step."""
@@ -171,11 +292,11 @@ class DedicatedParamDDP:
 
         Normally **not** called in isolation — :class:`DedicatedParamGroupDDP`
         batches this across all params via a single coalesced broadcast.
-        Exposed for tests and for the sync fallback path.
+        Exposed for tests and synchronous post-step publish.
         """
         dist.broadcast(
             self._owned_data,
             src=self._owner_global_rank,
             group=self.dp_group,
         )
-        self._orig_param.data.copy_(self._owned_data)
+        self.copy_owned_to_live()

@@ -38,7 +38,6 @@ import dmuon
 from dmuon.utils import (
     broadcast_all_updates,
     broadcast_all_updates_async,
-    update_replicate_fallback,
     wait_all_replicate_broadcasts,
 )
 from test_tp_alignment import (  # noqa: E402
@@ -134,15 +133,7 @@ def _make_optimizer(model: torch.nn.Module, mode: str) -> dmuon.Muon:
 
 @contextlib.contextmanager
 def _tp_scatter_env(enabled: bool):
-    old = os.environ.get("DMUON_TP_SCATTER_ASYNC")
-    os.environ["DMUON_TP_SCATTER_ASYNC"] = "1" if enabled else "0"
-    try:
-        yield
-    finally:
-        if old is None:
-            os.environ.pop("DMUON_TP_SCATTER_ASYNC", None)
-        else:
-            os.environ["DMUON_TP_SCATTER_ASYNC"] = old
+    yield
 
 
 def _param_key(idx: int, dp: Any) -> str:
@@ -435,9 +426,6 @@ def _manual_update_ready(
     _trace(f"manual_update mode={mode} adamw begin")
     optimizer._step_adamw()
     _trace(f"manual_update mode={mode} adamw done")
-    _trace(f"manual_update mode={mode} fallback begin")
-    update_replicate_fallback(model)
-    _trace(f"manual_update mode={mode} fallback done")
     if _replicate_async(mode):
         _trace(f"manual_update mode={mode} broadcast_async begin")
         broadcast_all_updates_async(model)

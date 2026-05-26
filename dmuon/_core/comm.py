@@ -27,11 +27,15 @@ class DedicatedCommContext:
             the shard (``dp_group``) dimension.
         reduce_stream: high-priority stream for NCCL reduce kernels on the
             shard dimension.
+        replicate_reduce_stream: default-priority stream for HSDP Stage-2
+            replicate-axis reduce/all-reduce. It is intentionally separate
+            from the post-step publish stream so large AdamW-route all-reduces
+            do not sit in front of next-forward Muon publishes.
         replicate_broadcast_stream: default-priority stream reserved for the
-            inter-replicate-group broadcast used by HSDP-native Muon
-            (Phase C).  Initialised here so Phase A code can reference it
-            without conditional guards; it stays idle until Phase C wires
-            async forward broadcast.
+            post-step inter-replicate-group broadcast used by HSDP-native Muon
+            and TP post-step scatter. Initialised here so Phase A code can
+            reference it without conditional guards; it stays idle until those
+            paths are enabled.
 
     Process groups:
         replicate_group: ``ProcessGroup`` spanning the replicate dimension of
@@ -51,20 +55,24 @@ class DedicatedCommContext:
         post_backward_final_callback_queued: guards the callback so it is
             queued at most once per backward pass.
 
-    Rolling reduce drain (1-outstanding):
+    Rolling Stage-1 drain (1-outstanding):
         last_reduced_group: most recently ``reduce_grads``-dispatched group
-            whose ``_pending_reduce`` has not been drained yet.  Each new
-            ``_run_post_backward`` waits on this group before dispatching
-            its own reduce, so per-rank backward memory peaks at ~2 groups'
-            full gradients instead of accumulating all N groups until the
-            final ``wait_all_reduces`` / root callback.  Reset by the root
-            post-backward callback at the end of every backward pass.
+            whose Stage-1 shard reduce has not been safety-drained yet.  Each
+            new ``_run_post_backward`` waits only on that Stage-1 event before
+            dispatching its own reduce, mirroring FSDP2's
+            ``reduce_scatter_state`` buffer-lifetime wait.  HSDP Stage-2
+            replicate reduce/all-reduce is intentionally *not* waited here; it
+            is drained at the optimizer/root-post-backward boundary.  Reset by
+            the root post-backward callback at the end of every backward pass.
     """
 
     def __init__(
         self,
         device: torch.device,
         replicate_group: Optional[dist.ProcessGroup] = None,
+        *,
+        tp_buffer_reuse: bool | str = False,
+        replicate_broadcast_bucket_mb: float = 0.0,
     ):
         """Build the shared communication context for one model's
         dedicated-ownership groups.
@@ -75,6 +83,11 @@ class DedicatedCommContext:
                 dimension of the HSDP 2D mesh. ``None`` in 1D shard-only
                 mode (the default); downstream code short-circuits the
                 replicate-dim reduce/broadcast when this is ``None``.
+            tp_buffer_reuse: Whether TP gather/scatter should reuse per-param
+                scratch buffers. Accepts ``False``/``True`` or ``"gather"``,
+                ``"scatter"``, ``"all"``.
+            replicate_broadcast_bucket_mb: Optional HSDP post-step publish
+                bucket size in MiB. ``0`` keeps one coalesced publish per group.
 
         Normally constructed by :func:`dmuon.dedicate_params`, not by
         user code directly.
@@ -87,8 +100,16 @@ class DedicatedCommContext:
         # resources than intra-node AG/RS.  We follow the same convention so
         # the Phase C scheduler can issue broadcasts on this stream without
         # starving shard-dim collectives.
+        self.replicate_reduce_stream = torch.cuda.Stream(device=device)
         self.replicate_broadcast_stream = torch.cuda.Stream(device=device)
         self.replicate_group: Optional[dist.ProcessGroup] = replicate_group
+        self.tp_buffer_reuse = self._normalize_tp_buffer_reuse(tp_buffer_reuse)
+        if replicate_broadcast_bucket_mb <= 0:
+            self.replicate_broadcast_bucket_bytes = 0
+        else:
+            self.replicate_broadcast_bucket_bytes = int(
+                float(replicate_broadcast_bucket_mb) * 1024 * 1024
+            )
         self.post_forward_order: list = []  # DedicatedParamGroup | DedicatedParamGroupDDP
         self.all_states: list[DedicatedState] = []
         self.post_backward_final_callback_queued: bool = False
@@ -97,6 +118,36 @@ class DedicatedCommContext:
         # it holds whichever concrete group type the active backend uses
         # (FSDP2 or DDP), same convention as ``post_forward_order``.
         self.last_reduced_group = None
+
+    @staticmethod
+    def _normalize_tp_buffer_reuse(value: bool | str) -> str:
+        if isinstance(value, bool):
+            return "all" if value else "off"
+        mode = str(value).strip().lower()
+        aliases = {
+            "": "off",
+            "0": "off",
+            "false": "off",
+            "no": "off",
+            "off": "off",
+            "1": "all",
+            "true": "all",
+            "yes": "all",
+            "on": "all",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"off", "all", "gather", "scatter"}:
+            raise ValueError(
+                "tp_buffer_reuse must be one of False, True, 'off', "
+                "'gather', 'scatter', or 'all'"
+            )
+        return mode
+
+    def tp_gather_buffer_reuse_enabled(self) -> bool:
+        return self.tp_buffer_reuse in {"all", "gather"}
+
+    def tp_scatter_buffer_reuse_enabled(self) -> bool:
+        return self.tp_buffer_reuse in {"all", "scatter"}
 
     def reset_post_forward_order(self) -> None:
         """Clear post-forward order. Call at the start of each forward pass."""

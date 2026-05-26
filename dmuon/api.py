@@ -1,4 +1,4 @@
-"""Public API: dedicate_params and dedicate_params_ddp."""
+"""Public API: dedicate_params and DDP variants."""
 
 import logging
 from collections import defaultdict
@@ -6,11 +6,15 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
-from torch.distributed import DeviceMesh
+try:
+    from torch.distributed import DeviceMesh
+except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
+    from torch.distributed.device_mesh import DeviceMesh
 
 from ._backends.ddp import DedicatedParamDDP, DedicatedParamGroupDDP
 from ._backends.fsdp2 import DedicatedParam, DedicatedParamGroup
 from ._core.comm import DedicatedCommContext
+from ._core.internal_utils import unsafe_setattr_param
 from ._core.owner_rank import normalize_owner_rank
 from ._core.partition import _extract_layer_id, compute_balanced_assignment
 from ._core.state import DedicatedState
@@ -26,6 +30,81 @@ def _find_parent_module(model: nn.Module, target_param: nn.Parameter) -> tuple[n
             if param is target_param:
                 return module, param_name
     raise ValueError(f"Parameter not found in model: {target_param.shape}")
+
+
+def _find_parent_modules(model: nn.Module, target_param: nn.Parameter) -> list[tuple[nn.Module, str]]:
+    """Find all direct module attributes that reference a parameter.
+
+    Tied embeddings expose the same ``nn.Parameter`` through multiple parent
+    modules.  Dedicated ownership must replace every alias with the same
+    placeholder/full-matrix parameter, otherwise one alias remains outside both
+    DMuon and FSDP management.
+    """
+
+    parents: list[tuple[nn.Module, str]] = []
+    for _module_name, module in model.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if param is target_param:
+                parents.append((module, param_name))
+    if not parents:
+        raise ValueError(f"Parameter not found in model: {target_param.shape}")
+    return parents
+
+
+def _module_fqn_map(model: nn.Module) -> dict[nn.Module, str]:
+    return {module: name for name, module in model.named_modules()}
+
+
+def _link_forward_prefetch_states(
+    model: nn.Module,
+    states: list[DedicatedState],
+    comm_ctx: DedicatedCommContext,
+) -> None:
+    """Link DedicatedState objects in model registration order.
+
+    Owner assignment may iterate parameters by load-balance order, which is not
+    necessarily the order in which modules run forward.  Forward prefetch must
+    target the next module in the actual model walk; otherwise unshard
+    collectives are issued too late and show up as exposed communication before
+    each layer.
+    """
+
+    module_order = {id(module): idx for idx, module in enumerate(model.modules())}
+    ordered = sorted(
+        states,
+        key=lambda state: module_order.get(id(state.module), len(module_order)),
+    )
+    for state in ordered:
+        state._next_group = None
+    for idx in range(len(ordered) - 1):
+        ordered[idx]._next_group = ordered[idx + 1].group
+    comm_ctx.all_states[:] = ordered
+
+
+def _lowest_common_ancestor_module(
+    model: nn.Module, modules: list[nn.Module]
+) -> nn.Module:
+    """Return the lowest module that contains every module in ``modules``.
+
+    Tied parameters can be read through aliases that live in different parts of
+    the model, for example input embeddings and the output head.  A Z3-style
+    reshard-after-forward policy is only valid if the hook boundary spans every
+    alias use.
+    """
+
+    if not modules:
+        return model
+
+    fqns = _module_fqn_map(model)
+    paths = [fqns[module].split(".") if fqns[module] else [] for module in modules]
+    prefix: list[str] = []
+    for parts in zip(*paths):
+        if all(part == parts[0] for part in parts):
+            prefix.append(parts[0])
+        else:
+            break
+    common_path = ".".join(prefix)
+    return model.get_submodule(common_path) if common_path else model
 
 
 def _find_layer_module(
@@ -129,6 +208,7 @@ def _find_hook_module(
 
 HookBoundaryResolver = Callable[[str, nn.Parameter], Optional[nn.Module]]
 AssignmentGroupKeyFn = Callable[[str, nn.Parameter], Optional[str]]
+RouteHintFn = Callable[[str, nn.Parameter], Optional[str]]
 
 
 def _resolve_hook_module(
@@ -178,14 +258,18 @@ def dedicate_params(
     hook_boundary_strict: bool = True,
     hook_boundary_resolver: Optional[HookBoundaryResolver] = None,
     assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
+    route_hint_fn: Optional[RouteHintFn] = None,
     max_owners_per_group: Optional[int] = None,
+    owner_strategy: str = "lpt",
+    tp_buffer_reuse: bool | str = False,
+    replicate_broadcast_bucket_mb: float = 0.0,
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
     Parameters satisfying ``predicate`` are assigned to owner ranks via a
     balanced partition algorithm. Each marked parameter will be automatically
     ignored by subsequent ``fully_shard()`` calls (requires the monkey-patch
-    from :mod:`dmuon.patch`).
+    installed automatically by :mod:`dmuon`).
 
     Communication hooks are registered at the **layer level** (e.g., on
     ``model.layers[i]``), not on individual sub-modules. This minimizes
@@ -196,7 +280,7 @@ def dedicate_params(
     ``replicate_mesh`` (i.e. the TP axis), DMuon will — at optimizer step
     time — gather the full matrix at a designated TP owner, run
     Newton-Schulz locally, and scatter the per-shard update back to
-    the TP group.  No TP-specific API is required; simply pass the DP
+    the TP group.  No TP mesh argument is required; simply pass the DP
     slice of your 3D mesh as ``mesh`` / ``replicate_mesh``, matching the
     FSDP2 convention (``fully_shard(mesh=mesh["replicate","shard"])``).
     See ``docs/internal/research/tp_design.md`` §5.
@@ -251,8 +335,21 @@ def dedicate_params(
         assignment_group_key_fn: Optional ``(param_fqn, param) -> key`` selector
             used by the owner assignment pass. Use this to align owner packing
             with communication boundaries.
+        route_hint_fn: Optional ``(param_fqn, param) -> route`` selector used
+            before parameters are replaced by DMuon placeholders.  This is
+            required for DMuon-managed sharded base AdamW parameters because
+            their initial local shard must be captured while the full tensor
+            is still present on the rank.  Supported route hints are
+            ``"muon"``, ``"adamw"``, and ``"sharded_adamw"``.
         max_owners_per_group: Optional cap on distinct owner slots used by one
             assignment group.
+        owner_strategy: DP/HSDP owner assignment strategy. ``"lpt"`` is the
+            production default; ``"round_robin"`` and ``"rank0"`` are intended
+            for benchmark ablations.
+        tp_buffer_reuse: Optional TP gather/scatter scratch-buffer reuse policy.
+            Accepts ``False``/``True`` or ``"gather"``, ``"scatter"``, ``"all"``.
+        replicate_broadcast_bucket_mb: Optional HSDP post-step publish bucket
+            size in MiB. ``0`` keeps one coalesced publish per hook group.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its DP owner
@@ -268,6 +365,7 @@ def dedicate_params(
     result = compute_balanced_assignment(
         model, mesh, predicate,
         replicate_mesh=replicate_mesh,
+        owner_strategy=owner_strategy,
         assignment_group_key_fn=assignment_group_key_fn,
         max_owners_per_group=max_owners_per_group,
     )
@@ -324,22 +422,33 @@ def dedicate_params(
     replicate_group = replicate_mesh.get_group() if replicate_mesh is not None else None
     device_type = mesh.device_type
     device = torch.device(device_type, torch.cuda.current_device())
-    comm_ctx = DedicatedCommContext(device, replicate_group=replicate_group)
+    comm_ctx = DedicatedCommContext(
+        device,
+        replicate_group=replicate_group,
+        tp_buffer_reuse=tp_buffer_reuse,
+        replicate_broadcast_bucket_mb=replicate_broadcast_bucket_mb,
+    )
 
     # 4. Group by layer module and create DedicatedParam + DedicatedState
     layer_to_dparams: dict[nn.Module, list[DedicatedParam]] = defaultdict(list)
     param_to_fqn = {param: name for name, param in model.named_parameters()}
 
     for param, coord in normalized.items():
-        parent_module, param_name = _find_parent_module(model, param)
-        layer_module = _resolve_hook_module(
-            model,
-            param,
-            param_fqn=param_to_fqn[param],
-            hook_boundary_predicate=hook_boundary_predicate,
-            hook_boundary_resolver=hook_boundary_resolver,
-            strict=hook_boundary_strict,
-        )
+        parent_modules = _find_parent_modules(model, param)
+        parent_module, param_name = parent_modules[0]
+        if len(parent_modules) > 1 and reshard_after_forward:
+            layer_module = _lowest_common_ancestor_module(
+                model, [module for module, _name in parent_modules]
+            )
+        else:
+            layer_module = _resolve_hook_module(
+                model,
+                param,
+                param_fqn=param_to_fqn[param],
+                hook_boundary_predicate=hook_boundary_predicate,
+                hook_boundary_resolver=hook_boundary_resolver,
+                strict=hook_boundary_strict,
+            )
         if (
             is_tp_sharded(param, dp_mesh_dim_names)
             and param not in result.tp_owners
@@ -360,7 +469,20 @@ def dedicate_params(
             tp_owner_local_rank=(
                 result.tp_owners[param] if param in result.tp_owners else 0
             ),
+            route_hint=(
+                route_hint_fn(param_to_fqn[param], param)
+                if route_hint_fn is not None
+                else getattr(param, "_dmuon_route_hint", None)
+            ),
         )
+        aliases = [
+            (module, name)
+            for module, name in parent_modules[1:]
+        ]
+        if aliases:
+            d_param._alias_modules = aliases
+            for alias_module, alias_name in aliases:
+                unsafe_setattr_param(alias_module, alias_name, d_param._placeholder)
         layer_to_dparams[layer_module].append(d_param)
 
     all_states: list[DedicatedState] = []
@@ -372,9 +494,9 @@ def dedicate_params(
         layer_module._dedicated_state = state
         all_states.append(state)
 
-    # Link states for forward prefetch: each state knows the next layer's group
-    for i in range(len(all_states) - 1):
-        all_states[i]._next_group = all_states[i + 1].group
+    # Link states for forward prefetch in actual module order, not owner
+    # assignment order.
+    _link_forward_prefetch_states(model, all_states, comm_ctx)
 
     # Store comm_ctx on model for external access (e.g., reset in training loop)
     model._dedicated_comm_ctx = comm_ctx
@@ -392,6 +514,7 @@ def dedicate_params_ddp(
     hook_boundary_resolver: Optional[HookBoundaryResolver] = None,
     assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
     max_owners_per_group: Optional[int] = None,
+    owner_strategy: str = "lpt",
 ) -> dict[nn.Parameter, int]:
     """DDP-path variant of :func:`dedicate_params`.
 
@@ -426,6 +549,7 @@ def dedicate_params_ddp(
         hook_boundary_resolver: Same as :func:`dedicate_params`.
         assignment_group_key_fn: Same as :func:`dedicate_params`.
         max_owners_per_group: Same as :func:`dedicate_params`.
+        owner_strategy: Same as :func:`dedicate_params`.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its owner
@@ -441,6 +565,7 @@ def dedicate_params_ddp(
         model,
         mesh,
         predicate,
+        owner_strategy=owner_strategy,
         assignment_group_key_fn=assignment_group_key_fn,
         max_owners_per_group=max_owners_per_group,
     )
@@ -451,8 +576,9 @@ def dedicate_params_ddp(
     if result.tp_owners:
         raise NotImplementedError(
             "dedicate_params_ddp does not support TP-sharded DTensor "
-            "dedicated parameters; use dedicate_params(..., mesh=DP, "
-            "replicate_mesh=...) for the FSDP2/HSDP TP path."
+            "dedicated parameters; use dedicate_params_ddp_tp(...) for "
+            "DDP+TP or dedicate_params(..., mesh=DP, replicate_mesh=...) "
+            "for the FSDP2/HSDP TP path."
         )
 
     normalized: dict[nn.Parameter, tuple[int, int]] = {
@@ -525,8 +651,138 @@ def dedicate_params_ddp(
         layer_module._dedicated_state = state
         all_states.append(state)
 
-    for i in range(len(all_states) - 1):
-        all_states[i]._next_group = all_states[i + 1].group
+    _link_forward_prefetch_states(model, all_states, comm_ctx)
+
+    model._dedicated_comm_ctx = comm_ctx
+    return assignment
+
+
+def dedicate_params_ddp_tp(
+    model: nn.Module,
+    mesh: DeviceMesh,
+    predicate: Callable[[str, nn.Parameter], bool],
+    compute_dtype: Optional[torch.dtype] = None,
+    hook_boundary_predicate: Optional[Callable[[nn.Module], bool]] = None,
+    hook_boundary_strict: bool = True,
+    hook_boundary_resolver: Optional[HookBoundaryResolver] = None,
+    assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
+    max_owners_per_group: Optional[int] = None,
+    owner_strategy: str = "lpt",
+    tp_buffer_reuse: bool | str = False,
+) -> dict[nn.Parameter, int]:
+    """DDP-path variant that allows TP-sharded DTensor dedicated params.
+
+    This API is intentionally separate from :func:`dedicate_params_ddp` so
+    pure DDP keeps rejecting DTensor parameters by default.  It is the
+    supported ``DDP + TP`` path:
+
+    1. Apply tensor parallelism first.
+    2. Call ``dedicate_params_ddp_tp(model, mesh["dp"], ...)``.
+    3. Call ``replicate_tp(model, mesh["dp"])`` for non-dedicated params.
+
+    Each TP-sharded dedicated parameter still has a DP owner.  All TP ranks
+    in that DP-owner replica gather their local reduced grads to a TP owner
+    for full-matrix Newton-Schulz, scatter update shards back, then DDP
+    broadcasts those updated shards across the DP mesh.
+    """
+    if mesh.ndim != 1:
+        raise ValueError(
+            f"dedicate_params_ddp_tp requires a 1D DP mesh; got ndim={mesh.ndim}."
+        )
+
+    result = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate,
+        owner_strategy=owner_strategy,
+        assignment_group_key_fn=assignment_group_key_fn,
+        max_owners_per_group=max_owners_per_group,
+    )
+    assignment = result.dp_owners
+    if not assignment:
+        logger.warning("dedicate_params_ddp_tp: no parameters matched the predicate")
+        return assignment
+
+    dp_names = set(mesh.mesh_dim_names or ())
+    dp_mesh_dim_names = frozenset(dp_names)
+    normalized: dict[nn.Parameter, tuple[int, int]] = {
+        param: normalize_owner_rank(owner) for param, owner in assignment.items()
+    }
+
+    shard_size = mesh.size()
+    rank_loads: dict[tuple[int, int], int] = defaultdict(int)
+    for param, coord in normalized.items():
+        rank_loads[coord] += param.numel()
+    loads_list = [rank_loads.get((s, 0), 0) for s in range(shard_size)]
+    max_load = max(loads_list) if loads_list else 0
+    min_load = min(loads_list) if loads_list else 0
+    imbalance = (max_load - min_load) / max(max_load, 1)
+    logger.info(
+        f"dedicate_params_ddp_tp: {len(normalized)} params over {shard_size} "
+        f"DP ranks, TP-sharded={len(result.tp_owners)}, "
+        f"imbalance={imbalance:.1%}, loads={loads_list}"
+    )
+
+    for param, coord in normalized.items():
+        param._dedicated_owner_rank = coord
+        param._dedicated_mode = "ddp_tp"
+
+    dp_group = mesh.get_group()
+    device_type = mesh.device_type
+    device = torch.device(device_type, torch.cuda.current_device())
+    comm_ctx = DedicatedCommContext(
+        device,
+        replicate_group=None,
+        tp_buffer_reuse=tp_buffer_reuse,
+    )
+
+    layer_to_dparams: dict[nn.Module, list[DedicatedParamDDP]] = defaultdict(list)
+    param_to_fqn = {param: name for name, param in model.named_parameters()}
+
+    for param, coord in normalized.items():
+        parent_module, param_name = _find_parent_module(model, param)
+        layer_module = _resolve_hook_module(
+            model,
+            param,
+            param_fqn=param_to_fqn[param],
+            hook_boundary_predicate=hook_boundary_predicate,
+            hook_boundary_resolver=hook_boundary_resolver,
+            strict=hook_boundary_strict,
+        )
+        if (
+            is_tp_sharded(param, dp_mesh_dim_names)
+            and param not in result.tp_owners
+        ):
+            raise RuntimeError(
+                f"{param_name}: TP-sharded DDP+TP dedicated parameter is "
+                "missing from AssignmentResult.tp_owners"
+            )
+        d_param = DedicatedParamDDP(
+            param=param,
+            module=parent_module,
+            param_name=param_name,
+            owner_rank=coord,
+            dp_group=dp_group,
+            device=device,
+            compute_dtype=compute_dtype,
+            tp_owner_local_rank=(
+                result.tp_owners[param] if param in result.tp_owners else 0
+            ),
+        )
+        layer_to_dparams[layer_module].append(d_param)
+
+    all_states: list[DedicatedState] = []
+    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
+    for layer_module, d_params in layer_to_dparams.items():
+        group = DedicatedParamGroupDDP(d_params, comm_ctx)
+        group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
+        state = DedicatedState(
+            layer_module, group, comm_ctx, reshard_after_forward=False
+        )
+        layer_module._dedicated_state = state
+        all_states.append(state)
+
+    _link_forward_prefetch_states(model, all_states, comm_ctx)
 
     model._dedicated_comm_ctx = comm_ctx
     return assignment

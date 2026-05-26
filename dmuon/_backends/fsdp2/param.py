@@ -35,6 +35,63 @@ def _make_contiguous_stride(size: torch.Size) -> tuple[int, ...]:
     return tuple(stride)
 
 
+def _normalize_dmuon_route_hint(route: Optional[str]) -> str:
+    if route is None:
+        return "muon"
+    route = str(route).strip().lower()
+    aliases = {
+        "matrix": "muon",
+        "matrix_optimizer": "muon",
+        "base": "adamw",
+        "base_adamw": "adamw",
+        "dedicated_adamw": "adamw",
+        "sharded": "sharded_adamw",
+        "base_sharded": "sharded_adamw",
+        "sharded_collective": "sharded_adamw",
+        "base_sharded_adamw": "sharded_adamw",
+    }
+    route = aliases.get(route, route)
+    if route not in {"muon", "adamw", "sharded_adamw"}:
+        raise ValueError(
+            "DMuon route hint must be one of 'muon', 'adamw', or "
+            f"'sharded_adamw', got {route!r}"
+        )
+    return route
+
+
+def _normalize_tp_local_grad(param: "DedicatedParam", grad: torch.Tensor) -> torch.Tensor:
+    """Return the TP-local gradient shard expected by dedicated reduce.
+
+    Normal DTensor autograd for a sharded parameter gives a local tensor whose
+    shape matches ``param._orig_size``.  Some custom/redistribute paths can
+    instead materialize a replicated full logical gradient.  Dedicated reduce
+    and the subsequent TP gather both operate on local shards, so slice that
+    full gradient back to this TP rank's shard before enqueueing collectives.
+    """
+    orig_size = torch.Size(param._orig_size)
+    grad_size = torch.Size(grad.shape)
+    if grad_size == orig_size:
+        return grad
+
+    if (
+        param.tp_group is not None
+        and param.shard_dim is not None
+        and grad_size == torch.Size(param.full_shape)
+    ):
+        shard_dim = param.shard_dim
+        local_extent = orig_size[shard_dim]
+        start = param.tp_group.rank() * local_extent
+        return grad.narrow(shard_dim, start, local_extent)
+
+    if grad.numel() == orig_size.numel():
+        return grad.reshape(orig_size)
+
+    raise RuntimeError(
+        f"{param.param_name}: gradient shape {tuple(grad_size)} cannot be "
+        f"normalized to TP-local shape {tuple(orig_size)}"
+    )
+
+
 class DedicatedParam:
     """Manages one dedicated-ownership parameter.
 
@@ -56,6 +113,7 @@ class DedicatedParam:
         compute_dtype: torch.dtype = None,
         replicate_group: Optional[dist.ProcessGroup] = None,
         tp_owner_local_rank: int = 0,
+        route_hint: Optional[str] = None,
     ):
         self.module = module
         self.param_name = param_name
@@ -108,6 +166,7 @@ class DedicatedParam:
         self._orig_dtype = local_data.dtype
         self._compute_dtype = compute_dtype  # e.g. bf16 for mixed precision
         self._requires_grad = param.requires_grad
+        self._dmuon_route: str = _normalize_dmuon_route_hint(route_hint)
 
         # Cached attrs (were @property, now computed once).
         # Dependencies: is_dtensor, _tp_spec, _orig_size — all set above.
@@ -184,8 +243,31 @@ class DedicatedParam:
         # True while group's packed buffer is allocated; False after reshard.
         self._is_unsharded: bool = False
 
+        # DMuon-managed sharded AdamW route.  This is the base-param path used
+        # for large non-Muon tensors such as embeddings and lm_head: every
+        # shard-rank owns one flat shard, DMuon reduce-scatters gradients into
+        # that shard, AdamW updates it locally, and the next forward all-gathers
+        # the full view.  FSDP2 is not involved in this path.
+        self._sharded_adamw_numel: int = int(local_data.numel())
+        self._sharded_adamw_chunk_numel: int = 0
+        self._sharded_adamw_valid_numel: int = 0
+        self._sharded_adamw_data: Optional[torch.Tensor] = None
+        self._sharded_adamw_grad: Optional[torch.Tensor] = None
+        self._sharded_adamw_full_padded: Optional[torch.Tensor] = None
+        self._sharded_adamw_comm_shard: Optional[torch.Tensor] = None
+        self._sharded_adamw_reduce_input: Optional[torch.Tensor] = None
+        if self._dmuon_route == "sharded_adamw":
+            self._init_sharded_adamw_storage(local_data)
+
         # Reduced gradient (on owner, after backward)
         self._reduced_grad: Optional[torch.Tensor] = None
+
+        # Optimizer route metadata.  ``route_hint`` gives the communication
+        # layer enough information at construction time to allocate storage
+        # for sharded base AdamW. ``Muon`` validates and may reassign semantic
+        # group indices later, but it must not move a param out of
+        # ``sharded_adamw`` after construction without rebuilding storage.
+        self._dmuon_adamw_replicate_allreduce: bool = False
 
         # Accumulated gradient for no_sync gradient accumulation (all ranks)
         self._accumulated_grad: Optional[torch.Tensor] = None
@@ -210,6 +292,61 @@ class DedicatedParam:
         # Set module to sharded state
         unsafe_setattr_param(self.module, self.param_name, self._placeholder)
 
+    def uses_sharded_adamw(self) -> bool:
+        return self._dmuon_route == "sharded_adamw"
+
+    def _init_sharded_adamw_storage(self, local_data: torch.Tensor) -> None:
+        """Initialize DMuon-owned shard storage for base AdamW tensors."""
+        if self.tp_group is not None:
+            raise NotImplementedError(
+                f"{self.param_name}: sharded_adamw base route does not yet "
+                "support TP-sharded DTensor parameters"
+            )
+        shard_world = int(self.dp_group.size())
+        shard_rank = int(self.dp_group.rank())
+        numel = int(local_data.numel())
+        chunk = (numel + shard_world - 1) // shard_world
+        start = shard_rank * chunk
+        stop = min(start + chunk, numel)
+        valid = max(0, stop - start)
+
+        self._sharded_adamw_chunk_numel = int(chunk)
+        self._sharded_adamw_valid_numel = int(valid)
+        shard = torch.zeros(chunk, dtype=self._orig_dtype, device=self.device)
+        if valid:
+            shard[:valid].copy_(local_data.detach().reshape(-1)[start:stop])
+        self._sharded_adamw_data = shard
+
+        full_padded_numel = chunk * shard_world
+        comm_dtype = self._compute_dtype or self._orig_dtype
+        self._sharded_adamw_full_padded = torch.empty(
+            full_padded_numel, dtype=comm_dtype, device=self.device
+        )
+        self._sharded_adamw_comm_shard = torch.empty(
+            chunk, dtype=comm_dtype, device=self.device
+        )
+        self._sharded_adamw_reduce_input = torch.empty(
+            full_padded_numel, dtype=comm_dtype, device=self.device
+        )
+
+        contiguous_stride = _make_contiguous_stride(self._orig_size)
+        view = torch.as_strided(
+            self._sharded_adamw_full_padded[:numel],
+            self._orig_size,
+            contiguous_stride,
+            0,
+        )
+        if self.is_dtensor:
+            wrapped = _from_local_no_grad(view, self._tp_spec)
+        else:
+            wrapped = view
+        self._unsharded_param = nn.Parameter(
+            wrapped, requires_grad=self._requires_grad
+        )
+        from dmuon._core.internal_utils import free_storage
+
+        free_storage(self._sharded_adamw_full_padded)
+
     def bind_to_packed_buffer(
         self, packed_buf: torch.Tensor, storage_offset: int
     ) -> None:
@@ -221,6 +358,12 @@ class DedicatedParam:
         alloc/free's the packed buffer's storage, this view's storage also
         resizes (it's the same Storage object).
         """
+        if self.uses_sharded_adamw():
+            # Sharded base AdamW owns its full forward view via
+            # ``_sharded_adamw_full_padded`` and is populated by all-gather,
+            # not owner broadcast.  Keep the view created in
+            # ``_init_sharded_adamw_storage``.
+            return
         contiguous_stride = _make_contiguous_stride(self._orig_size)
         view = torch.as_strided(packed_buf, self._orig_size, contiguous_stride, storage_offset)
         if self.is_dtensor:
@@ -275,6 +418,8 @@ class DedicatedParam:
         so setattr makes the new data visible to forward.
         """
         unsafe_setattr_param(self.module, self.param_name, self._unsharded_param)
+        for alias_module, alias_name in getattr(self, "_alias_modules", ()):
+            unsafe_setattr_param(alias_module, alias_name, self._unsharded_param)
         self._is_unsharded = True
 
     # ---- reshard ----
@@ -288,6 +433,8 @@ class DedicatedParam:
         if not self._is_unsharded:
             return
         unsafe_setattr_param(self.module, self.param_name, self._placeholder)
+        for alias_module, alias_name in getattr(self, "_alias_modules", ()):
+            unsafe_setattr_param(alias_module, alias_name, self._placeholder)
         self._is_unsharded = False
 
     # ---- gradient reduction ----
@@ -297,8 +444,7 @@ class DedicatedParam:
         if not self._is_unsharded or self._unsharded_param.grad is None:
             return None
         grad = self._unsharded_param.grad.data
-        if self.is_dtensor and DTensor is not None and isinstance(grad, DTensor):
-            grad = grad._local_tensor
+        grad = self.local_grad_for_reduce(grad)
         grad = grad.contiguous()
         return dist.reduce(
             grad,
@@ -315,11 +461,21 @@ class DedicatedParam:
         if self.is_owner:
             grad = self._unsharded_param.grad
             if grad is not None:
-                if self.is_dtensor and DTensor is not None and isinstance(grad, DTensor):
-                    grad = grad._local_tensor
+                grad = self.local_grad_for_reduce(grad)
                 self._reduced_grad = grad.data.clone()
         self._unsharded_param.grad = None
 
     def clear_reduced_grad(self):
         """Clear saved gradient (after optimizer step)."""
         self._reduced_grad = None
+
+    def local_grad_for_reduce(self, grad: torch.Tensor) -> torch.Tensor:
+        """Convert a parameter grad to the TP-local tensor reduce expects."""
+        if self.is_dtensor and DTensor is not None and isinstance(grad, DTensor):
+            if (
+                self._tp_spec is not None
+                and tuple(grad._spec.placements) != tuple(self._tp_spec.placements)
+            ):
+                grad = grad.redistribute(placements=self._tp_spec.placements)
+            grad = grad._local_tensor
+        return _normalize_tp_local_grad(self, grad)

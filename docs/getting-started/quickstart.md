@@ -221,6 +221,6 @@ broadcast. The training loop is otherwise unchanged.
 ## See Also
 
 - [Core Concepts](concepts.md) — why dedicated ownership works
-- [HSDP Guide](../guides/hsdp.md) — 2D mesh, async mode, fallback
+- [HSDP Guide](../guides/hsdp.md) — 2D mesh and async mode
 - [Training Guide](../guides/training.md) — production workflow with all options
 - [API Reference](../reference/api.md) — complete signatures

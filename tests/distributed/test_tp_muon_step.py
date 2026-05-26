@@ -180,17 +180,12 @@ def _build_param_group_tp_stack(
         ("action/muon", True, "muon", action_lr),
         ("action/adamw", False, "adamw", 1e-3),
     ]
-    summary = dmuon.summarize_param_groups(model, optimizer, max_rows=12)
-    groups = {group["group_name"]: group for group in summary["groups"]}
-    assert groups["action/muon"]["lr"] == action_lr
-    assert groups["action/muon"]["tp_sharded_dedicated_param_count"] > 0
-    assert any(
-        row["route"] == "muon"
-        and row["group_name"] == "action/muon"
-        and row["is_tp_sharded"]
-        for row in summary["parameters"]
-    )
-    assert "action/muon" in dmuon.format_param_group_summary(summary)
+    group_idx = {
+        group["group_name"]: idx for idx, group in enumerate(optimizer.param_groups)
+    }
+    action_dps = optimizer._muon_group_dps[group_idx["action/muon"]]
+    assert action_dps
+    assert any(getattr(dp, "tp_group", None) is not None for dp in action_dps)
     return model, optimizer
 
 

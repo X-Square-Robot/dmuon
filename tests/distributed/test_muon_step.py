@@ -318,17 +318,12 @@ def test_muon_param_groups_fsdp2(rank, world_size, device, mesh):
         for group in optimizer.param_groups
     ]
     assert actual == expected
-    summary = dmuon.summarize_param_groups(model, optimizer, max_rows=20)
-    groups = {group["group_name"]: group for group in summary["groups"]}
-    assert summary["num_groups"] == 4
-    assert groups["action/muon"]["lr"] == 0.02
-    assert groups["action/muon"]["dedicated_param_count"] > 0
-    assert groups["action/adamw"]["adamw_param_count"] > 0
-    assert any(
-        row["route"] == "muon" and row["group_name"] == "action/muon"
-        for row in summary["parameters"]
-    )
-    assert "action/muon" in dmuon.format_param_group_summary(summary)
+    group_idx = {
+        group["group_name"]: idx for idx, group in enumerate(optimizer.param_groups)
+    }
+    assert group_idx["action/muon"] in optimizer._muon_group_dps
+    assert optimizer._muon_group_dps[group_idx["action/muon"]]
+    assert optimizer._adamw_group_params[group_idx["action/adamw"]]
 
     optimizer.zero_grad()
     x = torch.randn(4, 256, device=device)
@@ -340,14 +335,464 @@ def test_muon_param_groups_fsdp2(rank, world_size, device, mesh):
     log(rank, "PASSED: test_muon_param_groups_fsdp2")
 
 
+def test_muon_all_trainable_type_split_fsdp2(rank, world_size, device, mesh):
+    def build_type_split_model_and_optimizer(seed):
+        torch.manual_seed(seed)
+        model = TinyModel().to(device)
+        matrix_names = set()
+        base_names = set()
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "proj" in name and param.ndim == 2:
+                matrix_names.add(name)
+            else:
+                base_names.add(name)
+
+        dmuon.dedicate_params(
+            model,
+            mesh,
+            predicate=lambda _n, p: p.requires_grad,
+        )
+        matrix_params = []
+        base_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name in matrix_names:
+                matrix_params.append(param)
+            elif name in base_names:
+                base_params.append(param)
+
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+
+        optimizer = dmuon.Muon(
+            model,
+            lr=0.01,
+            ns_steps=2,
+            adamw_lr=0.001,
+            param_groups=[
+                {
+                    "params": matrix_params,
+                    "group_name": "matrix",
+                    "dmuon_route": "muon",
+                    "muon_lr": 0.01,
+                },
+                {
+                    "params": base_params,
+                    "group_name": "base",
+                    "dmuon_route": "adamw",
+                    "adamw_lr": 0.001,
+                    "adamw_weight_decay": 0.0,
+                },
+            ],
+        )
+        return model, optimizer
+
+    model, optimizer = build_type_split_model_and_optimizer(seed=0)
+
+    group_idx = {
+        group["group_name"]: idx for idx, group in enumerate(optimizer.param_groups)
+    }
+    matrix_dps = optimizer._muon_group_dps[group_idx["matrix/muon"]]
+    dedicated_adamw_dps = [
+        dp
+        for dp in optimizer._all_dedicated_params
+        if id(dp) in optimizer._dp_to_adamw_group_idx
+    ]
+    assert matrix_dps
+    assert dedicated_adamw_dps
+
+    optimizer.zero_grad()
+    x = torch.randn(4, 256, device=device)
+    loss = model(x)
+    loss.backward()
+    optimizer.step()
+
+    dedicated_adamw_state_count = sum(
+        1
+        for key, state in optimizer.state.items()
+        if isinstance(key, int) and "exp_avg" in state
+    )
+    assert dedicated_adamw_state_count > 0
+
+    model_sd = dmuon.get_model_state_dict(model, cpu_offload=True, rank0_only=False)
+    optim_sd = dmuon.get_optimizer_state_dict(
+        model,
+        optimizer,
+        cpu_offload=True,
+        rank0_only=False,
+    )
+    assert optim_sd["dedicated_adamw"], "checkpoint missing dedicated AdamW state"
+    for fqn, state in optim_sd["dedicated_adamw"].items():
+        assert "step" in state, f"{fqn}: missing AdamW step"
+        assert state["step"] > 0, f"{fqn}: AdamW step was not saved"
+        assert "exp_avg" in state, f"{fqn}: missing AdamW exp_avg"
+        assert "exp_avg_sq" in state, f"{fqn}: missing AdamW exp_avg_sq"
+
+    reloaded_model, reloaded_optimizer = build_type_split_model_and_optimizer(seed=1234)
+    dmuon.set_model_state_dict(reloaded_model, model_sd)
+    dmuon.set_optimizer_state_dict(reloaded_model, reloaded_optimizer, optim_sd)
+    restored_adamw_state_count = sum(
+        1
+        for key, state in reloaded_optimizer.state.items()
+        if isinstance(key, int) and "exp_avg" in state and "exp_avg_sq" in state
+    )
+    assert restored_adamw_state_count == dedicated_adamw_state_count, (
+        f"dedicated AdamW state count mismatch after checkpoint load: "
+        f"{restored_adamw_state_count} != {dedicated_adamw_state_count}"
+    )
+
+    torch.cuda.synchronize()
+    log(rank, "PASSED: test_muon_all_trainable_type_split_fsdp2")
+
+
+def test_muon_all_trainable_type_split_hsdp(rank, world_size, device, mesh):
+    assert world_size >= 4, "HSDP type-split test requires at least 4 GPUs"
+
+    from torch.distributed.device_mesh import init_device_mesh
+
+    hsdp_mesh = init_device_mesh(
+        "cuda", (2, world_size // 2), mesh_dim_names=("replicate", "shard")
+    )
+    replicate_mesh = hsdp_mesh["replicate"]
+    shard_mesh = hsdp_mesh["shard"]
+
+    def build_model_and_optimizer(seed):
+        torch.manual_seed(seed)
+        model = TinyModel(num_layers=2, hidden=128, intermediate=512).to(device)
+        matrix_names = set()
+        base_names = set()
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "proj" in name and param.ndim == 2:
+                matrix_names.add(name)
+            else:
+                base_names.add(name)
+
+        dmuon.dedicate_params(
+            model,
+            shard_mesh,
+            replicate_mesh=replicate_mesh,
+            predicate=lambda _n, p: p.requires_grad,
+        )
+        matrix_params = []
+        base_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name in matrix_names:
+                matrix_params.append(param)
+            elif name in base_names:
+                base_params.append(param)
+
+        for layer in model.layers:
+            fully_shard(layer, mesh=hsdp_mesh)
+        fully_shard(model, mesh=hsdp_mesh)
+
+        optimizer = dmuon.Muon(
+            model,
+            lr=0.01,
+            ns_steps=2,
+            adamw_lr=0.001,
+            param_groups=[
+                {
+                    "params": matrix_params,
+                    "group_name": "matrix",
+                    "dmuon_route": "muon",
+                    "muon_lr": 0.01,
+                },
+                {
+                    "params": base_params,
+                    "group_name": "base",
+                    "dmuon_route": "adamw",
+                    "adamw_lr": 0.001,
+                    "adamw_weight_decay": 0.0,
+                },
+            ],
+        )
+        return model, optimizer
+
+    model, optimizer = build_model_and_optimizer(0)
+
+    adamw_dps = [
+        dp
+        for dp in optimizer._all_dedicated_params
+        if id(dp) in optimizer._dp_to_adamw_group_idx
+    ]
+    assert adamw_dps, "expected dedicated AdamW-route params"
+    assert all(
+        not getattr(dp, "_dmuon_adamw_replicate_allreduce", False)
+        for dp in adamw_dps
+    )
+
+    torch.manual_seed(42)
+    x = torch.randn(4, 128, device=device)
+    for _ in range(2):
+        optimizer.zero_grad()
+        loss = model(x)
+        assert torch.isfinite(loss.detach())
+        loss.backward()
+        optimizer.step()
+
+    local_adamw_state_count = sum(
+        1
+        for dp in adamw_dps
+        if dp.is_owner
+        and id(dp) in optimizer.state
+        and "exp_avg" in optimizer.state[id(dp)]
+    )
+    expected_local_count = sum(1 for dp in adamw_dps if dp.is_owner)
+    assert local_adamw_state_count == expected_local_count, (
+        f"local dedicated AdamW state count mismatch: "
+        f"{local_adamw_state_count} != {expected_local_count}"
+    )
+
+    model_sd = dmuon.get_model_state_dict(model, cpu_offload=True, rank0_only=False)
+    optim_sd = dmuon.get_optimizer_state_dict(
+        model,
+        optimizer,
+        cpu_offload=True,
+        rank0_only=False,
+    )
+    assert optim_sd["dedicated_adamw"], "checkpoint missing dedicated AdamW state"
+
+    reloaded_model, reloaded_optimizer = build_model_and_optimizer(1234)
+    dmuon.set_model_state_dict(reloaded_model, model_sd)
+    dmuon.set_optimizer_state_dict(reloaded_model, reloaded_optimizer, optim_sd)
+    reloaded_adamw_dps = [
+        dp
+        for dp in reloaded_optimizer._all_dedicated_params
+        if id(dp) in reloaded_optimizer._dp_to_adamw_group_idx
+    ]
+    restored_local_count = sum(
+        1
+        for dp in reloaded_adamw_dps
+        if dp.is_owner
+        and id(dp) in reloaded_optimizer.state
+        and "exp_avg" in reloaded_optimizer.state[id(dp)]
+    )
+    expected_reloaded_count = sum(
+        1 for dp in reloaded_adamw_dps if dp.is_owner
+    )
+    assert restored_local_count == expected_reloaded_count, (
+        f"restored local dedicated AdamW state count mismatch: "
+        f"{restored_local_count} != {expected_reloaded_count}"
+    )
+
+    torch.cuda.synchronize()
+    log(rank, "PASSED: test_muon_all_trainable_type_split_hsdp")
+
+
+def test_muon_sharded_base_adamw_fsdp2(rank, world_size, device, mesh):
+    def build_model_and_optimizer(seed):
+        torch.manual_seed(seed)
+        model = TinyModel(num_layers=2, hidden=128, intermediate=512).to(device)
+        matrix_names = set()
+        sharded_base_names = {"head.weight"}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "proj" in name and param.ndim == 2:
+                matrix_names.add(name)
+
+        dmuon.dedicate_params(
+            model,
+            mesh,
+            predicate=lambda _n, p: p.requires_grad,
+            route_hint_fn=lambda n, _p: (
+                "sharded_adamw"
+                if n in sharded_base_names
+                else ("muon" if n in matrix_names else "adamw")
+            ),
+        )
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh)
+        fully_shard(model, mesh=mesh)
+
+        optimizer = dmuon.Muon(
+            model,
+            lr=0.01,
+            ns_steps=2,
+            adamw_lr=0.001,
+            adamw_weight_decay=0.0,
+        )
+        return model, optimizer
+
+    model, optimizer = build_model_and_optimizer(0)
+    sharded_dps = [
+        dp
+        for dp in optimizer._all_dedicated_params
+        if getattr(dp, "_dmuon_route", None) == "sharded_adamw"
+    ]
+    assert sharded_dps, "expected sharded AdamW-route dedicated params"
+    assert all(getattr(dp, "_sharded_adamw_data", None) is not None for dp in sharded_dps)
+    assert all(id(dp) in optimizer._dp_to_adamw_group_idx for dp in sharded_dps)
+
+    torch.manual_seed(42)
+    x = torch.randn(4, 128, device=device)
+    for _ in range(2):
+        optimizer.zero_grad()
+        loss = model(x)
+        assert torch.isfinite(loss.detach())
+        loss.backward()
+        optimizer.step()
+
+    state_count = sum(
+        1
+        for dp in sharded_dps
+        if id(dp) in optimizer.state and "exp_avg" in optimizer.state[id(dp)]
+    )
+    assert state_count == len(sharded_dps)
+
+    model_sd = dmuon.get_model_state_dict(model, cpu_offload=True, rank0_only=False)
+    optim_sd = dmuon.get_optimizer_state_dict(
+        model,
+        optimizer,
+        cpu_offload=True,
+        rank0_only=False,
+    )
+    assert optim_sd["dedicated_adamw"], "checkpoint missing sharded AdamW state"
+
+    reloaded_model, reloaded_optimizer = build_model_and_optimizer(1234)
+    dmuon.set_model_state_dict(reloaded_model, model_sd)
+    dmuon.set_optimizer_state_dict(reloaded_model, reloaded_optimizer, optim_sd)
+    reloaded_sharded_dps = [
+        dp
+        for dp in reloaded_optimizer._all_dedicated_params
+        if getattr(dp, "_dmuon_route", None) == "sharded_adamw"
+    ]
+    restored_count = sum(
+        1
+        for dp in reloaded_sharded_dps
+        if id(dp) in reloaded_optimizer.state
+        and "exp_avg" in reloaded_optimizer.state[id(dp)]
+        and tuple(reloaded_optimizer.state[id(dp)]["exp_avg"].shape)
+        == tuple(dp._sharded_adamw_data.shape)
+    )
+    assert restored_count == len(reloaded_sharded_dps)
+
+    torch.cuda.synchronize()
+    log(rank, "PASSED: test_muon_sharded_base_adamw_fsdp2")
+
+
+def test_muon_sharded_base_adamw_hsdp(rank, world_size, device, mesh):
+    assert world_size >= 4, "HSDP sharded AdamW test requires at least 4 GPUs"
+
+    from torch.distributed.device_mesh import init_device_mesh
+
+    hsdp_mesh = init_device_mesh(
+        "cuda", (2, world_size // 2), mesh_dim_names=("replicate", "shard")
+    )
+    replicate_mesh = hsdp_mesh["replicate"]
+    shard_mesh = hsdp_mesh["shard"]
+
+    torch.manual_seed(0)
+    model = TinyModel(num_layers=2, hidden=128, intermediate=512).to(device)
+    matrix_names = set()
+    sharded_base_names = {"head.weight"}
+    base_names = set()
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "proj" in name and param.ndim == 2:
+            matrix_names.add(name)
+        elif name not in sharded_base_names:
+            base_names.add(name)
+
+    dmuon.dedicate_params(
+        model,
+        shard_mesh,
+        replicate_mesh=replicate_mesh,
+        predicate=lambda _n, p: p.requires_grad,
+        route_hint_fn=lambda n, _p: (
+            "sharded_adamw"
+            if n in sharded_base_names
+            else ("muon" if n in matrix_names else "adamw")
+        ),
+    )
+
+    matrix_params = []
+    sharded_base_params = []
+    base_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name in matrix_names:
+            matrix_params.append(param)
+        elif name in sharded_base_names:
+            sharded_base_params.append(param)
+        elif name in base_names:
+            base_params.append(param)
+
+    for layer in model.layers:
+        fully_shard(layer, mesh=hsdp_mesh)
+    fully_shard(model, mesh=hsdp_mesh)
+
+    optimizer = dmuon.Muon(
+        model,
+        lr=0.01,
+        ns_steps=2,
+        adamw_lr=0.001,
+        param_groups=[
+            {
+                "params": matrix_params,
+                "group_name": "matrix",
+                "dmuon_route": "muon",
+                "muon_lr": 0.01,
+            },
+            {
+                "params": sharded_base_params,
+                "group_name": "base_sharded",
+                "dmuon_route": "sharded_adamw",
+                "adamw_lr": 0.001,
+                "adamw_weight_decay": 0.0,
+            },
+            {
+                "params": base_params,
+                "group_name": "base",
+                "dmuon_route": "adamw",
+                "adamw_lr": 0.001,
+                "adamw_weight_decay": 0.0,
+            },
+        ],
+    )
+
+    sharded_dps = [
+        dp
+        for dp in optimizer._all_dedicated_params
+        if getattr(dp, "_dmuon_route", None) == "sharded_adamw"
+    ]
+    assert sharded_dps, "expected sharded AdamW-route dedicated params"
+    assert all(getattr(dp, "_sharded_adamw_data", None) is not None for dp in sharded_dps)
+
+    torch.manual_seed(42)
+    x = torch.randn(4, 128, device=device)
+    for _ in range(2):
+        optimizer.zero_grad()
+        loss = model(x)
+        assert torch.isfinite(loss.detach())
+        loss.backward()
+        optimizer.step()
+
+    assert all(
+        id(dp) in optimizer.state and "exp_avg" in optimizer.state[id(dp)]
+        for dp in sharded_dps
+    )
+
+    torch.cuda.synchronize()
+    log(rank, "PASSED: test_muon_sharded_base_adamw_hsdp")
+
+
 # ---------------------------------------------------------------------------
-# Test 5: TP params — pre-T2 guard.
+# Test 5: TP params — step smoke.
 #
-# The Gram-AR TP path was removed; the All-to-All path lands in T2.  Until
-# T2 ships, ``muon.step()`` must trip a ``NotImplementedError`` when any
-# dedicated param is TP-sharded.  This test asserts that guard fires; it
-# will be replaced by a bit-identical / loss-parity check once T2a+T2b+T2b2
-# land.
+# The TP path is live. This smoke keeps the older distributed test in sync with
+# the current contract: TP-sharded dedicated params must complete a DMuon step
+# without falling back to the removed pre-T2 NotImplementedError guard.
 # ---------------------------------------------------------------------------
 
 def test_muon_tp_path(rank, world_size, device, mesh):
@@ -398,32 +843,23 @@ def test_muon_tp_path(rank, world_size, device, mesh):
         f"No TP-aware dedicated params found (is_dtensor=True, tp_group≠None)"
     )
 
-    if len(optimizer._dedicated_params) == 0:
-        log(rank, "PASSED: test_muon_tp_path (no owned params on this rank)")
-        return
-
-    # forward -> backward -> step.  Until T2 lands, the TP branch in
-    # muon._step_muon raises NotImplementedError; we treat its absence as
-    # a regression (Gram-AR accidentally reintroduced or guard removed).
-    optimizer.zero_grad()
-    x = torch.randn(4, 256, device=device)
-    loss = model(x)
-    loss.backward()
-    try:
+    losses = []
+    for step in range(2):
+        optimizer.zero_grad()
+        torch.manual_seed(2026 + step)
+        x = torch.randn(4, 256, device=device)
+        loss = model(x)
+        assert torch.isfinite(loss.detach())
+        loss.backward()
         optimizer.step()
-    except NotImplementedError as e:
-        assert "T2" in str(e), (
-            f"TP step raised NotImplementedError but message lacks T2 marker: {e}"
-        )
-        torch.cuda.synchronize()
-        log(rank, "PASSED: test_muon_tp_path (pre-T2 guard fires as expected)")
-        return
+        dmuon.wait_all_post_step_broadcasts(model)
+        losses.append(loss.detach().float())
 
-    raise AssertionError(
-        "TP step unexpectedly succeeded — Gram-AR path may have been "
-        "reintroduced, or the T2 all-to-all path is live and this test "
-        "needs to be updated to assert numerical correctness instead."
-    )
+    loss_tensor = torch.stack(losses)
+    dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+    assert torch.isfinite(loss_tensor).all().item()
+    torch.cuda.synchronize()
+    log(rank, "PASSED: test_muon_tp_path")
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +883,10 @@ if __name__ == "__main__":
         "momentum": test_muon_momentum_accumulation,
         "nesterov": test_muon_nesterov,
         "param_groups_fsdp2": test_muon_param_groups_fsdp2,
+        "all_trainable_type_split_fsdp2": test_muon_all_trainable_type_split_fsdp2,
+        "all_trainable_type_split_hsdp": test_muon_all_trainable_type_split_hsdp,
+        "sharded_base_adamw_fsdp2": test_muon_sharded_base_adamw_fsdp2,
+        "sharded_base_adamw_hsdp": test_muon_sharded_base_adamw_hsdp,
         "tp_path": test_muon_tp_path,
     }
 

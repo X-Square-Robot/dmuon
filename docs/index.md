@@ -123,29 +123,36 @@ Scale from a single node to multi-node HSDP clusters with a two-line API change.
 
 ## Benchmarks
 
-**8 × A800-SXM4-80GB, bf16, seq=2048, bs=2**
+Current snapshot: A800-SXM4-80GB, bf16, seq=4096 for LLM runs, random initialization, synthetic data. MFU is computed from step-start intervals so cross-step communication overlap is not double-counted. Source: accepted summaries from the DMuon 256GPU experiment dashboard, 2026-05-24 run set. 256GPU entries are still pending the 32-node run window.
 
-### Total Step Time
+### LLM Z2/Z3 Scaling
 
-| Model | FSDP2+AdamW | FSDP2+Muon | DMuon | vs AdamW |
-|:------|----------:|-----------:|------:|------:|
-| Qwen2.5-1.5B | 328 ms | 684 ms | 340 ms | +4% |
-| Llama-3.2-3B | 599 ms | 1,810 ms | 660 ms | +10% |
-| Qwen2.5-7B | 1,108 ms | 3,985 ms | 1,222 ms | +10% |
-| Llama-3.1-8B | 1,188 ms | 4,617 ms | 1,349 ms | +13% |
+| Model / 128GPU | AdamW MFU range | DMuon MFU range | Best DMuon topology |
+|:---------------|---------------:|---------------:|:--------------------|
+| Qwen2.5-1.5B | 36.3–43.6% | 38.4–43.1% | HSDP-Z2, 43.1% |
+| Qwen2.5-7B | 43.0–48.3% | 39.7–48.0% | FSDP-Z2, 48.0% |
+| Llama-3.2-3B | 46.1–48.1% | 46.4–48.6% | HSDP-Z2, 48.6% |
+| Llama-3.1-8B | 47.0–49.9% | 41.1–46.2% | FSDP-Z2, 46.2% |
 
-### Optimizer-Only Time
+The 128GPU rows cover FSDP-Z2, FSDP-Z3, HSDP-Z2, and HSDP-Z3.
 
-| Model | AdamW | FSDP2+Muon | DMuon | Speedup |
-|:------|------:|-----------:|------:|------:|
-| Qwen2.5-1.5B | 17 ms | 373 ms | 31 ms | **12.0×** |
-| Llama-3.2-3B | 27 ms | 1,232 ms | 99 ms | **12.5×** |
-| Qwen2.5-7B | 53 ms | 2,917 ms | 189 ms | **15.5×** |
-| Llama-3.1-8B | 56 ms | 3,468 ms | 260 ms | **13.3×** |
+### VLA Z2/Z3 Scaling
 
-DMuon adds **4–13% total overhead** vs FSDP2+AdamW. The optimizer step itself is **12–15× faster** than naive FSDP2+Muon, from two compounding factors: 1/8 parameter load per owner rank (~8×) and Gram Newton-Schulz with SYRK kernel (~1.6×).
+| Model / 128GPU | FSDP-Z2 | FSDP-Z3 | HSDP-Z2 | HSDP-Z3 |
+|:---------------|--------:|--------:|--------:|--------:|
+| Pi0 | 43.0% | 40.3% | 43.4% | 42.8% |
+| WallX/Qwen2.5-VL-3B | 30.9% | 29.9% | 31.2% | 29.1% |
 
-Multi-node HSDP benchmarks at 64+ GPU: [TBD Phase D]
+These VLA runs use the real Pi0 and WallX training entries.
+
+### Matrix-Update Replay
+
+| Model / FSDP-Z2 8GPU | Direct naive NS | Gram+SYRK naive NS | Direct DMuon NS | Gram+SYRK DMuon NS |
+|:---------------------|----------------:|-------------------:|----------------:|-------------------:|
+| Pi0 | 750 ms | 486 ms | 93 ms | 61 ms |
+| WallX/Qwen2.5-VL-3B | 1,135 ms | 661 ms | 143 ms | 92 ms |
+
+This replay isolates matrix-update compute after DMuon owner assignment. Gram+SYRK is the current Muon backend and reduces the single-owner NS cost by about 1.5× on these VLA matrix sets.
 
 ---
 
@@ -173,7 +180,7 @@ Multi-node HSDP benchmarks at 64+ GPU: [TBD Phase D]
 
 -   :material-server-network:{ .lg .middle } **HSDP Guide**
 
-    Complete walkthrough: 2D mesh, async mode, fallback, and checkpointing.
+    Complete walkthrough: 2D mesh, async mode, and checkpointing.
 
     [:octicons-arrow-right-24: HSDP Guide](guides/hsdp.md)
 

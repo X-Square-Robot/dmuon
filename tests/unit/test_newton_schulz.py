@@ -1,12 +1,20 @@
-"""Unit tests for Newton-Schulz algorithm correctness (single GPU)."""
+"""Unit tests for Newton-Schulz algorithm correctness."""
 
-import os, sys
+import os
+import sys
+import tempfile
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as tmp
 
 from dmuon.optim.newton_schulz import (
+    gram_newton_schulz_factors,
     gram_newton_schulz_local,
+    gram_newton_schulz_distributed_local,
+    gram_newton_schulz_distributed_local_batched,
     _compiled_direct_newton_schulz as _compiled_newton_schulz,
     DEFAULT_COEFFICIENTS,
     YOU_COEFFICIENTS,
@@ -111,6 +119,121 @@ def test_ns_output_properties():
     )
 
     print("test_ns_output_properties PASSED")
+
+
+def test_gram_factors_reconstruct_gram_ns_output_on_cpu():
+    torch.manual_seed(42)
+
+    for shape in [(4, 8), (8, 4)]:
+        G = torch.randn(shape, dtype=torch.float32)
+        out = gram_newton_schulz_local(G, coefficients=DEFAULT_COEFFICIENTS)
+        factor_segments, transposed, normalizer = gram_newton_schulz_factors(
+            G,
+            coefficients=DEFAULT_COEFFICIENTS,
+        )
+        assert all(factor.dtype == torch.float16 for factor in factor_segments)
+        reconstructed = G.float().T if transposed else G.float()
+        reconstructed = (reconstructed / normalizer).half().contiguous()
+        for factor in factor_segments:
+            reconstructed = factor @ reconstructed
+        if transposed:
+            reconstructed = reconstructed.T
+        assert len(factor_segments) == 2
+        assert torch.allclose(out.float(), reconstructed.float(), atol=1e-6, rtol=0)
+
+
+def _distributed_gram_worker(rank: int, init_file: str, tmp_dir: str) -> None:
+    error_path = os.path.join(tmp_dir, f"rank{rank}.err")
+    try:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"file://{init_file}",
+            rank=rank,
+            world_size=2,
+        )
+        torch.manual_seed(1234)
+
+        for full, shard_dim, transposed in (
+            (torch.randn(4, 10, dtype=torch.float32), 1, False),
+            (torch.randn(10, 4, dtype=torch.float32), 0, True),
+        ):
+            local = full.chunk(2, dim=shard_dim)[rank].contiguous()
+            local_out = gram_newton_schulz_distributed_local(
+                local,
+                dist.group.WORLD,
+                transposed=transposed,
+                coefficients=DEFAULT_COEFFICIENTS,
+            )
+            expected = gram_newton_schulz_local(
+                full,
+                coefficients=DEFAULT_COEFFICIENTS,
+            ).chunk(2, dim=shard_dim)[rank]
+            assert torch.allclose(
+                local_out.float(),
+                expected.float(),
+                atol=1e-2,
+                rtol=0,
+            ), (
+                f"rank={rank} shard_dim={shard_dim} transposed={transposed} "
+                f"max_delta={(local_out.float() - expected.float()).abs().max().item()}"
+            )
+
+        for full_batch, shard_dim, transposed in (
+            (torch.randn(3, 4, 10, dtype=torch.float32), 2, False),
+            (torch.randn(3, 10, 4, dtype=torch.float32), 1, True),
+        ):
+            local_batch = full_batch.chunk(2, dim=shard_dim)[rank].contiguous()
+            local_out = gram_newton_schulz_distributed_local_batched(
+                local_batch,
+                dist.group.WORLD,
+                transposed=transposed,
+                coefficients=DEFAULT_COEFFICIENTS,
+            )
+            expected = torch.stack(
+                [
+                    gram_newton_schulz_local(
+                        full_batch[idx],
+                        coefficients=DEFAULT_COEFFICIENTS,
+                    ).chunk(2, dim=shard_dim - 1)[rank]
+                    for idx in range(full_batch.shape[0])
+                ],
+                dim=0,
+            )
+            assert torch.allclose(
+                local_out.float(),
+                expected.float(),
+                atol=1e-2,
+                rtol=0,
+            ), (
+                f"batched rank={rank} shard_dim={shard_dim} "
+                f"transposed={transposed} "
+                f"max_delta={(local_out.float() - expected.float()).abs().max().item()}"
+            )
+
+        with open(os.path.join(tmp_dir, f"rank{rank}.ok"), "w", encoding="utf-8") as f:
+            f.write("ok")
+    except Exception as exc:
+        with open(error_path, "w", encoding="utf-8") as f:
+            f.write(repr(exc))
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_distributed_gram_local_matches_full_gram_ns_on_cpu():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        init_file = os.path.join(tmp_dir, "init")
+        tmp.spawn(
+            _distributed_gram_worker,
+            args=(init_file, tmp_dir),
+            nprocs=2,
+            join=True,
+        )
+        for rank in range(2):
+            error_path = os.path.join(tmp_dir, f"rank{rank}.err")
+            assert not os.path.exists(error_path), open(error_path, encoding="utf-8").read()
+            assert os.path.exists(os.path.join(tmp_dir, f"rank{rank}.ok"))
 
 
 def test_ns_different_coefficients():
