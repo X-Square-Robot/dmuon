@@ -54,6 +54,7 @@ from .optim import (
 from .utils import (
     broadcast_all_updates,
     broadcast_all_updates_async,
+    collect_forward_unshard_profile,
     get_comm_ctx,
     get_dedicated_params,
     get_owned_params,
@@ -94,6 +95,7 @@ __all__ = [
     "wait_all_post_step_broadcasts",
     "broadcast_all_updates",
     "broadcast_all_updates_async",
+    "collect_forward_unshard_profile",
     "get_model_state_dict",
     "set_model_state_dict",
     "get_optimizer_state_dict",

@@ -21,7 +21,8 @@ from .param import DedicatedParam
 
 @contextmanager
 def _profile_range(name: str):
-    yield
+    with torch.profiler.record_function(name):
+        yield
 
 
 def _split_for_scatter(
@@ -251,6 +252,8 @@ class DedicatedParamGroup:
         # pending until the optimizer/root-post-backward boundary.
         self._stage1_reduce_event: Optional[torch.cuda.Event] = None
         self._post_reduce_event: Optional[torch.cuda.Event] = None
+        self._last_unshard_total_bytes: int = 0
+        self._last_unshard_prefetch: bool = False
         self._replicate_reduce_state: Optional[ReplicateReduceState] = None
         self._muon_grad_ready_event: Optional[torch.cuda.Event] = None
         self._muon_grad_ready_refs: list[torch.Tensor] = []
@@ -400,13 +403,25 @@ class DedicatedParamGroup:
         consume any still-pending async replicate broadcast here too so
         the copy-in below always reads fresh ``_owned_data``.
         """
+        group_name = _group_profile_name(self)
+        pending_tp_publish = self._tp_scatter_state is not None
+        pending_replicate_publish = self._replicate_broadcast_state is not None
         if prefetch:
-            self._pre_forward_prefetch_publish()
+            with _profile_range(f"dmuon.forward_prefetch_publish.{group_name}"):
+                self._pre_forward_prefetch_publish()
         else:
-            self._pre_forward_wait()
+            with _profile_range(f"dmuon.pre_forward_wait.{group_name}"):
+                self._pre_forward_wait()
         if self._is_unsharded:
+            self.comm_ctx.record_forward_unshard_counter(
+                group_name, already_unsharded=1
+            )
             return  # still unsharded from forward (reshard_after_forward=False)
         if self._broadcast_event is not None:
+            if not prefetch:
+                self.comm_ctx.record_forward_unshard_counter(
+                    group_name, prefetch_hits=1
+                )
             return  # already dispatched, pending wait_for_unshard
 
         broadcast_stream = self.comm_ctx.broadcast_stream
@@ -419,6 +434,41 @@ class DedicatedParamGroup:
         sharded_adamw_params = [
             p for p in self.params if _sharded_adamw_enabled(p)
         ]
+        owner_broadcast_bytes = sum(
+            int(packed_buf.numel() * packed_buf.element_size())
+            for packed_buf in self._packed_buf_by_owner.values()
+        )
+        owner_broadcast_max_bucket_bytes = max(
+            (
+                int(packed_buf.numel() * packed_buf.element_size())
+                for packed_buf in self._packed_buf_by_owner.values()
+            ),
+            default=0,
+        )
+        sharded_adamw_all_gather_bytes = sum(
+            int(
+                p._sharded_adamw_full_padded.numel()
+                * p._sharded_adamw_full_padded.element_size()
+            )
+            for p in sharded_adamw_params
+            if p._sharded_adamw_full_padded is not None
+        )
+        total_unshard_bytes = owner_broadcast_bytes + sharded_adamw_all_gather_bytes
+        self._last_unshard_total_bytes = total_unshard_bytes
+        self._last_unshard_prefetch = bool(prefetch)
+        self.comm_ctx.record_forward_unshard_counter(
+            group_name,
+            dispatch_calls=1,
+            prefetch_dispatch_calls=1 if prefetch else 0,
+            demand_dispatch_calls=0 if prefetch else 1,
+            owner_broadcast_bytes=owner_broadcast_bytes,
+            owner_broadcast_max_bucket_bytes=owner_broadcast_max_bucket_bytes,
+            owner_broadcast_bucket_count=len(self._packed_buf_by_owner),
+            sharded_adamw_all_gather_bytes=sharded_adamw_all_gather_bytes,
+            sharded_adamw_param_count=len(sharded_adamw_params),
+            tp_publish_waits=1 if pending_tp_publish else 0,
+            replicate_publish_waits=1 if pending_replicate_publish else 0,
+        )
         with torch.cuda.stream(broadcast_stream):
             # Alloc + owner copy-in BEFORE coalescing: these ops execute
             # immediately on broadcast_stream. Wrapped in no_grad +
@@ -468,35 +518,71 @@ class DedicatedParamGroup:
                     alloc_storage(p._sharded_adamw_full_padded)
                     p._sharded_adamw_comm_shard.copy_(p._sharded_adamw_data)
 
-            group_name = _group_profile_name(self)
-            with dist._coalescing_manager(group=dp_group, device=self.device):
-                for owner_coord, packed_buf in self._packed_buf_by_owner.items():
-                    profile_name = (
-                        f"dmuon.unshard_broadcast.bucket."
-                        f"owner{owner_coord[0]}_{owner_coord[1]}."
-                        f"bytes{int(packed_buf.numel() * packed_buf.element_size())}."
-                        f"params{len(self._by_owner[owner_coord])}.{group_name}"
-                    )
-                    with _profile_range(profile_name):
-                        dist.broadcast(
-                            packed_buf,
-                            src=self._global_owner_ranks[owner_coord],
-                            group=dp_group,
-                        )
-            if sharded_adamw_params:
-                with dist._coalescing_manager(group=dp_group, device=self.device):
-                    for p in sharded_adamw_params:
-                        profile_name = (
-                            f"dmuon.unshard_all_gather.sharded_adamw."
-                            f"bytes{int(p._sharded_adamw_full_padded.numel() * p._sharded_adamw_full_padded.element_size())}."
-                            f"{p.param_name}.{group_name}"
-                        )
-                        with _profile_range(profile_name):
-                            dist.all_gather_into_tensor(
-                                p._sharded_adamw_full_padded,
-                                p._sharded_adamw_comm_shard,
-                                group=dp_group,
+            if owner_broadcast_bytes:
+                owner_start = None
+                owner_end = None
+                if self.comm_ctx.record_forward_profile:
+                    owner_start = torch.cuda.Event(enable_timing=True)
+                    owner_end = torch.cuda.Event(enable_timing=True)
+                    owner_start.record(broadcast_stream)
+                with _profile_range(f"dmuon.unshard_broadcast.dispatch.{group_name}"):
+                    with dist._coalescing_manager(group=dp_group, device=self.device):
+                        for owner_coord, packed_buf in self._packed_buf_by_owner.items():
+                            profile_name = (
+                                f"dmuon.unshard_broadcast.bucket."
+                                f"owner{owner_coord[0]}_{owner_coord[1]}."
+                                f"bytes{int(packed_buf.numel() * packed_buf.element_size())}."
+                                f"params{len(self._by_owner[owner_coord])}.{group_name}"
                             )
+                            with _profile_range(profile_name):
+                                dist.broadcast(
+                                    packed_buf,
+                                    src=self._global_owner_ranks[owner_coord],
+                                    group=dp_group,
+                                )
+                if owner_start is not None and owner_end is not None:
+                    owner_end.record(broadcast_stream)
+                    self.comm_ctx.record_forward_unshard_event(
+                        group_name=group_name,
+                        phase="owner_broadcast_dispatch",
+                        start=owner_start,
+                        end=owner_end,
+                        bytes=owner_broadcast_bytes,
+                        prefetch=prefetch,
+                    )
+            if sharded_adamw_params:
+                gather_start = None
+                gather_end = None
+                if self.comm_ctx.record_forward_profile:
+                    gather_start = torch.cuda.Event(enable_timing=True)
+                    gather_end = torch.cuda.Event(enable_timing=True)
+                    gather_start.record(broadcast_stream)
+                with _profile_range(
+                    f"dmuon.unshard_all_gather.sharded_adamw.dispatch.{group_name}"
+                ):
+                    with dist._coalescing_manager(group=dp_group, device=self.device):
+                        for p in sharded_adamw_params:
+                            profile_name = (
+                                f"dmuon.unshard_all_gather.sharded_adamw."
+                                f"bytes{int(p._sharded_adamw_full_padded.numel() * p._sharded_adamw_full_padded.element_size())}."
+                                f"{p.param_name}.{group_name}"
+                            )
+                            with _profile_range(profile_name):
+                                dist.all_gather_into_tensor(
+                                    p._sharded_adamw_full_padded,
+                                    p._sharded_adamw_comm_shard,
+                                    group=dp_group,
+                                )
+                if gather_start is not None and gather_end is not None:
+                    gather_end.record(broadcast_stream)
+                    self.comm_ctx.record_forward_unshard_event(
+                        group_name=group_name,
+                        phase="sharded_adamw_all_gather_dispatch",
+                        start=gather_start,
+                        end=gather_end,
+                        bytes=sharded_adamw_all_gather_bytes,
+                        prefetch=prefetch,
+                    )
 
         self._broadcast_event = broadcast_stream.record_event()
 
@@ -510,7 +596,25 @@ class DedicatedParamGroup:
         if self._broadcast_event is None:
             return
 
-        torch.cuda.current_stream().wait_event(self._broadcast_event)
+        group_name = _group_profile_name(self)
+        current_stream = torch.cuda.current_stream()
+        if self.comm_ctx.record_forward_profile:
+            wait_start = torch.cuda.Event(enable_timing=True)
+            wait_end = torch.cuda.Event(enable_timing=True)
+            wait_start.record(current_stream)
+            current_stream.wait_event(self._broadcast_event)
+            wait_end.record(current_stream)
+            self.comm_ctx.record_forward_unshard_counter(group_name, wait_calls=1)
+            self.comm_ctx.record_forward_unshard_event(
+                group_name=group_name,
+                phase="forward_wait",
+                start=wait_start,
+                end=wait_end,
+                bytes=self._last_unshard_total_bytes,
+                prefetch=self._last_unshard_prefetch,
+            )
+        else:
+            current_stream.wait_event(self._broadcast_event)
 
         # Finalize: set unsharded params on modules
         for p in self.params:

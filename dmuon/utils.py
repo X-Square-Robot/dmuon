@@ -37,6 +37,28 @@ def get_comm_ctx(model: nn.Module) -> Optional[DedicatedCommContext]:
     return getattr(model, "_dedicated_comm_ctx", None)
 
 
+def collect_forward_unshard_profile(
+    model: nn.Module,
+    *,
+    clear: bool = True,
+    synchronize: bool = False,
+) -> dict[str, object]:
+    """Collect DMuon FSDP2 forward-unshard diagnostics for ``model``.
+
+    The counters are only populated when ``DMUON_RECORD_FORWARD_PROFILE=1`` is
+    set before :func:`dmuon.dedicate_params` builds the communication context.
+    ``synchronize=True`` should be used at diagnostic boundaries so CUDA-event
+    timings are complete; keep it disabled in normal measurement windows.
+    """
+
+    ctx = get_comm_ctx(model)
+    if ctx is None:
+        return {"enabled": False, "events_ready": 0, "events_pending": 0}
+    if synchronize and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return ctx.consume_forward_unshard_profile(clear=clear)
+
+
 def prepare_group_muon_grads(g, *, use_reduce_stream: bool = False) -> None:
     """Prepare one communication group's Muon gradients.
 
@@ -124,7 +146,8 @@ def _iter_groups(model: nn.Module):
 
 @contextmanager
 def _profile_range(name: str):
-    yield
+    with torch.profiler.record_function(name):
+        yield
 
 
 def _group_profile_name(g) -> str:
