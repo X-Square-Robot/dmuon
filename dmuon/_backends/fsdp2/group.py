@@ -244,6 +244,7 @@ class DedicatedParamGroup:
         # Stage-2 input + event alive until ``wait_for_reduce`` runs, mirroring
         # ``AllReduceState`` in ``_fsdp_param_group.py:115-117``.
         self._broadcast_event: Optional[torch.cuda.Event] = None
+        self._sharded_adamw_unshard_event: Optional[torch.cuda.Event] = None
         # FSDP2 only waits the previous reduce-scatter event between backward
         # groups to keep its input buffer lifetime bounded; it does *not* wait
         # the HSDP all-reduce tail there.  DMuon mirrors that split with this
@@ -440,7 +441,10 @@ class DedicatedParamGroup:
                 group_name, already_unsharded=1
             )
             return  # still unsharded from forward (reshard_after_forward=False)
-        if self._broadcast_event is not None:
+        if (
+            self._broadcast_event is not None
+            or self._sharded_adamw_unshard_event is not None
+        ):
             if not prefetch:
                 self.comm_ctx.record_forward_unshard_counter(
                     group_name, prefetch_hits=1
@@ -448,6 +452,18 @@ class DedicatedParamGroup:
             return  # already dispatched, pending wait_for_unshard
 
         broadcast_stream = self.comm_ctx.broadcast_stream
+        sharded_adamw_separate_stream = bool(
+            getattr(
+                self.comm_ctx,
+                "sharded_adamw_unshard_separate_stream_enabled",
+                False,
+            )
+        )
+        sharded_adamw_stream = (
+            self.comm_ctx.sharded_adamw_unshard_stream
+            if sharded_adamw_separate_stream
+            else broadcast_stream
+        )
         wait_current_start = None
         wait_current_end = None
         if self.comm_ctx.record_forward_profile:
@@ -462,6 +478,27 @@ class DedicatedParamGroup:
                 phase="broadcast_stream_wait_current",
                 start=wait_current_start,
                 end=wait_current_end,
+                bytes=0,
+                prefetch=prefetch,
+            )
+        sharded_wait_current_start = None
+        sharded_wait_current_end = None
+        if sharded_adamw_separate_stream and self.comm_ctx.record_forward_profile:
+            sharded_wait_current_start = torch.cuda.Event(enable_timing=True)
+            sharded_wait_current_end = torch.cuda.Event(enable_timing=True)
+            sharded_wait_current_start.record(sharded_adamw_stream)
+        if sharded_adamw_separate_stream:
+            sharded_adamw_stream.wait_stream(torch.cuda.current_stream())
+        if (
+            sharded_wait_current_start is not None
+            and sharded_wait_current_end is not None
+        ):
+            sharded_wait_current_end.record(sharded_adamw_stream)
+            self.comm_ctx.record_forward_unshard_event(
+                group_name=group_name,
+                phase="sharded_adamw_stream_wait_current",
+                start=sharded_wait_current_start,
+                end=sharded_wait_current_end,
                 bytes=0,
                 prefetch=prefetch,
             )
@@ -540,23 +577,6 @@ class DedicatedParamGroup:
                 ):
                     torch._foreach_copy_(dsts, srcs)
 
-            # DMuon-managed sharded AdamW base params: every shard rank owns a
-            # flat shard and all-gathers the full forward view.  This keeps
-            # embeddings/heads on the DMuon communication surface instead of
-            # handing them back to FSDP2 or a single owner broadcast.
-            for p in sharded_adamw_params:
-                assert p._sharded_adamw_full_padded is not None
-                assert p._sharded_adamw_comm_shard is not None
-                assert p._sharded_adamw_data is not None
-                with (
-                    torch.no_grad(),
-                    torch.autograd._unsafe_preserve_version_counter(
-                        p._sharded_adamw_full_padded
-                    ),
-                ):
-                    alloc_storage(p._sharded_adamw_full_padded)
-                    p._sharded_adamw_comm_shard.copy_(p._sharded_adamw_data)
-
             if owner_broadcast_bytes:
                 owner_start = None
                 owner_end = None
@@ -589,13 +609,32 @@ class DedicatedParamGroup:
                         bytes=owner_broadcast_bytes,
                         prefetch=prefetch,
                     )
-            if sharded_adamw_params:
+        if sharded_adamw_params:
+            # DMuon-managed sharded AdamW base params: every shard rank owns a
+            # flat shard and all-gathers the full forward view.  A separate
+            # stream is optional because these large embedding/head gathers can
+            # otherwise queue in front of the first decoder-layer owner
+            # broadcasts on the regular forward unshard stream.
+            with torch.cuda.stream(sharded_adamw_stream):
+                for p in sharded_adamw_params:
+                    assert p._sharded_adamw_full_padded is not None
+                    assert p._sharded_adamw_comm_shard is not None
+                    assert p._sharded_adamw_data is not None
+                    with (
+                        torch.no_grad(),
+                        torch.autograd._unsafe_preserve_version_counter(
+                            p._sharded_adamw_full_padded
+                        ),
+                    ):
+                        alloc_storage(p._sharded_adamw_full_padded)
+                        p._sharded_adamw_comm_shard.copy_(p._sharded_adamw_data)
+
                 gather_start = None
                 gather_end = None
                 if self.comm_ctx.record_forward_profile:
                     gather_start = torch.cuda.Event(enable_timing=True)
                     gather_end = torch.cuda.Event(enable_timing=True)
-                    gather_start.record(broadcast_stream)
+                    gather_start.record(sharded_adamw_stream)
                 with _profile_range(
                     f"dmuon.unshard_all_gather.sharded_adamw.dispatch.{group_name}"
                 ):
@@ -613,7 +652,7 @@ class DedicatedParamGroup:
                                     group=dp_group,
                                 )
                 if gather_start is not None and gather_end is not None:
-                    gather_end.record(broadcast_stream)
+                    gather_end.record(sharded_adamw_stream)
                     self.comm_ctx.record_forward_unshard_event(
                         group_name=group_name,
                         phase="sharded_adamw_all_gather_dispatch",
@@ -622,6 +661,7 @@ class DedicatedParamGroup:
                         bytes=sharded_adamw_all_gather_bytes,
                         prefetch=prefetch,
                     )
+            self._sharded_adamw_unshard_event = sharded_adamw_stream.record_event()
 
         self._broadcast_event = broadcast_stream.record_event()
 
@@ -632,7 +672,7 @@ class DedicatedParamGroup:
         After this call, all dedicated parameters are set on their modules
         and ready for forward/backward compute.
         """
-        if self._broadcast_event is None:
+        if self._broadcast_event is None and self._sharded_adamw_unshard_event is None:
             return
 
         group_name = _group_profile_name(self)
@@ -641,7 +681,10 @@ class DedicatedParamGroup:
             wait_start = torch.cuda.Event(enable_timing=True)
             wait_end = torch.cuda.Event(enable_timing=True)
             wait_start.record(current_stream)
-            current_stream.wait_event(self._broadcast_event)
+            if self._broadcast_event is not None:
+                current_stream.wait_event(self._broadcast_event)
+            if self._sharded_adamw_unshard_event is not None:
+                current_stream.wait_event(self._sharded_adamw_unshard_event)
             wait_end.record(current_stream)
             self.comm_ctx.record_forward_unshard_counter(group_name, wait_calls=1)
             self.comm_ctx.record_forward_unshard_event(
@@ -653,13 +696,17 @@ class DedicatedParamGroup:
                 prefetch=self._last_unshard_prefetch,
             )
         else:
-            current_stream.wait_event(self._broadcast_event)
+            if self._broadcast_event is not None:
+                current_stream.wait_event(self._broadcast_event)
+            if self._sharded_adamw_unshard_event is not None:
+                current_stream.wait_event(self._sharded_adamw_unshard_event)
 
         # Finalize: set unsharded params on modules
         for p in self.params:
             p.finish_unshard()
 
         self._broadcast_event = None
+        self._sharded_adamw_unshard_event = None
         self._is_unsharded = True
 
     # ---- reshard ----
@@ -683,6 +730,9 @@ class DedicatedParamGroup:
             # Drain and discard — the prefetched unshard was not consumed.
             torch.cuda.current_stream().wait_event(self._broadcast_event)
             self._broadcast_event = None
+        if self._sharded_adamw_unshard_event is not None:
+            torch.cuda.current_stream().wait_event(self._sharded_adamw_unshard_event)
+            self._sharded_adamw_unshard_event = None
         for p in self.params:
             p.reshard()
         from dmuon._core.internal_utils import free_storage

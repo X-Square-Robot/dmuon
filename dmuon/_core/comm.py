@@ -96,6 +96,10 @@ class DedicatedCommContext:
         """
         self.device = device
         self.broadcast_stream = torch.cuda.Stream(device=device, priority=-1)
+        self.sharded_adamw_unshard_stream = torch.cuda.Stream(
+            device=device, priority=-1
+        )
+        self.sharded_adamw_unshard_separate_stream_enabled = False
         self.reduce_stream = torch.cuda.Stream(device=device, priority=-1)
         # FSDP2 sets the all-reduce (i.e. replicate-dim) stream at default
         # priority because inter-node AR traffic uses different network

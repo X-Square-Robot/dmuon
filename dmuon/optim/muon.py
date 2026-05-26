@@ -138,6 +138,7 @@ class Muon(Optimizer):
         tp_distributed_gram_max_factor_to_scatter_ratio: float = 0.5,
         post_step_prefetch_groups: int = 0,
         post_step_prefetch_sharded_adamw: bool = False,
+        sharded_adamw_unshard_separate_stream: bool = False,
     ):
         if isinstance(ns_backend, str):
             ns_backend = NewtonSchulz(backend=ns_backend)
@@ -175,6 +176,9 @@ class Muon(Optimizer):
                 "Model has no _dedicated_comm_ctx. Call dmuon.dedicate_params() first."
             )
         self._comm_ctx = comm_ctx
+        self._comm_ctx.sharded_adamw_unshard_separate_stream_enabled = bool(
+            sharded_adamw_unshard_separate_stream
+        )
         self._all_dedicated_params = []
         self._dedicated_params = []
         seen_dps: set[int] = set()
