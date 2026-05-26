@@ -1163,6 +1163,7 @@ class Muon(Optimizer):
         needs_prepare = not self._grads_ready
         prepare_ahead = self._group_prepare_ahead
         prepared_until = -1
+        prefetched_sharded_adamw_groups = 0
 
         def _prepare_group(index: int) -> None:
             nonlocal prepared_until
@@ -1212,13 +1213,23 @@ class Muon(Optimizer):
                 _dispatch_post_step_async(group, phase_recorder=self._profile_phase)
             finally:
                 self._profile_event_end(profile_token)
-            should_prefetch = (
+            should_prefetch = bool(
                 self._post_step_prefetch_groups
                 and group_idx < self._post_step_prefetch_groups
-            ) or (
-                self._post_step_prefetch_sharded_adamw
-                and self._group_has_sharded_adamw_params(group)
             )
+            has_sharded_adamw = self._group_has_sharded_adamw_params(group)
+            if (
+                self._post_step_prefetch_sharded_adamw
+                and has_sharded_adamw
+                and prefetched_sharded_adamw_groups < 1
+            ):
+                # Only the first sharded-AdamW group is on the early forward
+                # critical path (embedding in decoder LMs).  Late groups such
+                # as lm_head are better left to normal forward prefetch; eager
+                # post-step prefetch would queue them before the first decoder
+                # layer's unshard.
+                should_prefetch = True
+                prefetched_sharded_adamw_groups += 1
             if should_prefetch:
                 group.unshard(prefetch=True)
 
