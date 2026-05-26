@@ -41,6 +41,7 @@ from .grad_clip import (
     clip_grad_norm_,
     register_muon_grad_clip_strategy,
 )
+from .diagnostics import summarize_comm_plan, summarize_param_groups
 from .optim import (
     POLAR_EXPRESS_COEFFICIENTS,
     YOU_COEFFICIENTS,
@@ -88,6 +89,8 @@ __all__ = [
     "clip_grad_norm_",
     "register_muon_grad_clip_strategy",
     "MuonGradClipStats",
+    "summarize_comm_plan",
+    "summarize_param_groups",
     "no_sync",
     "prepare_muon_grads",
     "wait_all_reduces",
