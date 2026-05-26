@@ -4,7 +4,7 @@ Combines Newton-Schulz orthogonalization on dedicated parameters with
 AdamW on symmetric (FSDP2-managed) parameters in a single optimizer.
 """
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import Optional, Union
 
 import torch
@@ -82,7 +82,9 @@ class Muon(Optimizer):
             Recommended by original Muon paper and used by Moonlight.
         replicate_async: If True (default), publish owner updates asynchronously
             and consume the events in the next forward. If False, drain the
-            publish path inside ``step()`` for deterministic timing.
+            publish path inside ``step()`` for deterministic timing. When TP
+            dedicated parameters are present, DMuon currently keeps this path
+            synchronous for correctness.
         record_step_profile: If True, record CUDA-event timing for optimizer
             phases and expose it via ``consume_last_step_profile()``.
         group_prepare_ahead: If True, prepare the next group's reduced grads
@@ -185,6 +187,20 @@ class Muon(Optimizer):
             getattr(dp, "tp_group", None) is not None
             for dp in self._all_dedicated_params
         )
+        self._has_ddp_tp_dedicated = any(
+            (
+                dp.__class__.__name__ == "DedicatedParamDDP"
+                and getattr(dp, "tp_group", None) is not None
+            )
+            or getattr(getattr(dp, "_orig_param", None), "_dedicated_mode", None) == "ddp_tp"
+            for dp in self._all_dedicated_params
+        )
+        if self._has_tp_dedicated and replicate_async:
+            # TP dedicated params publish through a TP-scatter stage before the
+            # DP/HSDP fan-out. Keep the public training path synchronous until
+            # async TP publish has sync-vs-async parity coverage.
+            self._replicate_async = False
+            replicate_async = False
 
         # Discover FSDP2-managed params AND DDP-replicated params. Both go
         # into the same AdamW param group downstream. ``_fsdp_params`` keeps
@@ -940,7 +956,7 @@ class Muon(Optimizer):
                 int(factor.numel()) for factor in desc["gram_factor_segments"]
             )
         self._profile_add("tp_gram_factor_broadcast_numel", total_numel)
-        # Keep legacy profile key for old dashboard/analysis scripts.
+        # Keep legacy profile key for older analysis scripts.
         self._profile_add("tp_gram_q_broadcast_numel", total_numel)
 
     def _apply_tp_distributed_gram_descriptor(

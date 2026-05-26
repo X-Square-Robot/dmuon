@@ -39,17 +39,7 @@ benchmarks/profiles/
 dmuon_kernel_cache/
 
 # Internal docs — never in public repo
-# Only llm_benchmark.md and syrk_benchmark.md are tracked from within docs/internal/.
-docs/internal/*.md
-docs/internal/**/*.md
-docs/internal/assets/
-docs/internal/report/
-docs/internal/research/
-docs/internal/fsdp2/
-docs/internal/weekly/
-docs/internal/benchmarks/*
-!docs/internal/benchmarks/llm_benchmark.md
-!docs/internal/benchmarks/syrk_benchmark.md
+docs/internal/
 
 # OS
 .DS_Store
@@ -72,3 +62,4 @@ tests/distributed/*.pt.trace.json
 /.remote_gpu_runs/
 /.profiles/
 /.tmp_*/
+/.pytest_artifacts/

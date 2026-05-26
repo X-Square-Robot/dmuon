@@ -137,10 +137,11 @@ def _find_layer_module(
 
     # Build the full path to the layer module
     # e.g., parent_fqn = "model.layers.3.self_attn.q_proj", layer_id = "layers.3"
-    idx = parent_fqn.find(layer_id)
+    layer_path_id = layer_id.removeprefix("_root.")
+    idx = parent_fqn.find(layer_path_id)
     if idx < 0:
         return parent_module, parent_module, param_name
-    layer_path = parent_fqn[: idx + len(layer_id)]
+    layer_path = parent_fqn[: idx + len(layer_path_id)]
     try:
         layer_module = model.get_submodule(layer_path)
     except AttributeError:
@@ -283,7 +284,6 @@ def dedicate_params(
     the TP group.  No TP mesh argument is required; simply pass the DP
     slice of your 3D mesh as ``mesh`` / ``replicate_mesh``, matching the
     FSDP2 convention (``fully_shard(mesh=mesh["replicate","shard"])``).
-    See ``docs/internal/research/tp_design.md`` §5.
 
     Typical 3D (replicate × shard × tp) call order::
 
@@ -521,8 +521,7 @@ def dedicate_params_ddp(
     Every rank keeps the full parameter live on the module. Ownership
     applies only to (1) who runs Newton-Schulz, (2) the ``dist.reduce``
     destination after backward, and (3) the ``dist.broadcast`` source
-    after ``optim.step``. See ``docs/internal/research/ddp_adapter_plan.md``
-    for the full semantic model.
+    after ``optim.step``.
 
     Compared with :func:`dedicate_params`, this entry:
 

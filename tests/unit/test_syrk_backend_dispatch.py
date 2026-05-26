@@ -1,6 +1,6 @@
 """Unit tests for the unified SYRK backend dispatch layer.
 
-See ``docs/internal/research/ns_backend_dispatch_plan.md`` §3 (B2).
+Exercises unified SYRK backend dispatch.
 """
 
 from __future__ import annotations

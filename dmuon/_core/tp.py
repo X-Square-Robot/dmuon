@@ -9,13 +9,13 @@ module provides only:
     * ``get_tp_mesh``      — TP sub-mesh lookup
     * ``get_tp_shard_dim`` — tensor dim sharded on TP axis
 
-FSDP2 alignment (see ``docs/internal/research/tp_design.md`` §5):
+FSDP2 alignment:
 ``dedicate_params`` never receives a ``tp_mesh`` argument.  The TP
 dimension is inferred from each parameter's DTensor — the caller's DP
 ``mesh_dim_names`` are subtracted from the param's mesh_dim_names, and
 whatever is left is TP.  This mirrors how ``fully_shard`` operates.
 
-DTensor reuse (see ``tp_design.md`` §6.3): no ``TPShardingInfo`` /
+DTensor reuse: no ``TPShardingInfo`` /
 ``TPMeshSpec`` dataclasses.  T1 only produces ``(param → int tp_rank)``
 owner mappings; T2 looks up mesh / shard_dim from DTensor at the moment
 it registers hooks.  This keeps the module small and forward-compatible

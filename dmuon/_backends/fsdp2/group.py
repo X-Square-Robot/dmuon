@@ -6,7 +6,7 @@ synchronization instead of CPU-blocking work.wait().
 """
 
 from collections import defaultdict
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
 import torch

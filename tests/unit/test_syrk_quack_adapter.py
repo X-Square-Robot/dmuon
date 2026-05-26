@@ -4,7 +4,7 @@ These tests run only when ``dmuon.kernels.syrk_quack.is_supported()`` is
 True — i.e. CUDA is available, a compatible quack version is installed,
 and the device is SM90+.  Every other environment skips gracefully.
 
-See ``docs/internal/benchmarks/quack_smoke_b300.md`` for the full B7/B8
+Exercises the quack soft-dependency adapter contract.
 probe; this file is the reproducible CI-friendly subset.
 """
 

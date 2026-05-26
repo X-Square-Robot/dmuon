@@ -12,8 +12,6 @@ import logging
 import os
 import time as _time
 from pathlib import Path
-from typing import Optional
-
 import torch
 from torch import Tensor
 

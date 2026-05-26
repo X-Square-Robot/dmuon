@@ -1,6 +1,6 @@
 """Tests for the public ``get_ns_backend`` / ``get_backend_status`` APIs.
 
-See ``docs/internal/research/ns_backend_dispatch_plan.md`` §3 (B3).
+Exercises the public Newton-Schulz backend inspection API.
 """
 
 from __future__ import annotations

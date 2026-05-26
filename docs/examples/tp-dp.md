@@ -78,9 +78,8 @@ Most TP runs need no extra optimizer knobs.  Advanced runs can set
 scratch buffers, and `tp_distributed_gram=` on `Muon` to use the
 TP-aware distributed Gram path when its factor payload is smaller than
 the full update scatter.  `replicate_async` is the DP/HSDP post-step
-publish overlap switch; it is not TP-only.  Sync and async post-step
-publish are designed to preserve the same loss trajectory on supported
-topologies.
+publish overlap switch; in the current release DMuon falls back to
+synchronous publish when TP-sharded dedicated parameters are present.
 
 ## What Happens Under the Hood
 

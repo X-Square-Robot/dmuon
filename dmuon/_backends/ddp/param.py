@@ -1,8 +1,6 @@
 """DedicatedParamDDP: DDP-path variant of DedicatedParam.
 
-Differs from :class:`dmuon.param.DedicatedParam` in three axes
-(storage / compute / comm are orthogonal — see
-``docs/internal/research/ddp_adapter_plan.md`` §2):
+Differs from :class:`dmuon.param.DedicatedParam` in three orthogonal axes:
 
 * **Storage**: every rank keeps the full parameter as a live
   ``nn.Parameter`` on the module, AND every rank clones the current value

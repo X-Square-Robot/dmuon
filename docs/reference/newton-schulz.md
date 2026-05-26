@@ -272,10 +272,9 @@ ns = dmuon.NewtonSchulz(kernel="cute_sm80")
 !!! info "quack backend"
     The `quack` SYRK backend is enabled on SM90+ devices when the
     `quack-kernels` soft dependency is installed (`pip install dmuon[quack]`).
-    Validated end-to-end on B300 (SM103) — see
-    `docs/internal/benchmarks/quack_smoke_b300.md` for the correctness
-    matrix and performance crossover (quack wins from M ≈ 4096, clear
-    advantage at M ≥ 8192).
+    It is validated by the optional backend tests and is expected to be most
+    useful on large matrices where SM90+ symmetric GEMM kernels have enough
+    work to amortize dispatch overhead.
 
     A runtime circuit-breaker
     `dmuon.kernels.syrk_quack.ADAPTER_READY` can be flipped to `False`

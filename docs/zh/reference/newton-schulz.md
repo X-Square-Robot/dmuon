@@ -259,9 +259,8 @@ ns = dmuon.NewtonSchulz(kernel="cute_sm80")
 
 !!! info "quack 后端"
     `quack` SYRK 后端在 SM90+ 设备上、已安装 `quack-kernels` 软依赖（`pip install dmuon[quack]`）
-    时自动启用。已在 B300（SM103）上端到端验证——详见
-    `docs/internal/benchmarks/quack_smoke_b300.md`（含 correctness 矩阵与性能拐点：
-    quack 从 M ≈ 4096 开始占优，M ≥ 8192 时领先显著）。
+    时自动启用。它由可选后端测试覆盖，主要面向大矩阵场景；在这些场景下
+    SM90+ symmetric GEMM kernel 有足够工作量摊薄调度开销。
 
     运行时 circuit-breaker `dmuon.kernels.syrk_quack.ADAPTER_READY`
     可设为 `False` 紧急禁用 quack 路径（无需卸载包），届时 `kernel="auto"`

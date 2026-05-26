@@ -19,7 +19,7 @@ Environment mirrors ``test_tp_alignment.py``:
 * ``DMUON_COMM_TOPOLOGY``: ``tp2``, ``tp4``, ``dp_tp2``, ``dp_tp4``,
   or ``hsdp_tp2``.
 * ``DMUON_COMM_MODE``: ``sync`` or ``async``.
-* ``DMUON_COMM_MODEL``: ``tiny`` or ``llama``.
+* ``DMUON_COMM_MODEL``: ``tiny`` or ``llama``; default ``tiny``.
 * ``DMUON_COMM_STEPS``: optimizer steps, default 2.
 * ``DMUON_COMM_OUT``: optional JSON output path.
 """
@@ -162,7 +162,7 @@ def _write_json(path: str | None, payload: dict[str, Any]) -> None:
 def main() -> int:
     topology = os.environ.get("DMUON_COMM_TOPOLOGY", "tp4")
     mode = os.environ.get("DMUON_COMM_MODE", "async")
-    model_kind = os.environ.get("DMUON_COMM_MODEL", "llama")
+    model_kind = os.environ.get("DMUON_COMM_MODEL", "tiny")
     tp_scope = os.environ.get("DMUON_COMM_TP_SCOPE", "full")
     steps = int(os.environ.get("DMUON_COMM_STEPS", "2"))
     out_path = os.environ.get("DMUON_COMM_OUT")
@@ -246,8 +246,13 @@ def main() -> int:
                 raise AssertionError(
                     f"TP scatter state missing after post-step dispatch: {after_dispatch}"
                 )
-            if not _ordered_post_step_groups(model):
+            ordered_groups = _ordered_post_step_groups(model)
+            if not ordered_groups:
                 raise AssertionError("post-step group order is empty")
+            group_summary = [
+                str(getattr(group, "_debug_name", None) or f"group_{id(group):x}")
+                for group in ordered_groups
+            ]
             if after_dispatch["pinned_tp_send_refs"] == 0:
                 raise AssertionError(
                     "TP owner send split refs were not pinned through scatter event: "

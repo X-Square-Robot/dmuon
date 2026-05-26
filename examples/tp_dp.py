@@ -156,7 +156,7 @@ def main():
     # Inspect TP properties
     if rank == 0:
         print(f"\nNS backend: {dmuon.get_ns_backend()}")
-        print(f"\nDedicated params owned by rank 0:")
+        print("\nDedicated params owned by rank 0:")
         for dp in dmuon.get_owned_params(model, rank=0):
             tp_info = (
                 f"tp_size={dp.tp_group.size()}, is_tp_owner={dp.is_tp_owner}"

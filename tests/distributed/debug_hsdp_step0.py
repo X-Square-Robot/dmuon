@@ -19,7 +19,6 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 
-import dmuon
 from dmuon import dedicate_params
 
 

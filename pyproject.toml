@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,10 +7,10 @@ name = "dmuon"
 version = "0.2.0"
 description = "Dedicated parameter ownership for distributed training with matrix optimizers"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.4.0",
+    "torch>=2.6.0",
 ]
 
 [project.optional-dependencies]
@@ -25,9 +25,26 @@ syrk = [
 quack = [
     "quack-kernels>=0.3,<0.4",
 ]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocs-static-i18n>=1.3",
+    "mkdocstrings[python]>=0.25",
+    "pymdown-extensions>=10.0",
+]
+release = [
+    "build>=1.2",
+    "twine>=5",
+]
 dev = [
-    "pytest",
-    "ruff",
+    "pytest>=8",
+    "ruff>=0.8",
+    "build>=1.2",
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocs-static-i18n>=1.3",
+    "mkdocstrings[python]>=0.25",
+    "pymdown-extensions>=10.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -51,7 +68,7 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
-ignore = ["E731", "E741", "F841"]
+ignore = ["E402", "E501", "E731", "E741", "F841", "I001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

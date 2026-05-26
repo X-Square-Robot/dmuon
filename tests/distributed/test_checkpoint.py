@@ -27,7 +27,6 @@ from dmuon import (
     set_optimizer_state_dict,
 )
 from dmuon.checkpoint import _compute_dedicated_fqns
-from dmuon.utils import get_dedicated_params, get_owned_params
 
 
 # ---- Simple model (same as other tests) ----
@@ -132,7 +131,7 @@ def test_model_state_dict_roundtrip(rank, world_size, device, mesh):
         train_step(model, optimizer, x)
 
     # Save state dict
-    sd = get_model_state_dict(model, cpu_offload=True)
+    sd = get_model_state_dict(model, cpu_offload=True, rank0_only=False)
 
     # Verify: all entries are non-empty, on CPU
     dp_fqns = _compute_dedicated_fqns(model)
@@ -184,13 +183,19 @@ def test_optimizer_state_dict_roundtrip(rank, world_size, device, mesh):
 
     # Save before any evaluation (avoid forward side effects)
     save_loss = model_save(batches[0]).item()
-    model_sd = get_model_state_dict(model_save, cpu_offload=True)
-    optim_sd = get_optimizer_state_dict(model_save, opt_save, cpu_offload=True)
+    model_sd = get_model_state_dict(
+        model_save, cpu_offload=True, rank0_only=False
+    )
+    optim_sd = get_optimizer_state_dict(
+        model_save, opt_save, cpu_offload=True, rank0_only=False
+    )
 
     # Continue training for reference
     train_step(model_save, opt_save, batches[2])
     ref_loss = model_save(batches[0]).item()
-    del model_save, opt_save; gc.collect(); torch.cuda.empty_cache()
+    del model_save, opt_save
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Load into fresh model
     model_load = build_model(device, mesh, seed=123)
@@ -273,7 +278,7 @@ def test_state_dict_completeness(rank, world_size, device, mesh):
     del ref_model
 
     model = build_model(device, mesh, seed=42)
-    sd = get_model_state_dict(model, cpu_offload=True)
+    sd = get_model_state_dict(model, cpu_offload=True, rank0_only=False)
     actual_keys = set(sd.keys())
 
     assert actual_keys == expected_keys, (
@@ -306,23 +311,33 @@ def main():
 
     if test_name in ("fqn", "all"):
         test_fqn_correctness(rank, world_size, device, mesh)
-        dist.barrier(); gc.collect(); torch.cuda.empty_cache()
+        dist.barrier()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if test_name in ("model", "all"):
         test_model_state_dict_roundtrip(rank, world_size, device, mesh)
-        dist.barrier(); gc.collect(); torch.cuda.empty_cache()
+        dist.barrier()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if test_name in ("optim", "all", "optim_only"):
         test_optimizer_state_dict_roundtrip(rank, world_size, device, mesh)
-        dist.barrier(); gc.collect(); torch.cuda.empty_cache()
+        dist.barrier()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if test_name in ("standard", "all"):
         test_load_from_standard_checkpoint(rank, world_size, device, mesh)
-        dist.barrier(); gc.collect(); torch.cuda.empty_cache()
+        dist.barrier()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if test_name in ("completeness", "all"):
         test_state_dict_completeness(rank, world_size, device, mesh)
-        dist.barrier(); gc.collect(); torch.cuda.empty_cache()
+        dist.barrier()
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if rank == 0:
         print("\nAll state dict tests passed!")

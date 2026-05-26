@@ -4,7 +4,7 @@ Exercises ``compute_balanced_assignment`` returning ``AssignmentResult``
 for models that contain a mix of TP-sharded and non-TP parameters, plus
 the backward-compat case where no DTensor is present at all.
 
-See ``docs/internal/research/tp_design.md`` §9.3.
+Exercises owner assignment for DTensor TP-sharded parameters.
 """
 
 from __future__ import annotations

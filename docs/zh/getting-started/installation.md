@@ -56,8 +56,7 @@
     pip install -e ".[dev]"
     ```
 
-    以可编辑模式安装库，并包含测试依赖
-    （`pytest`、`pytest-dist` 等工具）。
+    以可编辑模式安装库，并包含测试、打包和文档依赖。
     运行单元测试确认一切正常：
 
     ```bash
@@ -103,7 +102,7 @@ print(f"NS 后端      : {dmuon.get_ns_backend()}")
 DMuon 版本   : 0.2.0
 PyTorch 版本 : 2.6.0
 CUDA 可用    : True
-NS 后端      : syrk_sm80
+NS 后端      : Gram NS · kernel=cute_sm80 (SM80, DMuon internal)
 ```
 
 未安装 SYRK 或 GPU 较旧时的预期输出：
@@ -112,7 +111,7 @@ NS 后端      : syrk_sm80
 DMuon 版本   : 0.2.0
 PyTorch 版本 : 2.6.0
 CUDA 可用    : True
-NS 后端      : compiled
+NS 后端      : Gram NS · kernel=cublas (SM80, universal fallback)
 ```
 
 ---

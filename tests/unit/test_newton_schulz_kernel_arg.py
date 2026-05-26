@@ -3,7 +3,7 @@
 Covers the resolution priority:
     explicit kernel=  >  DMUON_NS_KERNEL  >  deterministic=  >  'auto'
 
-See ``docs/internal/research/ns_backend_dispatch_plan.md`` §3 (B4).
+Exercises NewtonSchulz kernel argument handling.
 """
 
 from __future__ import annotations

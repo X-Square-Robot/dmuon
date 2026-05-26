@@ -34,7 +34,7 @@ torchrun --nproc_per_node=4 tests/distributed/test_multiprocessing.py
 torchrun --nproc_per_node=4 tests/distributed/test_reduce_regression.py
 torchrun --nproc_per_node=4 tests/distributed/test_muon_step.py
 torchrun --nproc_per_node=4 tests/distributed/test_e2e_dp.py
-torchrun --nproc_per_node=4 tests/distributed/test_e2e_tp_dp.py   # needs 4+ GPUs (DP=2, TP=2)
+torchrun --nproc_per_node=8 tests/distributed/test_e2e_tp_dp.py   # needs 8 GPUs (DP=4, TP=2)
 torchrun --nproc_per_node=4 tests/distributed/test_correctness.py
 ```
 

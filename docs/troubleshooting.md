@@ -29,7 +29,7 @@
 
     **Fix:** upgrade PyTorch.
     ```bash
-    pip install "torch>=2.4" --index-url https://download.pytorch.org/whl/cu121
+    pip install "torch>=2.6" --index-url https://download.pytorch.org/whl/cu121
     ```
 
 ---

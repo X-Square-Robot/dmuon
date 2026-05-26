@@ -40,11 +40,10 @@ For each parameter the user marked for dedicated ownership:
      axis; the next forward's shard broadcast reads the updated owner
      shard.
 
-Sync (`replicate_async=False`) and async (default `replicate_async=True`)
-post-step paths are designed to preserve the same numerical trajectory;
-async only changes WHEN the final scatter completes, not the mathematical
-result.  The distributed loss matrix below checks this across the supported
-TP topologies.
+In the current release, TP-sharded dedicated parameters use the synchronous
+post-step publish path even if `replicate_async=True` is requested.  This keeps
+TP training on the checked numerical path while the async TP scatter path
+remains a diagnostic/performance development target.
 
 ---
 
@@ -191,8 +190,8 @@ arguments rather than environment variables:
   `tp_distributed_gram_policy="beneficial"`, DMuon only uses it when the Gram
   factor payload is expected to be smaller than scattering the full update.
 * `Muon(..., replicate_async=...)` controls DP/HSDP post-step publish overlap.
-  It is not TP-specific, but TP scatter participates in the same post-step
-  publish schedule.
+  When TP-sharded dedicated parameters are present, DMuon currently falls back
+  to synchronous post-step publish for correctness.
 
 ---
 
@@ -201,10 +200,8 @@ arguments rather than environment variables:
 `Muon` exposes `replicate_async` for post-step publish timing:
 
 ```python
-# Default — async scatter + replicate broadcast; each group's post-step
-# comm is consumed by the next iteration's forward (overlap).
-optimizer = dmuon.Muon(model, lr=0.02)                        # async
-optimizer = dmuon.Muon(model, lr=0.02, replicate_async=True)  # explicit
+# Current TP-safe default — scatter + broadcast complete before step() returns.
+optimizer = dmuon.Muon(model, lr=0.02)
 
 # Sync — scatter + broadcast complete before step() returns.  Useful
 # for profiling or for pipelines where the next iter's forward starts
@@ -212,12 +209,10 @@ optimizer = dmuon.Muon(model, lr=0.02, replicate_async=True)  # explicit
 optimizer = dmuon.Muon(model, lr=0.02, replicate_async=False)
 ```
 
-Both modes produce the same loss trajectory on the supported TP
-topologies (verified on 2026-04-30 across TP2, TP4, DP×TP2, DP×TP4,
-and HSDP×TP2).  Async's benefit is purely that the scatter NCCL kernels
-run concurrently with the next iteration's forward compute.  On the
-seq512 Llama3B benchmark, async improved p50 step time by roughly
-`1.05x` to `1.14x` depending on topology.
+TP async publish is not enabled by default in this release.  The TP diagnostic
+tests still exercise the underlying scatter/publish state machine, but user
+training stays on the synchronous path until sync-vs-async parity is covered
+across the public TP matrix.
 
 ---
 
@@ -264,9 +259,6 @@ TP group.
 
 * [HSDP guide](hsdp.md) — replicate × shard setup; composes with TP
 * [`dedicate_params` API](../reference/api.md) — full signature
-* `docs/internal/research/tp_design.md` — final implementation design,
-  lifecycle ordering, correctness gates, and benchmark summary
-* `docs/internal/research/tp_overlap_profile.md` — NSight-style
-  overlap measurement (100% on 8-GPU 3D mesh toy)
-* `docs/internal/research/tp_alignment_report.md` — sync/async
-  bit-identical alignment verification
+* [Checkpointing](checkpoint.md) — state-dict behavior for dedicated params
+* [Communication Cost Analysis](../reference/communication-cost.md) —
+  broadcast/reduce cost model

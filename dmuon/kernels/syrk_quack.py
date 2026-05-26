@@ -6,9 +6,8 @@ contract (``D = α · A @ Bᵀ + β · C + diag_add · I``) to quack's
 ``gemm_symmetric`` (``out = α · A @ B + β · C``) — DMuon passes ``B.T``
 as quack's ``B`` and adds the diagonal bias as a post-step.
 
-The mapping is validated on B300 (SM103) in B7/B8; see
-``docs/internal/benchmarks/quack_smoke_b300.md`` for the correctness
-matrix and perf crossover.
+The mapping is validated on SM90+ hardware with correctness and performance
+smoke tests.
 
 Design (Phase B-H):
   * Uses the 2D high-level interface ``quack.gemm_interface.gemm_symmetric``
