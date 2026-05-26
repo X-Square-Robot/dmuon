@@ -406,12 +406,35 @@ class DedicatedParamGroup:
         group_name = _group_profile_name(self)
         pending_tp_publish = self._tp_scatter_state is not None
         pending_replicate_publish = self._replicate_broadcast_state is not None
+        publish_wait_stream = (
+            self.comm_ctx.broadcast_stream if prefetch else torch.cuda.current_stream()
+        )
+        publish_wait_start = None
+        publish_wait_end = None
+        if self.comm_ctx.record_forward_profile:
+            publish_wait_start = torch.cuda.Event(enable_timing=True)
+            publish_wait_end = torch.cuda.Event(enable_timing=True)
+            publish_wait_start.record(publish_wait_stream)
         if prefetch:
             with _profile_range(f"dmuon.forward_prefetch_publish.{group_name}"):
                 self._pre_forward_prefetch_publish()
         else:
             with _profile_range(f"dmuon.pre_forward_wait.{group_name}"):
                 self._pre_forward_wait()
+        if publish_wait_start is not None and publish_wait_end is not None:
+            publish_wait_end.record(publish_wait_stream)
+            self.comm_ctx.record_forward_unshard_event(
+                group_name=group_name,
+                phase=(
+                    "prefetch_publish_wait"
+                    if prefetch
+                    else "pre_forward_publish_wait"
+                ),
+                start=publish_wait_start,
+                end=publish_wait_end,
+                bytes=0,
+                prefetch=prefetch,
+            )
         if self._is_unsharded:
             self.comm_ctx.record_forward_unshard_counter(
                 group_name, already_unsharded=1
@@ -425,7 +448,23 @@ class DedicatedParamGroup:
             return  # already dispatched, pending wait_for_unshard
 
         broadcast_stream = self.comm_ctx.broadcast_stream
+        wait_current_start = None
+        wait_current_end = None
+        if self.comm_ctx.record_forward_profile:
+            wait_current_start = torch.cuda.Event(enable_timing=True)
+            wait_current_end = torch.cuda.Event(enable_timing=True)
+            wait_current_start.record(broadcast_stream)
         broadcast_stream.wait_stream(torch.cuda.current_stream())
+        if wait_current_start is not None and wait_current_end is not None:
+            wait_current_end.record(broadcast_stream)
+            self.comm_ctx.record_forward_unshard_event(
+                group_name=group_name,
+                phase="broadcast_stream_wait_current",
+                start=wait_current_start,
+                end=wait_current_end,
+                bytes=0,
+                prefetch=prefetch,
+            )
 
         from dmuon._core.internal_utils import alloc_storage
 
