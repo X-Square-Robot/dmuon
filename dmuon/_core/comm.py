@@ -118,6 +118,7 @@ class DedicatedCommContext:
             )
         self.post_forward_order: list = []  # DedicatedParamGroup | DedicatedParamGroupDDP
         self.all_states: list[DedicatedState] = []
+        self.forward_prefetch_depth = 1
         self.post_backward_final_callback_queued: bool = False
         # Rolling-drain pointer for the 1-outstanding reduce policy; see the
         # class docstring's "Rolling reduce drain" section.  Untyped because

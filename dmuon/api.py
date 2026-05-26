@@ -76,8 +76,12 @@ def _link_forward_prefetch_states(
     )
     for state in ordered:
         state._next_group = None
+        state._next_groups = []
     for idx in range(len(ordered) - 1):
         ordered[idx]._next_group = ordered[idx + 1].group
+        ordered[idx]._next_groups = [
+            later_state.group for later_state in ordered[idx + 1 :]
+        ]
     comm_ctx.all_states[:] = ordered
 
 

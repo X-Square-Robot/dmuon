@@ -15,14 +15,23 @@ def test_forward_prefetch_links_states_by_model_module_order():
     model.second = nn.Linear(2, 2)
     model.third = nn.Linear(2, 2)
 
-    first = SimpleNamespace(module=model.first, group="first", _next_group=None)
-    second = SimpleNamespace(module=model.second, group="second", _next_group=None)
-    third = SimpleNamespace(module=model.third, group="third", _next_group=None)
+    first = SimpleNamespace(
+        module=model.first, group="first", _next_group=None, _next_groups=[]
+    )
+    second = SimpleNamespace(
+        module=model.second, group="second", _next_group=None, _next_groups=[]
+    )
+    third = SimpleNamespace(
+        module=model.third, group="third", _next_group=None, _next_groups=[]
+    )
     comm_ctx = SimpleNamespace(all_states=[third, first, second])
 
     _link_forward_prefetch_states(model, [third, first, second], comm_ctx)
 
     assert first._next_group == "second"
+    assert first._next_groups == ["second", "third"]
     assert second._next_group == "third"
+    assert second._next_groups == ["third"]
     assert third._next_group is None
+    assert third._next_groups == []
     assert comm_ctx.all_states == [first, second, third]

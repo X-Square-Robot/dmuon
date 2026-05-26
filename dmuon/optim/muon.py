@@ -139,6 +139,7 @@ class Muon(Optimizer):
         post_step_prefetch_groups: int = 0,
         post_step_prefetch_sharded_adamw: bool = False,
         sharded_adamw_unshard_separate_stream: bool = False,
+        forward_prefetch_depth: int = 1,
     ):
         if isinstance(ns_backend, str):
             ns_backend = NewtonSchulz(backend=ns_backend)
@@ -179,6 +180,7 @@ class Muon(Optimizer):
         self._comm_ctx.sharded_adamw_unshard_separate_stream_enabled = bool(
             sharded_adamw_unshard_separate_stream
         )
+        self._comm_ctx.forward_prefetch_depth = max(0, int(forward_prefetch_depth))
         self._all_dedicated_params = []
         self._dedicated_params = []
         seen_dps: set[int] = set()

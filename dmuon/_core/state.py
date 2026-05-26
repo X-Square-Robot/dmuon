@@ -110,6 +110,7 @@ class DedicatedState:
         self.reshard_after_forward = reshard_after_forward
         # Linked by api.py for forward prefetch (next layer's group)
         self._next_group: Optional["DedicatedParamGroup"] = None
+        self._next_groups: list["DedicatedParamGroup"] = []
 
         # Register self so the autograd-engine root callback can iterate all
         # states and fire post_backward on any group whose fast path missed.
@@ -145,8 +146,13 @@ class DedicatedState:
         # Forward prefetch: dispatch next layer's unshard (no wait).
         # During activation-checkpoint recompute this hook runs inside backward;
         # the next forward layer is not the next layer consumed by backward.
-        if self._next_group is not None and not _is_backward_pass():
-            self._next_group.unshard(prefetch=True)  # no-op if already unsharded
+        if not _is_backward_pass():
+            next_groups = self._next_groups
+            if not next_groups and self._next_group is not None:
+                next_groups = [self._next_group]
+            depth = max(0, int(getattr(self.comm_ctx, "forward_prefetch_depth", 1)))
+            for group in next_groups[:depth]:
+                group.unshard(prefetch=True)  # no-op if already unsharded
         # Reset fast-path flag for this forward; backward will set it True
         # either from the fast path or from the root callback.
         self.group._post_backward_fired = False
