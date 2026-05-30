@@ -139,9 +139,20 @@ class DedicatedCommContext:
                 "owner_broadcast_bucket_count": 0,
                 "sharded_adamw_all_gather_bytes": 0,
                 "sharded_adamw_param_count": 0,
+                "sharded_muon_all_gather_bytes": 0,
+                "sharded_muon_param_count": 0,
                 "wait_calls": 0,
                 "tp_publish_waits": 0,
                 "replicate_publish_waits": 0,
+                "sharded_muon_publish_waits": 0,
+                "prefetch_publish_not_ready_skips": 0,
+                "prefetch_tp_publish_not_ready_skips": 0,
+                "prefetch_replicate_publish_not_ready_skips": 0,
+                "prefetch_sharded_muon_publish_not_ready_skips": 0,
+                "prefetch_unready_publish_waits_queued": 0,
+                "prefetch_unready_tp_publish_waits_queued": 0,
+                "prefetch_unready_replicate_publish_waits_queued": 0,
+                "prefetch_unready_sharded_muon_publish_waits_queued": 0,
             }
         )
 

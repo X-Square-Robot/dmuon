@@ -151,8 +151,11 @@ class DedicatedState:
             if not next_groups and self._next_group is not None:
                 next_groups = [self._next_group]
             depth = max(0, int(getattr(self.comm_ctx, "forward_prefetch_depth", 1)))
-            for group in next_groups[:depth]:
-                group.unshard(prefetch=True)  # no-op if already unsharded
+            for prefetch_idx, group in enumerate(next_groups[:depth]):
+                group.unshard(  # no-op if already unsharded
+                    prefetch=True,
+                    allow_unready_publish_wait=(prefetch_idx == 0),
+                )
         # Reset fast-path flag for this forward; backward will set it True
         # either from the fast path or from the root callback.
         self.group._post_backward_fired = False
@@ -302,11 +305,12 @@ def _root_post_backward_final_callback(comm_ctx: DedicatedCommContext) -> None:
     1. Force-fire post_backward on any group whose fast path did not run
        (e.g. when no input tensor required gradient, so
        ``_DedicatedPostBackward.backward`` never executed).
-    2. Drain the full reduce tails before the optimizer step.  The per-layer
-       rolling drain in :meth:`_run_post_backward` only waits Stage-1 for
-       buffer safety, following FSDP2.  Here we wait the complete Stage-1 +
-       Stage-2 pipeline so owner-side gradients are materialized before the
-       optimizer reads them.
+    2. Drain the full reduce tails before the optimizer step for legacy groups
+       that cannot split Stage-1 and Stage-2.  FSDP2/HSDP groups default to
+       delaying the full Stage-2 wait until per-group optimizer preparation;
+       backward only waits Stage-1 for buffer safety, following FSDP2.  This
+       lets late Stage-2 tails overlap with earlier groups' optimizer work and
+       post-step publish instead of forcing a hard end-of-backward barrier.
 
     The two passes are intentionally separated: step 1's ``_run_post_backward``
     calls may dispatch new reduces (updating ``last_reduced_group``), so the

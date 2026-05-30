@@ -268,6 +268,8 @@ def dedicate_params(
     owner_strategy: str = "lpt",
     tp_buffer_reuse: bool | str = False,
     replicate_broadcast_bucket_mb: float = 0.0,
+    muon_forward_unshard: str = "broadcast",
+    delay_stage2_to_optimizer: bool = True,
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -354,6 +356,18 @@ def dedicate_params(
             Accepts ``False``/``True`` or ``"gather"``, ``"scatter"``, ``"all"``.
         replicate_broadcast_bucket_mb: Optional HSDP post-step publish bucket
             size in MiB. ``0`` keeps one coalesced publish per hook group.
+        muon_forward_unshard: Forward unshard placement for Muon-routed
+            parameters. ``"broadcast"`` keeps the existing owner-to-all
+            publish path. ``"all_gather"`` keeps the owner-side full-matrix
+            update, then scatters the updated tensor into rank-local shards
+            after the optimizer step and reconstructs the forward view with an
+            FSDP-style all-gather. The all-gather mode is experimental and is
+            currently supported only for non-TP Muon parameters.
+        delay_stage2_to_optimizer: When True, backward only waits the Stage-1
+            shard reduce for buffer lifetime; HSDP Stage-2 replicate reduce is
+            waited by per-group optimizer preparation.  This is the default
+            because it preserves overlap between late reduce tails and earlier
+            optimizer/publish work.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its DP owner
@@ -478,6 +492,7 @@ def dedicate_params(
                 if route_hint_fn is not None
                 else getattr(param, "_dmuon_route_hint", None)
             ),
+            muon_forward_unshard=muon_forward_unshard,
         )
         aliases = [
             (module, name)
@@ -492,7 +507,11 @@ def dedicate_params(
     all_states: list[DedicatedState] = []
     module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     for layer_module, d_params in layer_to_dparams.items():
-        group = DedicatedParamGroup(d_params, comm_ctx)
+        group = DedicatedParamGroup(
+            d_params,
+            comm_ctx,
+            delay_stage2_to_optimizer=delay_stage2_to_optimizer,
+        )
         group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         state = DedicatedState(layer_module, group, comm_ctx, reshard_after_forward)
         layer_module._dedicated_state = state

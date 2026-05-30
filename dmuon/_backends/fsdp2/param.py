@@ -59,6 +59,27 @@ def _normalize_dmuon_route_hint(route: Optional[str]) -> str:
     return route
 
 
+def _normalize_muon_forward_unshard(mode: Optional[str]) -> str:
+    if mode is None:
+        return "broadcast"
+    mode = str(mode).strip().lower()
+    aliases = {
+        "owner_broadcast": "broadcast",
+        "bcast": "broadcast",
+        "sharded": "all_gather",
+        "sharded_publish": "all_gather",
+        "scatter_all_gather": "all_gather",
+        "ag": "all_gather",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"broadcast", "all_gather"}:
+        raise ValueError(
+            "DMuon Muon forward unshard mode must be 'broadcast' or "
+            f"'all_gather', got {mode!r}"
+        )
+    return mode
+
+
 def _normalize_tp_local_grad(param: "DedicatedParam", grad: torch.Tensor) -> torch.Tensor:
     """Return the TP-local gradient shard expected by dedicated reduce.
 
@@ -114,6 +135,7 @@ class DedicatedParam:
         replicate_group: Optional[dist.ProcessGroup] = None,
         tp_owner_local_rank: int = 0,
         route_hint: Optional[str] = None,
+        muon_forward_unshard: str = "broadcast",
     ):
         self.module = module
         self.param_name = param_name
@@ -167,6 +189,9 @@ class DedicatedParam:
         self._compute_dtype = compute_dtype  # e.g. bf16 for mixed precision
         self._requires_grad = param.requires_grad
         self._dmuon_route: str = _normalize_dmuon_route_hint(route_hint)
+        self._muon_forward_unshard: str = _normalize_muon_forward_unshard(
+            muon_forward_unshard
+        )
 
         # Cached attrs (were @property, now computed once).
         # Dependencies: is_dtensor, _tp_spec, _orig_size — all set above.
@@ -259,6 +284,22 @@ class DedicatedParam:
         if self._dmuon_route == "sharded_adamw":
             self._init_sharded_adamw_storage(local_data)
 
+        # Optional Muon forward placement: the optimizer still updates the
+        # owner full matrix, but post-step publish scatters updated shards to
+        # every rank and the next forward reconstructs with all-gather.  This
+        # mirrors FSDP's forward communication shape and avoids owner-to-all
+        # broadcast on the forward critical path.
+        self._sharded_muon_numel: int = int(local_data.numel())
+        self._sharded_muon_chunk_numel: int = 0
+        self._sharded_muon_valid_numel: int = 0
+        self._sharded_muon_data: Optional[torch.Tensor] = None
+        self._sharded_muon_full_padded: Optional[torch.Tensor] = None
+        self._sharded_muon_comm_shard: Optional[torch.Tensor] = None
+        self._sharded_muon_scatter_input: Optional[torch.Tensor] = None
+        self._sharded_muon_initialized: bool = False
+        if self.uses_sharded_muon_forward():
+            self._init_sharded_muon_storage(local_data)
+
         # Reduced gradient (on owner, after backward)
         self._reduced_grad: Optional[torch.Tensor] = None
 
@@ -295,11 +336,21 @@ class DedicatedParam:
     def uses_sharded_adamw(self) -> bool:
         return self._dmuon_route == "sharded_adamw"
 
-    def _init_sharded_adamw_storage(self, local_data: torch.Tensor) -> None:
-        """Initialize DMuon-owned shard storage for base AdamW tensors."""
+    def uses_sharded_muon_forward(self) -> bool:
+        return (
+            self._dmuon_route == "muon"
+            and self._muon_forward_unshard == "all_gather"
+        )
+
+    def _init_sharded_storage_common(
+        self,
+        local_data: torch.Tensor,
+        *,
+        allow_meta_source: bool = False,
+    ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.tp_group is not None:
             raise NotImplementedError(
-                f"{self.param_name}: sharded_adamw base route does not yet "
+                f"{self.param_name}: sharded forward placement does not yet "
                 "support TP-sharded DTensor parameters"
             )
         shard_world = int(self.dp_group.size())
@@ -310,24 +361,42 @@ class DedicatedParam:
         stop = min(start + chunk, numel)
         valid = max(0, stop - start)
 
-        self._sharded_adamw_chunk_numel = int(chunk)
-        self._sharded_adamw_valid_numel = int(valid)
-        shard = torch.zeros(chunk, dtype=self._orig_dtype, device=self.device)
-        if valid:
-            shard[:valid].copy_(local_data.detach().reshape(-1)[start:stop])
-        self._sharded_adamw_data = shard
+        data_shard = torch.zeros(chunk, dtype=self._orig_dtype, device=self.device)
+        if valid and not bool(getattr(local_data, "is_meta", False)):
+            data_shard[:valid].copy_(local_data.detach().reshape(-1)[start:stop])
+        elif valid and not allow_meta_source:
+            raise NotImplementedError(
+                f"{self.param_name}: cannot initialize sharded storage from a "
+                "meta tensor"
+            )
 
         full_padded_numel = chunk * shard_world
         comm_dtype = self._compute_dtype or self._orig_dtype
-        self._sharded_adamw_full_padded = torch.empty(
+        full_padded = torch.empty(
             full_padded_numel, dtype=comm_dtype, device=self.device
         )
-        self._sharded_adamw_comm_shard = torch.empty(
-            chunk, dtype=comm_dtype, device=self.device
-        )
-        self._sharded_adamw_reduce_input = torch.empty(
-            full_padded_numel, dtype=comm_dtype, device=self.device
-        )
+        comm_shard = torch.empty(chunk, dtype=comm_dtype, device=self.device)
+        full_comm = torch.empty(full_padded_numel, dtype=comm_dtype, device=self.device)
+        return chunk, valid, data_shard, full_padded, comm_shard, full_comm
+
+    def _init_sharded_adamw_storage(self, local_data: torch.Tensor) -> None:
+        """Initialize DMuon-owned shard storage for base AdamW tensors."""
+        numel = int(local_data.numel())
+        (
+            chunk,
+            valid,
+            shard,
+            full_padded,
+            comm_shard,
+            reduce_input,
+        ) = self._init_sharded_storage_common(local_data)
+        self._sharded_adamw_chunk_numel = int(chunk)
+        self._sharded_adamw_valid_numel = int(valid)
+        self._sharded_adamw_data = shard
+
+        self._sharded_adamw_full_padded = full_padded
+        self._sharded_adamw_comm_shard = comm_shard
+        self._sharded_adamw_reduce_input = reduce_input
 
         contiguous_stride = _make_contiguous_stride(self._orig_size)
         view = torch.as_strided(
@@ -347,6 +416,45 @@ class DedicatedParam:
 
         free_storage(self._sharded_adamw_full_padded)
 
+    def _init_sharded_muon_storage(self, local_data: torch.Tensor) -> None:
+        """Initialize shard storage for Muon forward all-gather placement."""
+        numel = int(local_data.numel())
+        (
+            chunk,
+            valid,
+            shard,
+            full_padded,
+            comm_shard,
+            scatter_input,
+        ) = self._init_sharded_storage_common(
+            local_data,
+            allow_meta_source=True,
+        )
+        self._sharded_muon_chunk_numel = int(chunk)
+        self._sharded_muon_valid_numel = int(valid)
+        self._sharded_muon_data = shard
+        self._sharded_muon_full_padded = full_padded
+        self._sharded_muon_comm_shard = comm_shard
+        self._sharded_muon_scatter_input = scatter_input
+
+        contiguous_stride = _make_contiguous_stride(self._orig_size)
+        view = torch.as_strided(
+            self._sharded_muon_full_padded[:numel],
+            self._orig_size,
+            contiguous_stride,
+            0,
+        )
+        if self.is_dtensor:
+            wrapped = _from_local_no_grad(view, self._tp_spec)
+        else:
+            wrapped = view
+        self._unsharded_param = nn.Parameter(
+            wrapped, requires_grad=self._requires_grad
+        )
+        from dmuon._core.internal_utils import free_storage
+
+        free_storage(self._sharded_muon_full_padded)
+
     def bind_to_packed_buffer(
         self, packed_buf: torch.Tensor, storage_offset: int
     ) -> None:
@@ -358,11 +466,12 @@ class DedicatedParam:
         alloc/free's the packed buffer's storage, this view's storage also
         resizes (it's the same Storage object).
         """
-        if self.uses_sharded_adamw():
+        if self.uses_sharded_adamw() or self.uses_sharded_muon_forward():
             # Sharded base AdamW owns its full forward view via
-            # ``_sharded_adamw_full_padded`` and is populated by all-gather,
-            # not owner broadcast.  Keep the view created in
-            # ``_init_sharded_adamw_storage``.
+            # ``_sharded_adamw_full_padded``; optional Muon sharded forward
+            # placement owns the same kind of view via
+            # ``_sharded_muon_full_padded``.  Both are populated by
+            # all-gather, not owner broadcast, so keep their init-time views.
             return
         contiguous_stride = _make_contiguous_stride(self._orig_size)
         view = torch.as_strided(packed_buf, self._orig_size, contiguous_stride, storage_offset)

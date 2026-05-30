@@ -18,6 +18,8 @@ def _make_dp(
     is_owner=True,
     tp_group=None,
     tp_owner_local_rank=0,
+    route_hint=None,
+    muon_forward_unshard="broadcast",
 ):
     """Build a DedicatedParam on CPU with a minimal dp_group stub.
 
@@ -29,6 +31,9 @@ def _make_dp(
     module.weight = param
 
     class _StubGroup:
+        def size(self):
+            return 2
+
         def rank(self):
             return 0 if is_owner else 1
 
@@ -55,6 +60,8 @@ def _make_dp(
             device=torch.device("cpu"),
             compute_dtype=None,
             tp_owner_local_rank=tp_owner_local_rank,
+            route_hint=route_hint,
+            muon_forward_unshard=muon_forward_unshard,
         )
     finally:
         param_module.dist = orig_dist
@@ -130,6 +137,19 @@ def test_tp_owner_local_rank_bounds_checked():
 
     with pytest.raises(ValueError, match="outside TP group size"):
         _make_dp(tp_group=_StubTPGroup(), tp_owner_local_rank=2)
+
+
+def test_muon_all_gather_forward_uses_sharded_storage():
+    dp = _make_dp(route_hint="muon", muon_forward_unshard="all_gather")
+    assert dp.uses_sharded_muon_forward()
+    assert dp._sharded_muon_chunk_numel == 16
+    assert dp._sharded_muon_valid_numel == 16
+    assert dp._sharded_muon_data is not None
+    assert dp._sharded_muon_full_padded is not None
+    assert dp._sharded_muon_comm_shard is not None
+    assert dp._sharded_muon_scatter_input is not None
+    assert dp._unsharded_param is not None
+    assert dp._unsharded_param.shape == dp._orig_size
 
 
 if __name__ == "__main__":
