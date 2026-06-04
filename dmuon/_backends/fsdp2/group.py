@@ -11,6 +11,7 @@ from typing import NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
+from .patch import coalescing_manager  # torch 2.7+ compat
 
 from dmuon._core.comm import DedicatedCommContext
 from dmuon._core.dynamo import dynamo_disable
@@ -469,7 +470,7 @@ class DedicatedParamGroup:
                     p._sharded_adamw_comm_shard.copy_(p._sharded_adamw_data)
 
             group_name = _group_profile_name(self)
-            with dist._coalescing_manager(group=dp_group, device=self.device):
+            with coalescing_manager(group=dp_group, device=self.device):
                 for owner_coord, packed_buf in self._packed_buf_by_owner.items():
                     profile_name = (
                         f"dmuon.unshard_broadcast.bucket."
@@ -484,7 +485,7 @@ class DedicatedParamGroup:
                             group=dp_group,
                         )
             if sharded_adamw_params:
-                with dist._coalescing_manager(group=dp_group, device=self.device):
+                with coalescing_manager(group=dp_group, device=self.device):
                     for p in sharded_adamw_params:
                         profile_name = (
                             f"dmuon.unshard_all_gather.sharded_adamw."
@@ -655,7 +656,7 @@ class DedicatedParamGroup:
         # dangle the post-reduce view.
         with _profile_range(f"dmuon.stage1_shard_reduce.{group_name}"):
             with torch.cuda.stream(reduce_stream):
-                with dist._coalescing_manager(
+                with coalescing_manager(
                     group=dp_group, device=self.device
                 ):
                     for p in self.params:
@@ -687,7 +688,7 @@ class DedicatedParamGroup:
                     and p._unsharded_param.grad is not None
                 ]
                 if sharded_work:
-                    with dist._coalescing_manager(
+                    with coalescing_manager(
                         group=dp_group, device=self.device
                     ):
                         for p in sharded_work:
@@ -775,7 +776,7 @@ class DedicatedParamGroup:
                     partial = self._partial_reduce_by_param.pop(id(p), None)
                     if partial is not None:
                         grad.add_(partial)
-                with dist._coalescing_manager(
+                with coalescing_manager(
                     group=replicate_group, device=self.device
                 ):
                     for grad, p in stage2_pending:
@@ -994,7 +995,7 @@ class DedicatedParamGroup:
             ] = []
             reuse_buffers = _tp_gather_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
-                with dist._coalescing_manager(group=tp_group, device=self.device):
+                with coalescing_manager(group=tp_group, device=self.device):
                     for p, local_grad in group_work:
                         tp_size = p.tp_group.size()
                         if p.is_tp_owner:
@@ -1121,7 +1122,7 @@ class DedicatedParamGroup:
         with torch.cuda.stream(bcast_stream):
             reuse_buffers = _tp_scatter_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
-                with dist._coalescing_manager(group=tp_group, device=self.device):
+                with coalescing_manager(group=tp_group, device=self.device):
                     for p in group_work:
                         shard_dim = p.shard_dim if p.shard_dim is not None else 0
                         if reuse_buffers:
@@ -1288,7 +1289,7 @@ class DedicatedParamGroup:
         bcast_stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(bcast_stream):
-            with dist._coalescing_manager(group=replicate_group, device=self.device):
+            with coalescing_manager(group=replicate_group, device=self.device):
                 for p in self.params:
                     if my_shard_rank != p.owner_shard:
                         continue
@@ -1390,7 +1391,7 @@ class DedicatedParamGroup:
                     f"idx{bucket_idx}.bytes{bucket_bytes}."
                     f"params{len(bucket)}.{group_name}"
                 ):
-                    with dist._coalescing_manager(
+                    with coalescing_manager(
                         group=replicate_group, device=self.device
                     ):
                         for p in bucket:

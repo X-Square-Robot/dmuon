@@ -1,5 +1,6 @@
 """Monkey-patch FSDP2 to auto-ignore dedicated parameters."""
 
+import contextlib
 import inspect
 
 _installed = False
@@ -28,6 +29,49 @@ def _call_get_managed_states(original_fn, modules, ignored_params=None):
     if ignored_params:
         params = [param for param in params if param not in ignored_params]
     return params, buffers
+
+
+@contextlib.contextmanager
+def coalescing_manager(*, group, device, async_ops: bool = False):
+    """Drop-in replacement for ``dist._coalescing_manager`` that works
+    around a latent bug present in torch <= 2.7.
+
+    On torch <= 2.7 the exit branch of ``dist._coalescing_manager``
+    unconditionally calls ``group._end_coalescing(device).wait()``
+    whenever ``device=`` is passed. For collectives outside its Python
+    fast-path list (``all_reduce`` / ``all_gather_into_tensor`` /
+    ``reduce_scatter_tensor``) — for example the ``dist.reduce`` calls
+    DMuon emits for owner-rank gradient reduction — ``_end_coalescing``
+    returns ``None`` and the manager crashes with
+    ``AttributeError: 'NoneType' object has no attribute 'wait'``.
+    torch 2.8 fixed this by initializing ``work = None`` and gating the
+    wait on ``work is not None`` (with the note "Backward compatible
+    with backends that don't sync at CPP level").
+
+    This helper drives ``ProcessGroup._start_coalescing`` /
+    ``_end_coalescing`` directly (the API the NCCL backend actually
+    consumes for ``ncclGroupStart`` / ``ncclGroupEnd`` batching) and
+    only waits when the backend hands back a real work handle. It
+    wraps the same C++ coalescing API stock ``_coalescing_manager``
+    uses internally, so semantics match on the unaffected torch
+    versions; the only practical difference is that this version also
+    tolerates an empty or non-fast-path coalesce block.
+    """
+    group._start_coalescing(device)
+    try:
+        yield
+    except BaseException:
+        # Close the C++ coalesce group on exception so subsequent
+        # collectives are not stuck in coalesce mode.
+        try:
+            group._end_coalescing(device)
+        except BaseException:
+            pass
+        raise
+
+    work = group._end_coalescing(device)
+    if work is not None and not async_ops:
+        work.wait()
 
 
 def install_patch():

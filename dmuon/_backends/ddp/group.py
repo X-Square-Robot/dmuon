@@ -30,6 +30,7 @@ from typing import NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
+from ..fsdp2.patch import coalescing_manager  # torch 2.7+ compat
 
 from dmuon._core.comm import DedicatedCommContext
 from dmuon._core.dynamo import dynamo_disable
@@ -221,7 +222,7 @@ class DedicatedParamGroupDDP:
         dp_group = self._dp_group
 
         with torch.cuda.stream(reduce_stream):
-            with dist._coalescing_manager(group=dp_group, device=self.device):
+            with coalescing_manager(group=dp_group, device=self.device):
                 for p in self.params:
                     grad = p._orig_param.grad
                     if grad is None:
@@ -346,7 +347,7 @@ class DedicatedParamGroupDDP:
             ] = []
             reuse_buffers = _tp_gather_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
-                with dist._coalescing_manager(group=tp_group, device=self.device):
+                with coalescing_manager(group=tp_group, device=self.device):
                     for p, local_grad in group_work:
                         tp_size = p.tp_group.size()
                         if p.is_tp_owner:
@@ -449,7 +450,7 @@ class DedicatedParamGroupDDP:
         with torch.cuda.stream(bcast_stream):
             reuse_buffers = _tp_scatter_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
-                with dist._coalescing_manager(group=tp_group, device=self.device):
+                with coalescing_manager(group=tp_group, device=self.device):
                     for p in group_work:
                         shard_dim = p.shard_dim if p.shard_dim is not None else 0
                         if reuse_buffers:
@@ -560,7 +561,7 @@ class DedicatedParamGroupDDP:
         bcast_stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(bcast_stream):
-            with dist._coalescing_manager(group=self._dp_group, device=self.device):
+            with coalescing_manager(group=self._dp_group, device=self.device):
                 for p in self.params:
                     dist.broadcast(
                         p._owned_data,
