@@ -32,6 +32,7 @@ from typing import Iterator, Optional
 
 import torch
 import torch.distributed as dist
+from ..fsdp2.patch import coalescing_manager  # torch 2.7+ compat
 import torch.nn as nn
 from torch.autograd import Variable
 try:
@@ -177,7 +178,7 @@ class _ReplicatedGroup:
                 buckets[(grad.dtype, grad.device)].append(p)
 
             for (dtype, device), plist in buckets.items():
-                with dist._coalescing_manager(group=self._group, device=device):
+                with coalescing_manager(group=self._group, device=device):
                     for p in plist:
                         grad = (
                             p.grad._local_tensor

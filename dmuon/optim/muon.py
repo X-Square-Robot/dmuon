@@ -9,6 +9,7 @@ from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
+from .._backends.fsdp2.patch import coalescing_manager  # torch 2.7+ compat
 import torch.nn as nn
 from torch.optim import Optimizer
 
@@ -916,7 +917,7 @@ class Muon(Optimizer):
         try:
             for tp_group, group_descs in grouped:
                 device = group_descs[0]["dp"]._owned_data.device
-                with dist._coalescing_manager(group=tp_group, device=device):
+                with coalescing_manager(group=tp_group, device=device):
                     for desc in group_descs:
                         dp = desc["dp"]
                         dist.broadcast(
