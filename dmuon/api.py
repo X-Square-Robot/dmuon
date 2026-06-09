@@ -76,8 +76,12 @@ def _link_forward_prefetch_states(
     )
     for state in ordered:
         state._next_group = None
+        state._next_groups = []
     for idx in range(len(ordered) - 1):
         ordered[idx]._next_group = ordered[idx + 1].group
+        ordered[idx]._next_groups = [
+            later_state.group for later_state in ordered[idx + 1 :]
+        ]
     comm_ctx.all_states[:] = ordered
 
 
@@ -503,7 +507,11 @@ def dedicate_params(
     all_states: list[DedicatedState] = []
     module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     for layer_module, d_params in layer_to_dparams.items():
-        group = DedicatedParamGroup(d_params, comm_ctx)
+        group = DedicatedParamGroup(
+            d_params,
+            comm_ctx,
+            delay_stage2_to_optimizer=delay_stage2_to_optimizer,
+        )
         group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         state = DedicatedState(layer_module, group, comm_ctx, reshard_after_forward)
         layer_module._dedicated_state = state

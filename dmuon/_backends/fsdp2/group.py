@@ -273,7 +273,13 @@ class DedicatedParamGroup:
     All communication runs on dedicated CUDA streams from DedicatedCommContext.
     """
 
-    def __init__(self, params: list[DedicatedParam], comm_ctx: DedicatedCommContext):
+    def __init__(
+        self,
+        params: list[DedicatedParam],
+        comm_ctx: DedicatedCommContext,
+        *,
+        delay_stage2_to_optimizer: bool = True,
+    ):
         self.params = params
         self.comm_ctx = comm_ctx
         self.device = params[0].device if params else torch.device("cuda")
@@ -297,6 +303,12 @@ class DedicatedParamGroup:
         # across micro-batches.
         self.reduce_grads_enabled: bool = True
         self.replicate_grads_enabled: bool = True
+        # Match FSDP2's split between the inter-group buffer-safety wait and
+        # the optimizer dependency.  Backward only waits Stage-1 shard reduce
+        # to bound temporary grad lifetime; the HSDP Stage-2 replicate tail is
+        # consumed later by per-group optimizer preparation so it can overlap
+        # with earlier groups' optimizer work and post-step publish.
+        self._delay_stage2_to_optimizer: bool = bool(delay_stage2_to_optimizer)
 
         # Event-based synchronization (replaces work.wait()).  ``_post_reduce_event``
         # marks the end of the reduce pipeline — shard-only in Phase A, shard+replicate
