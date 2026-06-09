@@ -439,7 +439,8 @@ def compute_balanced_assignment(
         if not params:
             continue
         tp_size = get_tp_mesh(params[0], dp_mesh_dim_names).size()
-        tp_loads = [0] * tp_size
+        tp_cost_loads = [0] * tp_size
+        tp_numel_loads = [0] * tp_size
         tie_offset = _tp_tie_offset(dp_owner, tp_size)
         for p in sorted(
             params,
@@ -451,9 +452,16 @@ def compute_balanced_assignment(
         ):
             owner = min(
                 range(tp_size),
-                key=lambda idx: (tp_loads[idx], (idx - tie_offset) % tp_size),
+                key=lambda idx: (
+                    tp_cost_loads[idx],
+                    tp_numel_loads[idx],
+                    (idx - tie_offset) % tp_size,
+                ),
             )
             tp_owners[p] = owner
-            tp_loads[owner] += _matrix_optimizer_cost_units(param_names.get(p, ""), p)
+            tp_cost_loads[owner] += _matrix_optimizer_cost_units(
+                param_names.get(p, ""), p
+            )
+            tp_numel_loads[owner] += _param_logical_numel(p)
 
     return AssignmentResult(dp_owners=dp_owners, tp_owners=tp_owners)
