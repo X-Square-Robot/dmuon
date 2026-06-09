@@ -1,10 +1,12 @@
 # API Reference
 
 !!! tip "TL;DR"
-    DMuon exposes four surface areas: **setup** (`dedicate_params`, `install_patch`),
+    DMuon exposes five surface areas: **setup** (`dedicate_params`, `install_patch`),
     **optimizer** (`Muon`, `NewtonSchulz`, NS functions and constants), **state
     management** (`no_sync`, `wait_all_reduces`, replicate-broadcast helpers,
-    `DedicatedCommContext`), and **checkpointing** (`get/set_model/optimizer_state_dict`).
+    `DedicatedCommContext`), **diagnostics** (`summarize_param_groups`,
+    `summarize_comm_plan`, `collect_forward_unshard_profile`), and **checkpointing**
+    (`get/set_model/optimizer_state_dict`).
     Start with `dedicate_params` + `Muon`; reach for the rest when you need fine-grained
     control.
 
@@ -268,6 +270,79 @@ Shared CUDA streams (broadcast, reduce, replicate-broadcast) and prefetch
 ordering state.  Analogous to FSDP2's `FSDPCommContext`.
 
 ::: dmuon.DedicatedCommContext
+
+---
+
+## Diagnostics
+
+The diagnostics helpers return rank-local, JSON-friendly summaries.  They do
+not launch distributed collectives, so they are safe to call from benchmark
+logging code.  Dump one summary per rank if you need a global view.
+
+### summarize_param_groups
+
+Inspect how `Muon` routed trainable parameters across optimizer groups.  Use
+this after constructing the optimizer to check type-split routing, owner
+counts, and whether a `route_hint_fn` selected `muon`, `adamw`, or
+`sharded_adamw` as expected.
+
+```python
+import json
+import dmuon
+
+print(json.dumps(
+    dmuon.summarize_param_groups(model, optimizer),
+    indent=2,
+    default=str,
+))
+```
+
+::: dmuon.summarize_param_groups
+
+---
+
+### summarize_comm_plan
+
+Inspect the DMuon communication plan for FSDP2/HSDP groups.  The summary
+reports owner buckets, root ranks, route labels, and payload estimates.  It is
+an estimate of planned tensor sizes, not a measured NCCL latency report.
+
+```python
+print(json.dumps(
+    dmuon.summarize_comm_plan(model),
+    indent=2,
+    default=str,
+))
+```
+
+::: dmuon.summarize_comm_plan
+
+---
+
+### collect_forward_unshard_profile
+
+Collect aggregate forward-unshard counters and CUDA-event timings from the
+communication context.  Enable collection before `dedicate_params()` creates
+the context:
+
+```bash
+DMUON_RECORD_FORWARD_PROFILE=1 torchrun ...
+```
+
+Then collect at a diagnostic boundary:
+
+```python
+profile = dmuon.collect_forward_unshard_profile(
+    model,
+    synchronize=True,
+)
+```
+
+Use `synchronize=True` only at diagnostic boundaries.  It calls
+`torch.cuda.synchronize()`, so putting it inside a normal timing loop changes
+the overlap behavior being measured.
+
+::: dmuon.collect_forward_unshard_profile
 
 ---
 

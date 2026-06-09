@@ -166,6 +166,35 @@
     are slow, inspect the dedicated parameter assignment and consider a more
     even hook boundary or owner strategy.
 
+    **Diagnostics:** dump the rank-local routing and communication summaries:
+    ```python
+    import json
+    import dmuon
+
+    print(json.dumps(
+        dmuon.summarize_param_groups(model, optimizer),
+        indent=2,
+        default=str,
+    ))
+    print(json.dumps(
+        dmuon.summarize_comm_plan(model),
+        indent=2,
+        default=str,
+    ))
+    ```
+
+    For forward-unshard wait counters, set
+    `DMUON_RECORD_FORWARD_PROFILE=1` before `dmuon.dedicate_params()` runs,
+    then collect at a diagnostic boundary:
+    ```python
+    profile = dmuon.collect_forward_unshard_profile(
+        model,
+        synchronize=True,
+    )
+    ```
+    Do not put `synchronize=True` inside the normal step timing loop; it forces
+    a CUDA sync and changes overlap behavior.
+
 ---
 
 ??? warning "Broadcast never overlaps with forward / no async speedup observed"

@@ -154,6 +154,34 @@
     与异步计时。如果只有少数 owner rank 慢，检查 dedicated 参数分配、
     hook 边界和 owner 策略。
 
+    **诊断：** 打印当前 rank 的 routing 和通信计划摘要：
+    ```python
+    import json
+    import dmuon
+
+    print(json.dumps(
+        dmuon.summarize_param_groups(model, optimizer),
+        indent=2,
+        default=str,
+    ))
+    print(json.dumps(
+        dmuon.summarize_comm_plan(model),
+        indent=2,
+        default=str,
+    ))
+    ```
+
+    如需查看 forward-unshard wait 计数器，在 `dmuon.dedicate_params()`
+    运行前设置 `DMUON_RECORD_FORWARD_PROFILE=1`，再在诊断边界读取：
+    ```python
+    profile = dmuon.collect_forward_unshard_profile(
+        model,
+        synchronize=True,
+    )
+    ```
+    不要把 `synchronize=True` 放进正常 step timing loop；它会强制 CUDA
+    同步，改变正在测量的 overlap 行为。
+
 ---
 
 ??? warning "广播从未与前向重叠 / 未观察到异步加速"

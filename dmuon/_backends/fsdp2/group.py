@@ -6,7 +6,7 @@ synchronization instead of CPU-blocking work.wait().
 """
 
 from collections import defaultdict
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
 import torch
@@ -21,7 +21,8 @@ from .param import DedicatedParam
 
 @contextmanager
 def _profile_range(name: str):
-    yield
+    with torch.profiler.record_function(name):
+        yield
 
 
 def _split_for_scatter(
@@ -566,10 +567,29 @@ class DedicatedParamGroup:
             publish_wait_end = torch.cuda.Event(enable_timing=True)
             publish_wait_start.record(publish_wait_stream)
         if prefetch:
-            self._pre_forward_prefetch_publish()
+            with _profile_range(f"dmuon.forward_prefetch_publish.{group_name}"):
+                self._pre_forward_prefetch_publish()
         else:
-            self._pre_forward_wait()
+            with _profile_range(f"dmuon.pre_forward_wait.{group_name}"):
+                self._pre_forward_wait()
+        if publish_wait_start is not None and publish_wait_end is not None:
+            publish_wait_end.record(publish_wait_stream)
+            self.comm_ctx.record_forward_unshard_event(
+                group_name=group_name,
+                phase=(
+                    "prefetch_publish_wait"
+                    if prefetch
+                    else "pre_forward_publish_wait"
+                ),
+                start=publish_wait_start,
+                end=publish_wait_end,
+                bytes=0,
+                prefetch=prefetch,
+            )
         if self._is_unsharded:
+            self.comm_ctx.record_forward_unshard_counter(
+                group_name, already_unsharded=1
+            )
             return  # still unsharded from forward (reshard_after_forward=False)
         if (
             self._broadcast_event is not None

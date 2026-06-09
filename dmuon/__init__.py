@@ -41,6 +41,7 @@ from .grad_clip import (
     clip_grad_norm_,
     register_muon_grad_clip_strategy,
 )
+from .diagnostics import summarize_comm_plan, summarize_param_groups
 from .optim import (
     POLAR_EXPRESS_COEFFICIENTS,
     YOU_COEFFICIENTS,
@@ -54,6 +55,7 @@ from .optim import (
 from .utils import (
     broadcast_all_updates,
     broadcast_all_updates_async,
+    collect_forward_unshard_profile,
     get_comm_ctx,
     get_dedicated_params,
     get_owned_params,
@@ -87,6 +89,8 @@ __all__ = [
     "clip_grad_norm_",
     "register_muon_grad_clip_strategy",
     "MuonGradClipStats",
+    "summarize_comm_plan",
+    "summarize_param_groups",
     "no_sync",
     "prepare_muon_grads",
     "wait_all_reduces",
@@ -94,6 +98,7 @@ __all__ = [
     "wait_all_post_step_broadcasts",
     "broadcast_all_updates",
     "broadcast_all_updates_async",
+    "collect_forward_unshard_profile",
     "get_model_state_dict",
     "set_model_state_dict",
     "get_optimizer_state_dict",
