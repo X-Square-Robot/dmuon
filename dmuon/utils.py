@@ -187,6 +187,10 @@ def _dispatch_post_step_sync(g) -> None:
                     scatter()
             with _profile_range("dmuon.replicate_broadcast.sync"):
                 g.replicate_broadcast_sync()
+            publish = getattr(g, "sharded_muon_publish_sync", None)
+            if publish is not None:
+                with _profile_range("dmuon.sharded_muon_publish.sync"):
+                    publish()
 
 
 def _dispatch_post_step_async(g, phase_recorder=None) -> None:
@@ -231,12 +235,20 @@ def _dispatch_post_step_async(g, phase_recorder=None) -> None:
                 else:
                     with _phase("replicate_broadcast"):
                         g.replicate_broadcast_async()
+            publish_async = getattr(g, "sharded_muon_publish_async", None)
+            if publish_async is not None:
+                with _profile_range("dmuon.sharded_muon_publish.async"):
+                    with _phase("sharded_muon_publish"):
+                        publish_async()
 
 def _wait_post_step(g) -> None:
     if isinstance(g, DedicatedParamGroupDDP):
         g.wait_for_post_step_broadcast()
     else:
         g.wait_for_replicate_broadcast()
+        wait_publish = getattr(g, "wait_for_sharded_muon_publish", None)
+        if wait_publish is not None:
+            wait_publish()
 
 
 def broadcast_all_updates(model: nn.Module) -> None:

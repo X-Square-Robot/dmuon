@@ -134,6 +134,12 @@ class Muon(Optimizer):
         tp_distributed_gram: bool = False,
         tp_distributed_gram_policy: str = "beneficial",
         tp_distributed_gram_max_factor_to_scatter_ratio: float = 0.5,
+        post_step_prefetch_groups: int = 0,
+        post_step_prefetch_sharded_adamw: bool = False,
+        sharded_adamw_unshard_separate_stream: bool = False,
+        forward_prefetch_depth: int = 1,
+        first_step_progress_log: bool = True,
+        first_step_progress_log_limit: int = 8,
     ):
         if isinstance(ns_backend, str):
             ns_backend = NewtonSchulz(backend=ns_backend)
@@ -161,6 +167,14 @@ class Muon(Optimizer):
         self._tp_distributed_gram_max_factor_to_scatter_ratio = float(
             tp_distributed_gram_max_factor_to_scatter_ratio
         )
+        self._post_step_prefetch_groups = max(0, int(post_step_prefetch_groups))
+        self._post_step_prefetch_sharded_adamw = bool(post_step_prefetch_sharded_adamw)
+        self._optimizer_step_index = 0
+        self._first_step_progress_log = bool(first_step_progress_log)
+        self._first_step_progress_log_limit = max(
+            0, int(first_step_progress_log_limit)
+        )
+        self._first_step_logged_shapes: set[tuple[object, ...]] = set()
 
         # Discover all dedicated params, and the subset owned by this rank.
         comm_ctx = getattr(model, "_dedicated_comm_ctx", None)
@@ -169,6 +183,10 @@ class Muon(Optimizer):
                 "Model has no _dedicated_comm_ctx. Call dmuon.dedicate_params() first."
             )
         self._comm_ctx = comm_ctx
+        self._comm_ctx.sharded_adamw_unshard_separate_stream_enabled = bool(
+            sharded_adamw_unshard_separate_stream
+        )
+        self._comm_ctx.forward_prefetch_depth = max(0, int(forward_prefetch_depth))
         self._all_dedicated_params = []
         self._dedicated_params = []
         seen_dps: set[int] = set()
@@ -185,6 +203,39 @@ class Muon(Optimizer):
             getattr(dp, "tp_group", None) is not None
             for dp in self._all_dedicated_params
         )
+        self._has_ddp_tp_dedicated = any(
+            (
+                dp.__class__.__name__ == "DedicatedParamDDP"
+                and getattr(dp, "tp_group", None) is not None
+            )
+            or getattr(getattr(dp, "_orig_param", None), "_dedicated_mode", None) == "ddp_tp"
+            for dp in self._all_dedicated_params
+        )
+        self._has_hsdp_sharded_muon_forward = (
+            getattr(self._comm_ctx, "replicate_group", None) is not None
+            and any(
+                getattr(dp, "uses_sharded_muon_forward", lambda: False)()
+                for dp in self._all_dedicated_params
+            )
+        )
+        if self._has_hsdp_sharded_muon_forward:
+            # HSDP sharded-Muon publish has a two-stage post-step dependency:
+            # owner-row reduce-scatter followed by shard-column broadcast.  The
+            # current safe path consumes it in normal forward order.  Deeper
+            # forward prefetch can make ranks enter different collectives while
+            # some shard-publish events are still pending, so cap the forward
+            # depth here.  Optimizer-tail prefetch remains available below, but
+            # only for the first HSDP sharded-Muon group and only with an
+            # explicit publish-event wait chained into the prefetch stream.
+            self._comm_ctx.forward_prefetch_depth = min(
+                self._comm_ctx.forward_prefetch_depth, 1
+            )
+        if self._has_tp_dedicated and replicate_async:
+            # TP dedicated params publish through a TP-scatter stage before the
+            # DP/HSDP fan-out. Keep the public training path synchronous until
+            # async TP publish has sync-vs-async parity coverage.
+            self._replicate_async = False
+            replicate_async = False
 
         # Discover FSDP2-managed params AND DDP-replicated params. Both go
         # into the same AdamW param group downstream. ``_fsdp_params`` keeps
@@ -326,6 +377,66 @@ class Muon(Optimizer):
         """Dedicated AdamW follows DMuon owner-update + publish in mainline."""
 
         return False
+
+    @staticmethod
+    def _group_has_sharded_adamw_params(group) -> bool:
+        return any(
+            getattr(dp, "_dmuon_route", None) == "sharded_adamw"
+            for dp in getattr(group, "params", ())
+        )
+
+    @staticmethod
+    def _group_has_hsdp_sharded_muon_params(group) -> bool:
+        """Whether post-step eager prefetch would cross HSDP shard-publish.
+
+        For sharded-Muon forward placement under HSDP, post-step publish is a
+        two-stage owner-row reduce-scatter plus shard-column broadcast.  Most
+        eager far-prefetch cases should stay in normal forward order; the
+        optimizer loop below allows only one critical early group to prefetch
+        with an explicit publish-event dependency.
+        """
+
+        comm_ctx = getattr(group, "comm_ctx", None)
+        if getattr(comm_ctx, "replicate_group", None) is None:
+            return False
+        return any(
+            getattr(dp, "uses_sharded_muon_forward", lambda: False)()
+            for dp in getattr(group, "params", ())
+        )
+
+    @staticmethod
+    def _post_step_prefetch_policy(
+        group,
+        *,
+        group_idx: int,
+        post_step_prefetch_groups: int,
+        prefetched_hsdp_sharded_muon_groups: int,
+    ) -> tuple[bool, bool, bool]:
+        """Choose optimizer-tail prefetch behavior for one communication group.
+
+        Pure FSDP-Z3 can prefetch several groups after optimizer update.  HSDP
+        sharded-Muon forward placement is stricter because every group has a
+        two-stage post-step publish dependency.  PAI traces showed that letting
+        multiple HSDP groups far-prefetch from optimizer tail can create
+        divergent collective ordering.  The only tail prefetch we allow for
+        HSDP sharded-Muon is the first such group: it targets the early forward
+        all-gather that has almost no preceding compute to hide behind.
+
+        Returns:
+            ``should_prefetch``: call ``group.unshard(prefetch=True)``.
+            ``allow_unready_publish_wait``: chain publish event into the
+                prefetch stream before unshard collectives are enqueued.
+            ``counts_hsdp_sharded_muon_prefetch``: increment the one-group
+                HSDP budget if prefetch succeeds.
+        """
+
+        if post_step_prefetch_groups <= 0 or group_idx >= post_step_prefetch_groups:
+            return False, False, False
+        if Muon._group_has_hsdp_sharded_muon_params(group):
+            if prefetched_hsdp_sharded_muon_groups >= 1:
+                return False, False, False
+            return True, True, True
+        return True, False, False
 
     @staticmethod
     def _normalize_group_params(params) -> list[torch.Tensor]:
@@ -1132,6 +1243,8 @@ class Muon(Optimizer):
         needs_prepare = not self._grads_ready
         prepare_ahead = self._group_prepare_ahead
         prepared_until = -1
+        prefetched_sharded_adamw_groups = 0
+        prefetched_hsdp_sharded_muon_groups = 0
 
         def _prepare_group(index: int) -> None:
             nonlocal prepared_until
@@ -1181,6 +1294,42 @@ class Muon(Optimizer):
                 _dispatch_post_step_async(group, phase_recorder=self._profile_phase)
             finally:
                 self._profile_event_end(profile_token)
+            (
+                should_prefetch,
+                allow_unready_publish_wait,
+                counts_hsdp_sharded_muon_prefetch,
+            ) = self._post_step_prefetch_policy(
+                group,
+                group_idx=group_idx,
+                post_step_prefetch_groups=self._post_step_prefetch_groups,
+                prefetched_hsdp_sharded_muon_groups=(
+                    prefetched_hsdp_sharded_muon_groups
+                ),
+            )
+            has_sharded_adamw = self._group_has_sharded_adamw_params(group)
+            if (
+                self._post_step_prefetch_sharded_adamw
+                and has_sharded_adamw
+                and prefetched_sharded_adamw_groups < 1
+            ):
+                # Only the first sharded-AdamW group is on the early forward
+                # critical path (embedding in decoder LMs).  Late groups such
+                # as lm_head are better left to normal forward prefetch; eager
+                # post-step prefetch would queue them before the first decoder
+                # layer's unshard.
+                should_prefetch = True
+                prefetched_sharded_adamw_groups += 1
+                allow_unready_publish_wait = (
+                    allow_unready_publish_wait
+                    or self._group_has_hsdp_sharded_muon_params(group)
+                )
+            if should_prefetch:
+                group.unshard(
+                    prefetch=True,
+                    allow_unready_publish_wait=allow_unready_publish_wait,
+                )
+                if counts_hsdp_sharded_muon_prefetch:
+                    prefetched_hsdp_sharded_muon_groups += 1
 
         if needs_prepare:
             self._grads_ready = True
@@ -1418,6 +1567,7 @@ class Muon(Optimizer):
             dp.tp_group is not None for dp in dedicated_params
         ):
             torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
+        current_stream = torch.cuda.current_stream()
 
         for dp in dedicated_params:
             if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
@@ -1425,6 +1575,12 @@ class Muon(Optimizer):
                 param = getattr(dp, "_sharded_adamw_data", None)
                 if grad is None or param is None:
                     continue
+                # ``grad`` is allocated and populated on DMuon's reduce stream
+                # but consumed by AdamW kernels on the current stream.  Record
+                # the consumer stream before dropping the Python reference so
+                # the CUDA caching allocator cannot recycle the buffer while
+                # those kernels are still pending.
+                grad.record_stream(current_stream)
                 self._adamw_update_tensor(
                     state_key=id(dp),
                     param=param,
@@ -1439,6 +1595,7 @@ class Muon(Optimizer):
             param = dp._owned_data
             if grad is None or param is None:
                 continue
+            grad.record_stream(current_stream)
             self._adamw_update_tensor(
                 state_key=id(dp),
                 param=param,

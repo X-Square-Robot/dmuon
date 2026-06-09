@@ -151,14 +151,69 @@ def _sharded_adamw_enabled(p: DedicatedParam) -> bool:
     return bool(getattr(p, "uses_sharded_adamw", lambda: False)())
 
 
+def _sharded_muon_forward_enabled(p: DedicatedParam) -> bool:
+    return bool(getattr(p, "uses_sharded_muon_forward", lambda: False)())
+
+
+def _owner_broadcast_enabled(p: DedicatedParam) -> bool:
+    return not _sharded_adamw_enabled(p) and not _sharded_muon_forward_enabled(p)
+
+
 def _needs_post_step_replicate_broadcast(p: DedicatedParam) -> bool:
     # Production type-split AdamW uses DMuon owner update + post-step publish,
     # matching Muon tensors.  Replicate-all-reduce mode lets every shard-owner
     # replicate update locally, so there is no global-owner update to fan out.
+    # Muon tensors using FSDP-style forward placement have a separate sharded
+    # publish path: owner-row reduce-scatter followed by shard-column broadcast.
+    # Broadcasting the full owner tensor across the replicate axis first would
+    # duplicate that publish traffic and put a large transfer on the forward
+    # critical path.
     return (
         not _adamw_replicate_allreduce_enabled(p)
         and not _sharded_adamw_enabled(p)
+        and not _sharded_muon_forward_enabled(p)
     )
+
+
+def _event_is_ready(event: Optional[torch.cuda.Event]) -> bool:
+    if event is None:
+        return True
+    try:
+        return bool(event.query())
+    except RuntimeError:
+        return False
+
+
+def _should_skip_unready_publish_prefetch(
+    tp_event: Optional[torch.cuda.Event],
+    replicate_event: Optional[torch.cuda.Event],
+    sharded_muon_event: Optional[torch.cuda.Event] = None,
+    *,
+    allow_unready_publish_wait: bool,
+) -> tuple[bool, bool, bool, bool]:
+    if not allow_unready_publish_wait:
+        # Do not use per-rank CUDA event readiness to decide whether a far
+        # prefetch may enter collectives.  Event readiness is local and can
+        # diverge across ranks; letting only the "ready" ranks dispatch an
+        # all-gather/broadcast creates collective order mismatches.  Far
+        # prefetch retries from later hooks after the publish state is consumed.
+        tp_pending = tp_event is not None
+        replicate_pending = replicate_event is not None
+        sharded_muon_pending = sharded_muon_event is not None
+        should_skip = tp_pending or replicate_pending or sharded_muon_pending
+        return should_skip, tp_pending, replicate_pending, sharded_muon_pending
+
+    tp_not_ready = tp_event is not None and not _event_is_ready(tp_event)
+    replicate_not_ready = (
+        replicate_event is not None and not _event_is_ready(replicate_event)
+    )
+    sharded_muon_not_ready = (
+        sharded_muon_event is not None and not _event_is_ready(sharded_muon_event)
+    )
+    should_skip = (
+        tp_not_ready or replicate_not_ready or sharded_muon_not_ready
+    ) and not allow_unready_publish_wait
+    return should_skip, tp_not_ready, replicate_not_ready, sharded_muon_not_ready
 
 
 class TPScatterState(NamedTuple):
@@ -204,6 +259,13 @@ class ReplicateBroadcastState(NamedTuple):
     event: torch.cuda.Event
 
 
+class ShardedMuonPublishState(NamedTuple):
+    """State kept alive across async Muon sharded-publish reduce-scatter."""
+
+    refs: list[torch.Tensor]
+    event: torch.cuda.Event
+
+
 class DedicatedParamGroup:
     """Manages all dedicated parameters within one layer.
 
@@ -243,6 +305,7 @@ class DedicatedParamGroup:
         # Stage-2 input + event alive until ``wait_for_reduce`` runs, mirroring
         # ``AllReduceState`` in ``_fsdp_param_group.py:115-117``.
         self._broadcast_event: Optional[torch.cuda.Event] = None
+        self._sharded_adamw_unshard_event: Optional[torch.cuda.Event] = None
         # FSDP2 only waits the previous reduce-scatter event between backward
         # groups to keep its input buffer lifetime bounded; it does *not* wait
         # the HSDP all-reduce tail there.  DMuon mirrors that split with this
@@ -251,6 +314,8 @@ class DedicatedParamGroup:
         # pending until the optimizer/root-post-backward boundary.
         self._stage1_reduce_event: Optional[torch.cuda.Event] = None
         self._post_reduce_event: Optional[torch.cuda.Event] = None
+        self._last_unshard_total_bytes: int = 0
+        self._last_unshard_prefetch: bool = False
         self._replicate_reduce_state: Optional[ReplicateReduceState] = None
         self._muon_grad_ready_event: Optional[torch.cuda.Event] = None
         self._muon_grad_ready_refs: list[torch.Tensor] = []
@@ -268,6 +333,7 @@ class DedicatedParamGroup:
         #     ``AllGatherState`` (``_fsdp_param_group.py:105-107``).
         self._replicate_broadcast_event: Optional[torch.cuda.Event] = None
         self._replicate_broadcast_state: Optional[ReplicateBroadcastState] = None
+        self._sharded_muon_publish_state: Optional[ShardedMuonPublishState] = None
         # T2d: TP scatter state — mirrors ``_replicate_broadcast_state``
         # and pins transient TP-owner send shards until the scatter event is
         # visible. Async uses it for lifetime + deferred waiting; sync uses it
@@ -331,10 +397,10 @@ class DedicatedParamGroup:
         # handled separately via ``replicate_group``).
         self._total_numel_by_owner: dict[OwnerCoord, int] = {
             owner: sum(
-                p.numel for p in owner_params if not _sharded_adamw_enabled(p)
+                p.numel for p in owner_params if _owner_broadcast_enabled(p)
             )
             for owner, owner_params in self._by_owner.items()
-            if any(not _sharded_adamw_enabled(p) for p in owner_params)
+            if any(_owner_broadcast_enabled(p) for p in owner_params)
         }
         if self._dp_group is not None:
             self._global_owner_ranks: dict[OwnerCoord, int] = {
@@ -372,7 +438,7 @@ class DedicatedParamGroup:
                 offset = 0
                 dsts: list[torch.Tensor] = []
                 for p in self._by_owner[owner]:
-                    if _sharded_adamw_enabled(p):
+                    if not _owner_broadcast_enabled(p):
                         continue
                     p.bind_to_packed_buffer(packed, offset)
                     dsts.append(packed[offset : offset + p.numel])
@@ -384,7 +450,12 @@ class DedicatedParamGroup:
     # ---- unshard (broadcast) — dispatch phase ----
 
     @dynamo_disable
-    def unshard(self, *, prefetch: bool = False):
+    def unshard(
+        self,
+        *,
+        prefetch: bool = False,
+        allow_unready_publish_wait: bool = False,
+    ):
         """Dispatch broadcasts on broadcast_stream. Does NOT wait.
 
         Phase 2: each owner has one persistent packed buffer; params are
@@ -400,17 +471,181 @@ class DedicatedParamGroup:
         consume any still-pending async replicate broadcast here too so
         the copy-in below always reads fresh ``_owned_data``.
         """
+        group_name = _group_profile_name(self)
+        pending_tp_publish = self._tp_scatter_state is not None
+        pending_replicate_publish = self._replicate_broadcast_state is not None
+        pending_sharded_muon_publish = self._sharded_muon_publish_state is not None
+        if prefetch and (
+            pending_tp_publish
+            or pending_replicate_publish
+            or pending_sharded_muon_publish
+        ):
+            tp_event = (
+                self._tp_scatter_state.event
+                if self._tp_scatter_state is not None
+                else None
+            )
+            replicate_event = (
+                self._replicate_broadcast_state.event
+                if self._replicate_broadcast_state is not None
+                else None
+            )
+            sharded_muon_event = (
+                self._sharded_muon_publish_state.event
+                if self._sharded_muon_publish_state is not None
+                else None
+            )
+            (
+                should_skip,
+                tp_not_ready,
+                replicate_not_ready,
+                sharded_muon_not_ready,
+            ) = (
+                _should_skip_unready_publish_prefetch(
+                    tp_event,
+                    replicate_event,
+                    sharded_muon_event,
+                    allow_unready_publish_wait=allow_unready_publish_wait,
+                )
+            )
+            if should_skip:
+                # A forward prefetch must not insert an unready publish wait into
+                # the shard-dim broadcast stream for far-future groups: it can
+                # stall stream FIFO progress and block nearer layers. The
+                # immediate next forward group is allowed to queue the wait so
+                # its unshard starts as soon as the publish event becomes ready.
+                # Demand unshard still waits below; skipped prefetches retry
+                # from later hooks.
+                self.comm_ctx.record_forward_unshard_counter(
+                    group_name,
+                    prefetch_publish_not_ready_skips=1,
+                    prefetch_tp_publish_not_ready_skips=1 if tp_not_ready else 0,
+                    prefetch_replicate_publish_not_ready_skips=(
+                        1 if replicate_not_ready else 0
+                    ),
+                    prefetch_sharded_muon_publish_not_ready_skips=(
+                        1 if sharded_muon_not_ready else 0
+                    ),
+                )
+                return
+            if allow_unready_publish_wait and (
+                tp_not_ready or replicate_not_ready or sharded_muon_not_ready
+            ):
+                self.comm_ctx.record_forward_unshard_counter(
+                    group_name,
+                    prefetch_unready_publish_waits_queued=1,
+                    prefetch_unready_tp_publish_waits_queued=(
+                        1 if tp_not_ready else 0
+                    ),
+                    prefetch_unready_replicate_publish_waits_queued=(
+                        1 if replicate_not_ready else 0
+                    ),
+                    prefetch_unready_sharded_muon_publish_waits_queued=(
+                        1 if sharded_muon_not_ready else 0
+                    ),
+                )
+        publish_wait_stream = (
+            self.comm_ctx.broadcast_stream if prefetch else torch.cuda.current_stream()
+        )
+        publish_wait_start = None
+        publish_wait_end = None
+        if self.comm_ctx.record_forward_profile:
+            publish_wait_start = torch.cuda.Event(enable_timing=True)
+            publish_wait_end = torch.cuda.Event(enable_timing=True)
+            publish_wait_start.record(publish_wait_stream)
         if prefetch:
             self._pre_forward_prefetch_publish()
         else:
             self._pre_forward_wait()
         if self._is_unsharded:
             return  # still unsharded from forward (reshard_after_forward=False)
-        if self._broadcast_event is not None:
+        if (
+            self._broadcast_event is not None
+            or self._sharded_adamw_unshard_event is not None
+        ):
+            if not prefetch:
+                self.comm_ctx.record_forward_unshard_counter(
+                    group_name, prefetch_hits=1
+                )
             return  # already dispatched, pending wait_for_unshard
 
+        sharded_muon_params = [
+            p for p in self.params if _sharded_muon_forward_enabled(p)
+        ]
+        if sharded_muon_params and any(
+            not bool(getattr(p, "_sharded_muon_initialized", False))
+            for p in sharded_muon_params
+        ):
+            if prefetch:
+                # First-use sharded Muon publish is a collective over the shard
+                # group.  Demand unshard has a consistent module order across
+                # ranks; far prefetch may be skipped/retried differently across
+                # ranks, so it must not be allowed to introduce the first
+                # reduce-scatter sequence.
+                self.comm_ctx.record_forward_unshard_counter(
+                    group_name,
+                    prefetch_sharded_muon_publish_not_ready_skips=1,
+                )
+                return
+            # Meta-init only materializes the full logical matrix on owner
+            # shard columns.  The all-gather forward placement needs every
+            # rank's local shard before the first forward, so publish the
+            # owner tensor once before the first all-gather. Subsequent
+            # optimizer steps use the normal post-step sharded publish path.
+            with _profile_range(f"dmuon.sharded_muon_initial_publish.{group_name}"):
+                self.sharded_muon_publish_sync()
+
         broadcast_stream = self.comm_ctx.broadcast_stream
+        sharded_adamw_separate_stream = bool(
+            getattr(
+                self.comm_ctx,
+                "sharded_adamw_unshard_separate_stream_enabled",
+                False,
+            )
+        )
+        sharded_adamw_stream = (
+            self.comm_ctx.sharded_adamw_unshard_stream
+            if sharded_adamw_separate_stream
+            else broadcast_stream
+        )
+        wait_current_start = None
+        wait_current_end = None
+        if self.comm_ctx.record_forward_profile:
+            wait_current_start = torch.cuda.Event(enable_timing=True)
+            wait_current_end = torch.cuda.Event(enable_timing=True)
+            wait_current_start.record(broadcast_stream)
         broadcast_stream.wait_stream(torch.cuda.current_stream())
+        if wait_current_start is not None and wait_current_end is not None:
+            wait_current_end.record(broadcast_stream)
+            self.comm_ctx.record_forward_unshard_event(
+                group_name=group_name,
+                phase="broadcast_stream_wait_current",
+                start=wait_current_start,
+                end=wait_current_end,
+                bytes=0,
+                prefetch=prefetch,
+            )
+        sharded_wait_current_start = None
+        sharded_wait_current_end = None
+        if sharded_adamw_separate_stream and self.comm_ctx.record_forward_profile:
+            sharded_wait_current_start = torch.cuda.Event(enable_timing=True)
+            sharded_wait_current_end = torch.cuda.Event(enable_timing=True)
+            sharded_wait_current_start.record(sharded_adamw_stream)
+        if sharded_adamw_separate_stream:
+            sharded_adamw_stream.wait_stream(torch.cuda.current_stream())
+        if (
+            sharded_wait_current_start is not None
+            and sharded_wait_current_end is not None
+        ):
+            sharded_wait_current_end.record(sharded_adamw_stream)
+            self.comm_ctx.record_forward_unshard_event(
+                group_name=group_name,
+                phase="sharded_adamw_stream_wait_current",
+                start=sharded_wait_current_start,
+                end=sharded_wait_current_end,
+                bytes=0,
+                prefetch=prefetch,
+            )
 
         from dmuon._core.internal_utils import alloc_storage
 
@@ -419,6 +654,56 @@ class DedicatedParamGroup:
         sharded_adamw_params = [
             p for p in self.params if _sharded_adamw_enabled(p)
         ]
+        owner_broadcast_bytes = sum(
+            int(packed_buf.numel() * packed_buf.element_size())
+            for packed_buf in self._packed_buf_by_owner.values()
+        )
+        owner_broadcast_max_bucket_bytes = max(
+            (
+                int(packed_buf.numel() * packed_buf.element_size())
+                for packed_buf in self._packed_buf_by_owner.values()
+            ),
+            default=0,
+        )
+        sharded_adamw_all_gather_bytes = sum(
+            int(
+                p._sharded_adamw_full_padded.numel()
+                * p._sharded_adamw_full_padded.element_size()
+            )
+            for p in sharded_adamw_params
+            if p._sharded_adamw_full_padded is not None
+        )
+        sharded_muon_all_gather_bytes = sum(
+            int(
+                p._sharded_muon_full_padded.numel()
+                * p._sharded_muon_full_padded.element_size()
+            )
+            for p in sharded_muon_params
+            if p._sharded_muon_full_padded is not None
+        )
+        total_unshard_bytes = (
+            owner_broadcast_bytes
+            + sharded_adamw_all_gather_bytes
+            + sharded_muon_all_gather_bytes
+        )
+        self._last_unshard_total_bytes = total_unshard_bytes
+        self._last_unshard_prefetch = bool(prefetch)
+        self.comm_ctx.record_forward_unshard_counter(
+            group_name,
+            dispatch_calls=1,
+            prefetch_dispatch_calls=1 if prefetch else 0,
+            demand_dispatch_calls=0 if prefetch else 1,
+            owner_broadcast_bytes=owner_broadcast_bytes,
+            owner_broadcast_max_bucket_bytes=owner_broadcast_max_bucket_bytes,
+            owner_broadcast_bucket_count=len(self._packed_buf_by_owner),
+            sharded_adamw_all_gather_bytes=sharded_adamw_all_gather_bytes,
+            sharded_adamw_param_count=len(sharded_adamw_params),
+            sharded_muon_all_gather_bytes=sharded_muon_all_gather_bytes,
+            sharded_muon_param_count=len(sharded_muon_params),
+            tp_publish_waits=1 if pending_tp_publish else 0,
+            replicate_publish_waits=1 if pending_replicate_publish else 0,
+            sharded_muon_publish_waits=1 if pending_sharded_muon_publish else 0,
+        )
         with torch.cuda.stream(broadcast_stream):
             # Alloc + owner copy-in BEFORE coalescing: these ops execute
             # immediately on broadcast_stream. Wrapped in no_grad +
@@ -442,7 +727,11 @@ class DedicatedParamGroup:
             for owner_coord, dsts in self._copy_in_dsts_by_owner.items():
                 if owner_coord[0] != local_shard_rank:
                     continue
-                srcs = [p._owned_data.view(-1) for p in self._by_owner[owner_coord]]
+                srcs = [
+                    p._owned_data.view(-1)
+                    for p in self._by_owner[owner_coord]
+                    if _owner_broadcast_enabled(p)
+                ]
                 with (
                     torch.no_grad(),
                     torch.autograd._unsafe_preserve_version_counter(
@@ -451,52 +740,118 @@ class DedicatedParamGroup:
                 ):
                     torch._foreach_copy_(dsts, srcs)
 
-            # DMuon-managed sharded AdamW base params: every shard rank owns a
-            # flat shard and all-gathers the full forward view.  This keeps
-            # embeddings/heads on the DMuon communication surface instead of
-            # handing them back to FSDP2 or a single owner broadcast.
-            for p in sharded_adamw_params:
-                assert p._sharded_adamw_full_padded is not None
-                assert p._sharded_adamw_comm_shard is not None
-                assert p._sharded_adamw_data is not None
-                with (
-                    torch.no_grad(),
-                    torch.autograd._unsafe_preserve_version_counter(
-                        p._sharded_adamw_full_padded
-                    ),
-                ):
-                    alloc_storage(p._sharded_adamw_full_padded)
-                    p._sharded_adamw_comm_shard.copy_(p._sharded_adamw_data)
-
-            group_name = _group_profile_name(self)
-            with dist._coalescing_manager(group=dp_group, device=self.device):
-                for owner_coord, packed_buf in self._packed_buf_by_owner.items():
-                    profile_name = (
-                        f"dmuon.unshard_broadcast.bucket."
-                        f"owner{owner_coord[0]}_{owner_coord[1]}."
-                        f"bytes{int(packed_buf.numel() * packed_buf.element_size())}."
-                        f"params{len(self._by_owner[owner_coord])}.{group_name}"
-                    )
-                    with _profile_range(profile_name):
-                        dist.broadcast(
-                            packed_buf,
-                            src=self._global_owner_ranks[owner_coord],
-                            group=dp_group,
-                        )
-            if sharded_adamw_params:
-                with dist._coalescing_manager(group=dp_group, device=self.device):
-                    for p in sharded_adamw_params:
-                        profile_name = (
-                            f"dmuon.unshard_all_gather.sharded_adamw."
-                            f"bytes{int(p._sharded_adamw_full_padded.numel() * p._sharded_adamw_full_padded.element_size())}."
-                            f"{p.param_name}.{group_name}"
-                        )
-                        with _profile_range(profile_name):
-                            dist.all_gather_into_tensor(
-                                p._sharded_adamw_full_padded,
-                                p._sharded_adamw_comm_shard,
-                                group=dp_group,
+            if owner_broadcast_bytes:
+                owner_start = None
+                owner_end = None
+                if self.comm_ctx.record_forward_profile:
+                    owner_start = torch.cuda.Event(enable_timing=True)
+                    owner_end = torch.cuda.Event(enable_timing=True)
+                    owner_start.record(broadcast_stream)
+                with _profile_range(f"dmuon.unshard_broadcast.dispatch.{group_name}"):
+                    with dist._coalescing_manager(group=dp_group, device=self.device):
+                        for owner_coord, packed_buf in self._packed_buf_by_owner.items():
+                            profile_name = (
+                                f"dmuon.unshard_broadcast.bucket."
+                                f"owner{owner_coord[0]}_{owner_coord[1]}."
+                                f"bytes{int(packed_buf.numel() * packed_buf.element_size())}."
+                                f"params{len(self._by_owner[owner_coord])}.{group_name}"
                             )
+                            with _profile_range(profile_name):
+                                dist.broadcast(
+                                    packed_buf,
+                                    src=self._global_owner_ranks[owner_coord],
+                                    group=dp_group,
+                                )
+                if owner_start is not None and owner_end is not None:
+                    owner_end.record(broadcast_stream)
+                    self.comm_ctx.record_forward_unshard_event(
+                        group_name=group_name,
+                        phase="owner_broadcast_dispatch",
+                        start=owner_start,
+                        end=owner_end,
+                        bytes=owner_broadcast_bytes,
+                        prefetch=prefetch,
+                    )
+        if sharded_adamw_params or sharded_muon_params:
+            # DMuon-managed sharded AdamW base params: every shard rank owns a
+            # flat shard and all-gathers the full forward view.  A separate
+            # stream is optional because these large embedding/head gathers can
+            # otherwise queue in front of the first decoder-layer owner
+            # broadcasts on the regular forward unshard stream.
+            with torch.cuda.stream(sharded_adamw_stream):
+                for p in sharded_adamw_params:
+                    assert p._sharded_adamw_full_padded is not None
+                    assert p._sharded_adamw_comm_shard is not None
+                    assert p._sharded_adamw_data is not None
+                    with (
+                        torch.no_grad(),
+                        torch.autograd._unsafe_preserve_version_counter(
+                            p._sharded_adamw_full_padded
+                        ),
+                    ):
+                        alloc_storage(p._sharded_adamw_full_padded)
+                        p._sharded_adamw_comm_shard.copy_(p._sharded_adamw_data)
+                for p in sharded_muon_params:
+                    assert p._sharded_muon_full_padded is not None
+                    assert p._sharded_muon_comm_shard is not None
+                    assert p._sharded_muon_data is not None
+                    with (
+                        torch.no_grad(),
+                        torch.autograd._unsafe_preserve_version_counter(
+                            p._sharded_muon_full_padded
+                        ),
+                    ):
+                        alloc_storage(p._sharded_muon_full_padded)
+                        p._sharded_muon_comm_shard.copy_(p._sharded_muon_data)
+
+                gather_start = None
+                gather_end = None
+                if self.comm_ctx.record_forward_profile:
+                    gather_start = torch.cuda.Event(enable_timing=True)
+                    gather_end = torch.cuda.Event(enable_timing=True)
+                    gather_start.record(sharded_adamw_stream)
+                with _profile_range(
+                    f"dmuon.unshard_all_gather.sharded_adamw.dispatch.{group_name}"
+                ):
+                    with dist._coalescing_manager(group=dp_group, device=self.device):
+                        for p in sharded_adamw_params:
+                            profile_name = (
+                                f"dmuon.unshard_all_gather.sharded_adamw."
+                                f"bytes{int(p._sharded_adamw_full_padded.numel() * p._sharded_adamw_full_padded.element_size())}."
+                                f"{p.param_name}.{group_name}"
+                            )
+                            with _profile_range(profile_name):
+                                dist.all_gather_into_tensor(
+                                    p._sharded_adamw_full_padded,
+                                    p._sharded_adamw_comm_shard,
+                                    group=dp_group,
+                                )
+                        for p in sharded_muon_params:
+                            profile_name = (
+                                f"dmuon.unshard_all_gather.sharded_muon."
+                                f"bytes{int(p._sharded_muon_full_padded.numel() * p._sharded_muon_full_padded.element_size())}."
+                                f"{p.param_name}.{group_name}"
+                            )
+                            with _profile_range(profile_name):
+                                dist.all_gather_into_tensor(
+                                    p._sharded_muon_full_padded,
+                                    p._sharded_muon_comm_shard,
+                                    group=dp_group,
+                                )
+                if gather_start is not None and gather_end is not None:
+                    gather_end.record(sharded_adamw_stream)
+                    self.comm_ctx.record_forward_unshard_event(
+                        group_name=group_name,
+                        phase="sharded_param_all_gather_dispatch",
+                        start=gather_start,
+                        end=gather_end,
+                        bytes=(
+                            sharded_adamw_all_gather_bytes
+                            + sharded_muon_all_gather_bytes
+                        ),
+                        prefetch=prefetch,
+                    )
+            self._sharded_adamw_unshard_event = sharded_adamw_stream.record_event()
 
         self._broadcast_event = broadcast_stream.record_event()
 
@@ -507,16 +862,41 @@ class DedicatedParamGroup:
         After this call, all dedicated parameters are set on their modules
         and ready for forward/backward compute.
         """
-        if self._broadcast_event is None:
+        if self._broadcast_event is None and self._sharded_adamw_unshard_event is None:
             return
 
-        torch.cuda.current_stream().wait_event(self._broadcast_event)
+        group_name = _group_profile_name(self)
+        current_stream = torch.cuda.current_stream()
+        if self.comm_ctx.record_forward_profile:
+            wait_start = torch.cuda.Event(enable_timing=True)
+            wait_end = torch.cuda.Event(enable_timing=True)
+            wait_start.record(current_stream)
+            if self._broadcast_event is not None:
+                current_stream.wait_event(self._broadcast_event)
+            if self._sharded_adamw_unshard_event is not None:
+                current_stream.wait_event(self._sharded_adamw_unshard_event)
+            wait_end.record(current_stream)
+            self.comm_ctx.record_forward_unshard_counter(group_name, wait_calls=1)
+            self.comm_ctx.record_forward_unshard_event(
+                group_name=group_name,
+                phase="forward_wait",
+                start=wait_start,
+                end=wait_end,
+                bytes=self._last_unshard_total_bytes,
+                prefetch=self._last_unshard_prefetch,
+            )
+        else:
+            if self._broadcast_event is not None:
+                current_stream.wait_event(self._broadcast_event)
+            if self._sharded_adamw_unshard_event is not None:
+                current_stream.wait_event(self._sharded_adamw_unshard_event)
 
         # Finalize: set unsharded params on modules
         for p in self.params:
             p.finish_unshard()
 
         self._broadcast_event = None
+        self._sharded_adamw_unshard_event = None
         self._is_unsharded = True
 
     # ---- reshard ----
@@ -540,6 +920,9 @@ class DedicatedParamGroup:
             # Drain and discard — the prefetched unshard was not consumed.
             torch.cuda.current_stream().wait_event(self._broadcast_event)
             self._broadcast_event = None
+        if self._sharded_adamw_unshard_event is not None:
+            torch.cuda.current_stream().wait_event(self._sharded_adamw_unshard_event)
+            self._sharded_adamw_unshard_event = None
         for p in self.params:
             p.reshard()
         from dmuon._core.internal_utils import free_storage
@@ -551,9 +934,12 @@ class DedicatedParamGroup:
             ):
                 free_storage(packed_buf)
         for p in self.params:
-            if not _sharded_adamw_enabled(p):
+            if _sharded_adamw_enabled(p):
+                full_padded = getattr(p, "_sharded_adamw_full_padded", None)
+            elif _sharded_muon_forward_enabled(p):
+                full_padded = getattr(p, "_sharded_muon_full_padded", None)
+            else:
                 continue
-            full_padded = getattr(p, "_sharded_adamw_full_padded", None)
             if full_padded is None:
                 continue
             with (
@@ -1407,24 +1793,182 @@ class DedicatedParamGroup:
             event=event,
         )
 
+    def sharded_muon_publish_async(self) -> None:
+        """Publish updated Muon owner tensors into rank-local forward shards.
+
+        This opt-in path moves Muon-managed parameters from owner-broadcast
+        forward placement to FSDP-style all-gather forward placement.  The
+        owner still executes the full-matrix update into ``_owned_data``; this
+        post-step publish uses reduce-scatter with zero inputs on non-owner
+        ranks so the next forward can reconstruct the full view with all-gather.
+        """
+        work = [p for p in self.params if _sharded_muon_forward_enabled(p)]
+        if not work:
+            return
+        if self._sharded_muon_publish_state is not None:
+            group_name = getattr(self, "_debug_name", "<unknown>")
+            raise RuntimeError(
+                f"sharded_muon_publish_async[{group_name}]: previous event still "
+                "pending — pre_forward_wait was not consumed before the next dispatch"
+            )
+
+        dp_group = self._dp_group
+        replicate_group = self.comm_ctx.replicate_group
+        local_shard_rank = dp_group.rank()
+        local_replicate_rank = replicate_group.rank() if replicate_group else 0
+        publish_stream = self.comm_ctx.replicate_broadcast_stream
+        publish_stream.wait_stream(torch.cuda.current_stream())
+        if self._tp_scatter_state is not None:
+            publish_stream.wait_event(self._tp_scatter_state.event)
+        if self._replicate_broadcast_state is not None:
+            publish_stream.wait_event(self._replicate_broadcast_state.event)
+
+        refs: list[torch.Tensor] = []
+        group_name = _group_profile_name(self)
+        with torch.cuda.stream(publish_stream):
+            if replicate_group is None:
+                with _profile_range(
+                    f"dmuon.sharded_muon_publish.reduce_scatter.{group_name}"
+                ):
+                    with dist._coalescing_manager(group=dp_group, device=self.device):
+                        for p in work:
+                            assert p._sharded_muon_comm_shard is not None
+                            assert p._sharded_muon_data is not None
+                            assert p._sharded_muon_scatter_input is not None
+                            scatter_input = p._sharded_muon_scatter_input
+                            scatter_input.zero_()
+                            if local_shard_rank == p.owner_shard:
+                                assert p._owned_data is not None
+                                scatter_input[: p.numel].copy_(p._owned_data.reshape(-1))
+                            dist.reduce_scatter_tensor(
+                                p._sharded_muon_comm_shard,
+                                scatter_input,
+                                op=dist.ReduceOp.SUM,
+                                group=dp_group,
+                            )
+                            refs.extend(
+                                (
+                                    scatter_input,
+                                    p._sharded_muon_comm_shard,
+                                )
+                            )
+            else:
+                # HSDP has a 2D mesh: shard groups reconstruct each row's
+                # forward view, while replicate groups keep rows consistent.
+                # For all-gather forward placement, avoid a full-matrix
+                # replicate broadcast.  The global owner row first scatters
+                # the updated matrix into shard-local chunks; then each shard
+                # column broadcasts only its chunk across the replicate axis.
+                with _profile_range(
+                    f"dmuon.sharded_muon_publish.owner_row_reduce_scatter.{group_name}"
+                ):
+                    row_work = [
+                        p
+                        for p in work
+                        if local_replicate_rank == p.owner_replicate
+                    ]
+                    if row_work:
+                        with dist._coalescing_manager(
+                            group=dp_group, device=self.device
+                        ):
+                            for p in row_work:
+                                assert p._sharded_muon_comm_shard is not None
+                                assert p._sharded_muon_data is not None
+                                assert p._sharded_muon_scatter_input is not None
+                                scatter_input = p._sharded_muon_scatter_input
+                                scatter_input.zero_()
+                                if local_shard_rank == p.owner_shard:
+                                    assert p._owned_data is not None
+                                    scatter_input[: p.numel].copy_(
+                                        p._owned_data.reshape(-1)
+                                    )
+                                dist.reduce_scatter_tensor(
+                                    p._sharded_muon_comm_shard,
+                                    scatter_input,
+                                    op=dist.ReduceOp.SUM,
+                                    group=dp_group,
+                                )
+                                refs.extend(
+                                    (
+                                        scatter_input,
+                                        p._sharded_muon_comm_shard,
+                                    )
+                                )
+                with _profile_range(
+                    f"dmuon.sharded_muon_publish.shard_column_broadcast.{group_name}"
+                ):
+                    with dist._coalescing_manager(
+                        group=replicate_group, device=self.device
+                    ):
+                        for p in work:
+                            assert p._sharded_muon_comm_shard is not None
+                            assert p._sharded_muon_data is not None
+                            src_rank = dist.get_global_rank(
+                                replicate_group, p.owner_replicate
+                            )
+                            dist.broadcast(
+                                p._sharded_muon_comm_shard,
+                                src=src_rank,
+                                group=replicate_group,
+                            )
+
+            for p in work:
+                assert p._sharded_muon_comm_shard is not None
+                assert p._sharded_muon_data is not None
+                p._sharded_muon_data.copy_(
+                    p._sharded_muon_comm_shard.to(dtype=p._sharded_muon_data.dtype)
+                )
+                p._sharded_muon_comm_shard.record_stream(publish_stream)
+                p._sharded_muon_initialized = True
+
+        self._sharded_muon_publish_state = ShardedMuonPublishState(
+            refs=refs,
+            event=publish_stream.record_event(),
+        )
+
+    def sharded_muon_publish_sync(self) -> None:
+        """Synchronous variant of :meth:`sharded_muon_publish_async`."""
+        self.sharded_muon_publish_async()
+        self.wait_for_sharded_muon_publish()
+
+    def wait_for_sharded_muon_publish(self) -> None:
+        if self._sharded_muon_publish_state is None:
+            return
+        torch.cuda.current_stream().wait_event(self._sharded_muon_publish_state.event)
+        self._sharded_muon_publish_state = None
+
     def _pre_forward_prefetch_publish(self) -> None:
         """Dispatch pending publish for a prefetched unshard without
         blocking the current compute stream.
 
         Actual forward entry uses :meth:`_pre_forward_wait` and clears the
-        async state.  A prefetch only orders this group's shard-dim broadcast
-        stream after the HSDP publish event, so the caller can continue
-        running the current layer while the next group's publish/unshard
-        pipeline progresses on communication streams.
+        async state.  A prefetch orders every forward-unshard stream that may
+        consume the published shard after the HSDP publish event, so the caller
+        can continue running the current layer while the next group's
+        publish/unshard pipeline progresses on communication streams.
         """
 
-        bcast_stream = self.comm_ctx.broadcast_stream
+        streams = [self.comm_ctx.broadcast_stream]
+        if bool(
+            getattr(
+                self.comm_ctx,
+                "sharded_adamw_unshard_separate_stream_enabled",
+                False,
+            )
+        ):
+            streams.append(self.comm_ctx.sharded_adamw_unshard_stream)
         tp_state = self._tp_scatter_state
         if tp_state is not None:
-            bcast_stream.wait_event(tp_state.event)
+            for stream in streams:
+                stream.wait_event(tp_state.event)
         state = self._replicate_broadcast_state
         if state is not None:
-            bcast_stream.wait_event(state.event)
+            for stream in streams:
+                stream.wait_event(state.event)
+        sharded_state = self._sharded_muon_publish_state
+        if sharded_state is not None:
+            for stream in streams:
+                stream.wait_event(sharded_state.event)
 
     @dynamo_disable
     def _pre_forward_wait(self) -> None:
@@ -1441,18 +1985,78 @@ class DedicatedParamGroup:
         # replicate broadcast event implicitly covers the scatter, but
         # we still wait the scatter event explicitly so the state tuple
         # (and its pinned TP-owner send refs) can be released.
+        group_name = _group_profile_name(self)
+        current_stream = torch.cuda.current_stream()
         tp_state = self._tp_scatter_state
         if tp_state is not None:
-            torch.cuda.current_stream().wait_event(tp_state.event)
+            start = end = None
+            if self.comm_ctx.record_forward_profile:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record(current_stream)
+            current_stream.wait_event(tp_state.event)
+            if start is not None and end is not None:
+                end.record(current_stream)
+                self.comm_ctx.record_forward_unshard_counter(
+                    group_name, tp_publish_waits=1
+                )
+                self.comm_ctx.record_forward_unshard_event(
+                    group_name=group_name,
+                    phase="pre_forward_tp_publish_wait_direct",
+                    start=start,
+                    end=end,
+                    bytes=0,
+                    prefetch=False,
+                )
             self._tp_scatter_state = None
 
         state = self._replicate_broadcast_state
-        if state is None:
+        if state is not None:
+            start = end = None
+            if self.comm_ctx.record_forward_profile:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record(current_stream)
+            current_stream.wait_event(state.event)
+            if start is not None and end is not None:
+                end.record(current_stream)
+                self.comm_ctx.record_forward_unshard_counter(
+                    group_name, replicate_publish_waits=1
+                )
+                self.comm_ctx.record_forward_unshard_event(
+                    group_name=group_name,
+                    phase="pre_forward_replicate_publish_wait_direct",
+                    start=start,
+                    end=end,
+                    bytes=0,
+                    prefetch=False,
+                )
+            self._replicate_broadcast_state = None
+
+        sharded_state = self._sharded_muon_publish_state
+        if sharded_state is None:
             return
 
-        torch.cuda.current_stream().wait_event(state.event)
-
-        self._replicate_broadcast_state = None
+        start = end = None
+        if self.comm_ctx.record_forward_profile:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(current_stream)
+        current_stream.wait_event(sharded_state.event)
+        if start is not None and end is not None:
+            end.record(current_stream)
+            self.comm_ctx.record_forward_unshard_counter(
+                group_name, sharded_muon_publish_waits=1
+            )
+            self.comm_ctx.record_forward_unshard_event(
+                group_name=group_name,
+                phase="pre_forward_sharded_muon_publish_wait_direct",
+                start=start,
+                end=end,
+                bytes=0,
+                prefetch=False,
+            )
+        self._sharded_muon_publish_state = None
 
     # ---- backward prefetch ----
 
