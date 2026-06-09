@@ -7,7 +7,7 @@
 #
 # Usage:
 #   bash tests/distributed/run_tp_alignment.sh
-#   DMUON_ALIGN_MATRIX=llm_full DMUON_ALIGN_OUT=docs/internal/report/tp_llm_loss_matrix \
+#   DMUON_ALIGN_MATRIX=llm_full DMUON_ALIGN_OUT=.pytest_artifacts/tp_llm_loss_matrix \
 #       bash tests/distributed/run_tp_alignment.sh
 
 set -euo pipefail

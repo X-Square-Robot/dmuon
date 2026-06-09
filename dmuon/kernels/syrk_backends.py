@@ -12,7 +12,8 @@ Sits above the concrete kernels:
 import time; users may override via the ``backend=`` argument or the
 ``DMUON_NS_KERNEL`` env var.
 
-See ``docs/internal/research/ns_backend_dispatch_plan.md`` §3 (B2).
+This module owns backend selection and keeps optional kernels behind soft
+dependency checks.
 """
 
 from __future__ import annotations

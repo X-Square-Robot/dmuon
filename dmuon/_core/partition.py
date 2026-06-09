@@ -9,8 +9,7 @@ return type, which keeps existing tests untouched).
 T1 extends the return type to ``AssignmentResult``, which keeps the
 existing ``dp_owners`` mapping (1D ``int`` or 2D ``(shard, replicate)``
 tuple, unchanged in shape) and adds a sparse ``tp_owners`` dict populated
-only for TP-sharded parameters.  See
-``docs/internal/research/tp_design.md`` §6.
+only for TP-sharded parameters.
 """
 
 from collections import defaultdict

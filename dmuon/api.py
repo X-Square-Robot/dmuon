@@ -289,7 +289,6 @@ def dedicate_params(
     the TP group.  No TP mesh argument is required; simply pass the DP
     slice of your 3D mesh as ``mesh`` / ``replicate_mesh``, matching the
     FSDP2 convention (``fully_shard(mesh=mesh["replicate","shard"])``).
-    See ``docs/internal/research/tp_design.md`` §5.
 
     Typical 3D (replicate × shard × tp) call order::
 
@@ -544,8 +543,7 @@ def dedicate_params_ddp(
     Every rank keeps the full parameter live on the module. Ownership
     applies only to (1) who runs Newton-Schulz, (2) the ``dist.reduce``
     destination after backward, and (3) the ``dist.broadcast`` source
-    after ``optim.step``. See ``docs/internal/research/ddp_adapter_plan.md``
-    for the full semantic model.
+    after ``optim.step``.
 
     Compared with :func:`dedicate_params`, this entry:
 

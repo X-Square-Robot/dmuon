@@ -11,8 +11,7 @@ Two NS modes:
 TP support lives entirely in the runtime layer (``dmuon._backends.fsdp2``):
 for TP-sharded parameters the runtime does a TP gather so the TP owner
 sees the full matrix, then calls one of the functions above — the
-NS algorithms themselves are TP-agnostic.  See
-``docs/internal/research/tp_design.md``.
+NS algorithms themselves are TP-agnostic.  See ``docs/guides/tp-support.md``.
 
 Gram NS iteration logic is adapted from Dao-AILab/gram-newton-schulz, including
 per-step coefficients, restart mechanism, and mixed-precision pipeline.

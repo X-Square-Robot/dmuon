@@ -70,56 +70,20 @@ Muon-target 参数的稳态显存：
 
 ## 决策树
 
-- **模型 > 10B 参数？** → 用 DMuon-Z3（默认）。额外的 forward broadcast 相比节省的显存
-  完全值得。
+这些判断只是经验起点，不是硬规则。真实选择还要看 Muon-target 参数占比、GPU 显存余量、
+节点间网络、activation 显存、梯度累积设置，以及实际 profiling 的吞吐结果。
+
+- **模型 > 10B 参数？** → 优先从 DMuon-Z3（默认）开始。多数情况下，额外的 forward
+  broadcast 相比节省的显存更容易接受。
 - **模型 < 3B 且 8+ GPU？** → DMuon-Z2 可以考虑。通信占主导时，省掉 backward broadcast
   有明显收益。
-- **DMuon-Z3 下 OOM？** → 不寻常；packed buffer 在 Z3 下是 transient 的。先排查 activation
-  显存和梯度累积 buffer 大小。
+- **DMuon-Z3 下 OOM？** → 先不要急着切 Z2；packed buffer 在 Z3 下是 transient 的。优先排查
+  activation 显存和梯度累积 buffer 大小。
 - **和 `fully_shard(..., reshard_after_forward=X)` 配合使用？** → 让 `dedicate_params`
   的 `reshard_after_forward` 与之保持一致。对称配置让 Muon-target 和非 Muon 参数的显存模型
   保持统一，易于推理。
 - **使用 HSDP 多机？** → 选择同样适用。上面的通信量统计针对 shard 维；replicate 维的
   post-step broadcast 是独立的，不受 Z2/Z3 影响。
-
----
-
-## 代码切换
-
-```python title="z3_z2_switch.py"
-import dmuon
-from torch.distributed.fsdp import fully_shard
-from torch.distributed.device_mesh import init_device_mesh
-
-mesh = init_device_mesh("cuda", (world_size,))
-model = MyModel().cuda()
-
-# DMuon-Z3（默认）—— 推荐大模型
-dmuon.dedicate_params(
-    model,
-    mesh,
-    predicate=lambda n, p: p.ndim == 2 and "proj" in n,
-    # reshard_after_forward=True 是默认值，可以省略
-)
-for layer in model.layers:
-    fully_shard(layer, mesh=mesh)                   # FSDP2 也默认 Z3
-fully_shard(model, mesh=mesh)
-
-# --- 或 ---
-
-# DMuon-Z2 —— 中小模型 opt-in，通信占主导时使用
-dmuon.dedicate_params(
-    model,
-    mesh,
-    predicate=lambda n, p: p.ndim == 2 and "proj" in n,
-    reshard_after_forward=False,                     # ← DMuon-Z2
-)
-for layer in model.layers:
-    fully_shard(layer, mesh=mesh, reshard_after_forward=False)   # FSDP2 Z2
-fully_shard(model, mesh=mesh)
-
-optimizer = dmuon.Muon(model, lr=0.02, adamw_lr=1e-3)
-```
 
 ---
 
@@ -139,20 +103,22 @@ DMuon-Z2 + FSDP2-Z3（或反过来）合法，偶尔是最优选择：
 
 ## 与 ZeRO-2 / ZeRO-3 的关系
 
-DMuon 的 Z2/Z3 命名遵循 PyTorch FSDP2 `reshard_after_forward` 的同一套惯例：
+DMuon 的 Z2/Z3 命名沿用 PyTorch FSDP2 `reshard_after_forward` 的习惯：
 
-- **ZeRO-2 风格**（`reshard_after_forward=False`）：参数在 forward 和 backward 全程保持
-  unsharded（已收集）。
-- **ZeRO-3 风格**（`reshard_after_forward=True`）：参数在 forward 后 reshard（释放），
-  按需重新收集。
+- **ZeRO-2 风格**（`reshard_after_forward=False`）：参数在 forward 和 backward 之间保持
+  unsharded 状态，也就是已经收集好的完整形态。
+- **ZeRO-3 风格**（`reshard_after_forward=True`）：参数在 forward 结束后 reshard 并释放，
+  backward 需要时再重新收集。
 
-DMuon 把 Muon-target 参数完全**拿出** FSDP2 的 sharded-state 机制——它们根本不以 FSDP2 的
-方式分片。取而代之，每个参数有单一 owner 持有权威的 `_owned_data`，packed buffer 从 owner
-broadcast 出去。Z2/Z3 flag 控制的是**这个 packed buffer 的生命周期**，镜像了 FSDP2 对自己
-存储的相同语义。
+DMuon 管理的 Muon-target 参数不再走 FSDP2 的 sharded-state 路径，也就不是由 FSDP2
+按普通参数的方式分片。每个 Muon-target 参数会有一个单一 owner，owner 持有权威的
+`_owned_data`；训练时需要完整参数时，再从 owner broadcast 出 packed buffer。DMuon 的
+Z2/Z3 flag 控制的正是**这个 packed buffer 的生命周期**，语义上对应 FSDP2 对普通参数
+storage 的处理方式。
 
-这意味着 DMuon-Z2/Z3 和 FSDP2-Z2/Z3 是独立的旋钮，控制不同的存储路径，可以独立设置，
-如上文非对称配置部分所述。
+因此，DMuon-Z2/Z3 和 FSDP2-Z2/Z3 是两个独立旋钮：前者控制 Muon-target packed buffer，
+后者控制普通 FSDP2 参数。两者可以独立设置，只是非对称配置会增加分析成本，通常需要
+profiling 数据支撑。
 
 ---
 

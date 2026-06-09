@@ -222,7 +222,7 @@ inside each replica, use `dedicate_params_ddp_tp()` together with
 
 ## Benchmarks
 
-Current snapshot: A800-SXM4-80GB, bf16, random initialization, synthetic data. Step time is reported as p50 step-start interval, so cross-step communication overlap is not double-counted. Source: accepted summaries from the DMuon 256GPU experiment dashboard, 2026-05-24 run set. 256GPU entries are still pending the 32-node run window.
+Current snapshot: A800-SXM4-80GB, bf16, random initialization, synthetic data. Step time is reported as p50 step-start interval, so cross-step communication overlap is not double-counted. These rows are point-in-time research-preview summaries from controlled A800 runs; use them as relative performance context rather than a public reproduction recipe.
 
 ### LLM 128GPU Step Time
 
@@ -238,17 +238,6 @@ LLM runs use seq=4096.
 | Llama-3.2-3B | HSDP-Z3 | 1,192 ms | 1,165 ms | -2.3% |
 | Llama-3.1-8B | FSDP-Z2 | 1,271 ms | 1,372 ms | +8.0% |
 | Llama-3.1-8B | HSDP-Z3 | 1,348 ms | 1,412 ms | +4.7% |
-
-### VLA 128GPU Step Time
-
-These VLA runs use the real Pi0 and WallX training entries, not reduced mock models. Batch size follows the accepted dashboard run for each optimizer/runtime pair.
-
-| Model | Runtime | AdamW step | DMuon step | Delta vs AdamW |
-|:------|:--------|-----------:|-----------:|---------------:|
-| Pi0 | FSDP-Z2 | 1,587 ms | 1,659 ms | +4.6% |
-| Pi0 | HSDP-Z3 | 1,630 ms | 1,652 ms | +1.4% |
-| WallX/Qwen2.5-VL-3B | FSDP-Z2 | 1,690 ms | 1,790 ms | +5.9% |
-| WallX/Qwen2.5-VL-3B | HSDP-Z3 | 1,492 ms | 1,522 ms | +2.0% |
 
 ## 📖 Documentation
 
@@ -313,8 +302,6 @@ Full documentation is hosted on GitHub Pages: **[starrickliu.github.io/dmuon](ht
 - [ ] DeepSpeed ZeRO integration
 - [ ] CI/CD (GitHub Actions)
 - [ ] torch.compile support
-
-See [TODO.md](TODO.md) for details.
 
 ## Acknowledgments
 

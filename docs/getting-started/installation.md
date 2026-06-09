@@ -56,9 +56,9 @@
     pip install -e ".[dev]"
     ```
 
-    Installs the library in editable mode plus test dependencies
-    (`pytest`, `pytest-dist`, and related tooling). Run the unit
-    test suite to confirm everything works:
+    Installs the library in editable mode plus test, packaging, and
+    documentation dependencies. Run the unit test suite to confirm everything
+    works:
 
     ```bash
     pytest tests/unit/ -v
@@ -104,7 +104,7 @@ Expected output (SYRK installed, SM80+ GPU):
 DMuon version : 0.2.0
 PyTorch version: 2.6.0
 CUDA available : True
-NS backend     : syrk_sm80
+NS backend     : Gram NS · kernel=cute_sm80 (SM80, DMuon internal)
 ```
 
 Expected output (SYRK not installed or older GPU):
@@ -113,7 +113,7 @@ Expected output (SYRK not installed or older GPU):
 DMuon version : 0.2.0
 PyTorch version: 2.6.0
 CUDA available : True
-NS backend     : compiled
+NS backend     : Gram NS · kernel=cublas (SM80, universal fallback)
 ```
 
 ---

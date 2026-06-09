@@ -19,17 +19,17 @@ cd dmuon
 conda create -n dmuon-dev python=3.11 && conda activate dmuon-dev
 
 # Install PyTorch (adjust CUDA version as needed)
-pip install "torch>=2.4" --index-url https://download.pytorch.org/whl/cu121
+pip install "torch>=2.6" --index-url https://download.pytorch.org/whl/cu121
 
 # Install DMuon and dev dependencies
 pip install -e ".[dev]"
 
-# Install pre-commit hooks
-pre-commit install
 ```
 
-The `[dev]` extra installs `pytest`, `black`, `ruff`, `mkdocs-material`, and
-`mkdocstrings[python]`.
+The `[dev]` extra installs test, lint, packaging, and documentation tools,
+including `pytest`, `ruff`, `build`, `mkdocs-material`, and
+`mkdocstrings[python]`. Release checks that need `twine` can install
+`pip install -e ".[release]"`.
 
 ---
 
@@ -40,11 +40,6 @@ The `[dev]` extra installs `pytest`, `black`, `ruff`, `mkdocs-material`, and
 ```bash
 python -m pytest tests/unit/ -v
 ```
-
-!!! note
-    `tests/unit/test_newton_schulz.py` has a pre-existing failure unrelated to
-    your change — skip it with `--ignore=tests/unit/test_newton_schulz.py` if
-    needed.
 
 ### Distributed tests (requires 4 GPUs)
 
@@ -69,8 +64,8 @@ import torch
 
 ## Coding style
 
-- **Formatter:** `black` (line length 99)
-- **Linter:** `ruff` (configured in `pyproject.toml`)
+- **Formatter:** `ruff format` (configured in `pyproject.toml`)
+- **Linter:** `ruff check` (configured in `pyproject.toml`)
 - **Type hints:** required on all public functions and class methods
 - **Docstrings:** NumPy style (configured in mkdocstrings); concise —
   one line summary, Args, Returns
@@ -79,11 +74,11 @@ import torch
 Run style checks:
 
 ```bash
-black dmuon/ tests/
-ruff check dmuon/ tests/
+ruff format dmuon/ examples/
+ruff check dmuon/ examples/
 ```
 
-Both are also enforced by the pre-commit hook installed above.
+Run both before sending changes for review.
 
 ---
 
@@ -96,7 +91,6 @@ Before opening a pull request:
 - [ ] For distributed changes: `test_hsdp_correctness.py` passes
 - [ ] Public API changes have updated docstrings
 - [ ] Docs updated if behavior or API surface changed
-- [ ] `CHANGELOG.md` entry added (format: `- [type] short description`)
 - [ ] **Bit-identical correctness maintained** — no change to loss values for
   the same random seed across 1D shard-only, HSDP, and checkpoint-resume runs
 
@@ -107,8 +101,8 @@ For new features, open an issue first to align on scope.
 ## Architecture orientation
 
 Read [Design / Architecture](design/architecture.md) before touching the
-core ownership machinery (`dmuon/param.py`, `dmuon/group.py`,
-`dmuon/state.py`, `dmuon/api.py`).  The key invariants are:
+core ownership machinery (`dmuon/api.py`, `dmuon/_core/`,
+`dmuon/_backends/`).  The key invariants are:
 
 - `DedicatedParam._owned_data` is the single source of truth for the parameter
   value on the owner rank
@@ -128,8 +122,7 @@ DMuon follows semantic versioning: `MAJOR.MINOR.PATCH`.
 - **Major:** breaking API changes (rare; require discussion)
 
 Documentation is deployed automatically to GitHub Pages on every push to
-`main` via GitHub Actions.  Internal docs (`docs/internal/`) are excluded from
-the published site.
+`main` via GitHub Actions.
 
 ---
 

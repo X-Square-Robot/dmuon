@@ -77,8 +77,7 @@ optimizer = dmuon.Muon(model, lr=0.02, momentum=0.95, adamw_lr=1e-3)
 scratch buffer，也可以在 `Muon` 上设置 `tp_distributed_gram=`，当 Gram
 factor payload 小于完整 update scatter 时走 TP-aware distributed Gram
 路径。`replicate_async` 是 DP/HSDP post-step publish 的 overlap 开关，
-不是 TP 专属开关；sync 与 async post-step publish 在已支持拓扑上的设计目标是
-保持相同 loss 轨迹。
+当前版本在存在 TP-sharded dedicated 参数时会回退到同步 publish。
 
 ## 内部流程
 
