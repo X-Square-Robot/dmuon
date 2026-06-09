@@ -1694,6 +1694,7 @@ class Muon(Optimizer):
             dp.tp_group is not None for dp in dedicated_params
         ):
             torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
+        current_stream = torch.cuda.current_stream()
 
         for dp in dedicated_params:
             if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
@@ -1701,6 +1702,12 @@ class Muon(Optimizer):
                 param = getattr(dp, "_sharded_adamw_data", None)
                 if grad is None or param is None:
                     continue
+                # ``grad`` is allocated and populated on DMuon's reduce stream
+                # but consumed by AdamW kernels on the current stream.  Record
+                # the consumer stream before dropping the Python reference so
+                # the CUDA caching allocator cannot recycle the buffer while
+                # those kernels are still pending.
+                grad.record_stream(current_stream)
                 self._adamw_update_tensor(
                     state_key=id(dp),
                     param=param,
@@ -1715,6 +1722,7 @@ class Muon(Optimizer):
             param = dp._owned_data
             if grad is None or param is None:
                 continue
+            grad.record_stream(current_stream)
             self._adamw_update_tensor(
                 state_key=id(dp),
                 param=param,
