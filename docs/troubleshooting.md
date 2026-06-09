@@ -52,6 +52,14 @@
     [Backend dispatch](reference/newton-schulz.md#backend-dispatch) for the
     full auto-detection ladder.
 
+    On the first uncached shape, DMuon autotunes the SYRK tile config against
+    cuBLAS and prints rank-tagged progress lines such as
+    `[DMuon][rank=0/8] SYRK autotune candidate started ...`.  These logs make
+    startup stalls during per-shape autotune visible in cluster logs; they do
+    not change the selected backend or benchmark result.  Set
+    `DMUON_SYRK_AUTOTUNE_LOG=0` to silence them after confirming autotune is
+    behaving normally.
+
 ---
 
 ## Training setup

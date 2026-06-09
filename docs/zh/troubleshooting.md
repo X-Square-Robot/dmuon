@@ -48,6 +48,13 @@
     的 quack SYRK。完整的自动检测阶梯见
     [后端分发](reference/newton-schulz.md#backend-dispatch)。
 
+    首次遇到未缓存 shape 时，DMuon 会把 SYRK tile 配置和 cuBLAS 做
+    autotune，并打印带 rank 的进度行，例如
+    `[DMuon][rank=0/8] SYRK autotune candidate started ...`。这些日志用于
+    在集群日志里确认 per-shape autotune 没有卡住；它们不改变后端选择或
+    benchmark 结果。确认 autotune 正常后，可设置
+    `DMUON_SYRK_AUTOTUNE_LOG=0` 关闭。
+
 ---
 
 ## 训练设置

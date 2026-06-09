@@ -4,7 +4,8 @@ Combines Newton-Schulz orthogonalization on dedicated parameters with
 AdamW on symmetric (FSDP2-managed) parameters in a single optimizer.
 """
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
+import time
 from typing import Optional, Union
 
 import torch
@@ -94,6 +95,11 @@ class Muon(Optimizer):
             to be smaller than scattering the full update.
         tp_distributed_gram_max_factor_to_scatter_ratio: Maximum factor-payload
             to full-scatter byte ratio allowed by the ``"beneficial"`` policy.
+        first_step_progress_log: Print a small number of first optimizer step
+            progress messages on owner ranks. This makes one-time NS/SYRK
+            per-shape dispatch or autotune visible in cluster logs.
+        first_step_progress_log_limit: Maximum number of per-shape first-step
+            progress messages to print per rank.
 
     Example::
 
@@ -302,6 +308,111 @@ class Muon(Optimizer):
         self._last_step_profile_events: list[
             tuple[str, torch.cuda.Event, torch.cuda.Event]
         ] = []
+
+    @staticmethod
+    def _distributed_rank_world() -> tuple[int, int]:
+        if dist.is_available() and dist.is_initialized():
+            try:
+                return dist.get_rank(), dist.get_world_size()
+            except RuntimeError:
+                pass
+        return 0, 1
+
+    def _first_step_log(self, message: str) -> None:
+        if not self._first_step_progress_log:
+            return
+        rank, world = self._distributed_rank_world()
+        print(f"[DMuon][rank={rank}/{world}] {message}", flush=True)
+
+    def _owned_param_counts(self) -> tuple[int, int, int]:
+        muon_count = 0
+        adamw_count = 0
+        shape_keys: set[tuple[int, ...]] = set()
+        for dp in self._dedicated_params:
+            dp_id = id(dp)
+            if dp_id in self._dp_to_muon_group_idx:
+                muon_count += 1
+                shape_keys.add(tuple(int(dim) for dim in dp.full_shape))
+            elif dp_id in self._dp_to_adamw_group_idx:
+                adamw_count += 1
+        return muon_count, adamw_count, len(shape_keys)
+
+    def _first_step_progress_begin(self) -> Optional[float]:
+        if self._optimizer_step_index != 0:
+            return None
+        self._first_step_logged_shapes.clear()
+        started_at = time.perf_counter()
+        if not self._first_step_progress_log:
+            return started_at
+        rank, _world = self._distributed_rank_world()
+        muon_count, adamw_count, unique_muon_shapes = self._owned_param_counts()
+        if rank == 0 or muon_count > 0 or adamw_count > 0:
+            kernel = getattr(getattr(self._ns, "kernel", None), "value", None)
+            kernel_msg = f", ns_kernel={kernel}" if kernel is not None else ""
+            self._first_step_log(
+                "first optimizer step started; one-time NS/SYRK "
+                "per-shape backend dispatch or autotune may run now "
+                f"(owned_muon_params={muon_count}, "
+                f"owned_adamw_params={adamw_count}, "
+                f"unique_muon_shapes={unique_muon_shapes}, "
+                f"ns_backend={self._ns.backend}{kernel_msg}, "
+                f"replicate_async={self._replicate_async})"
+            )
+        return started_at
+
+    def _first_step_progress_end(
+        self, started_at: Optional[float], *, failed: bool = False
+    ) -> None:
+        first_step = self._optimizer_step_index == 0
+        if started_at is not None and self._first_step_progress_log:
+            muon_count, adamw_count, _unique_muon_shapes = self._owned_param_counts()
+            rank, _world = self._distributed_rank_world()
+            if rank == 0 or muon_count > 0 or adamw_count > 0:
+                elapsed = time.perf_counter() - started_at
+                status = "failed" if failed else "finished"
+                suffix = (
+                    "; subsequent steps should reuse cached shape/backend choices"
+                    if not failed
+                    else ""
+                )
+                self._first_step_log(
+                    f"first optimizer step {status} in {elapsed:.3f}s{suffix}"
+                )
+        if first_step and not failed:
+            self._optimizer_step_index += 1
+
+    def _first_step_progress_shape(
+        self, dp, tensor: torch.Tensor, *, path: str
+    ) -> None:
+        if (
+            self._optimizer_step_index != 0
+            or not self._first_step_progress_log
+            or self._first_step_progress_log_limit <= 0
+        ):
+            return
+        shape = tuple(int(dim) for dim in tensor.shape)
+        kernel = getattr(getattr(self._ns, "kernel", None), "value", None)
+        key = (path, shape, str(tensor.dtype), self._ns.backend, kernel)
+        if key in self._first_step_logged_shapes:
+            return
+        if len(self._first_step_logged_shapes) >= self._first_step_progress_log_limit:
+            return
+        self._first_step_logged_shapes.add(key)
+
+        if len(shape) >= 2:
+            gram_dim = min(shape[0], shape[1])
+        else:
+            gram_dim = shape[0] if shape else 0
+        param_name = getattr(dp, "param_name", None) or getattr(
+            getattr(dp, "_orig_param", None), "_dmuon_name", "<unnamed>"
+        )
+        kernel_msg = f", ns_kernel={kernel}" if kernel is not None else ""
+        self._first_step_log(
+            "first optimizer step is entering NS/backend dispatch "
+            f"for path={path}, param={param_name}, shape={shape}, "
+            f"gram_dim={gram_dim}, dtype={tensor.dtype}, "
+            f"ns_backend={self._ns.backend}{kernel_msg}"
+        )
 
     def _dummy_param(self) -> nn.Parameter:
         device = torch.device("cpu")
@@ -961,6 +1072,9 @@ class Muon(Optimizer):
             )
 
             assert ns_input_full is not None
+            self._first_step_progress_shape(
+                dp, ns_input_full, path="tp_distributed_gram"
+            )
             profile_token = self._profile_event_start("ns_compute")
             try:
                 factor_segments, actual_transposed, normalizer = gram_newton_schulz_factors(
@@ -1179,57 +1293,63 @@ class Muon(Optimizer):
                 loss = closure()
 
         self._profile_begin_step()
+        first_step_started_at = self._first_step_progress_begin()
         use_group_prepare_prefetch = self._replicate_async
 
-        if self._replicate_async:
-            if not use_group_prepare_prefetch:
+        try:
+            if self._replicate_async:
+                if not use_group_prepare_prefetch:
+                    profile_token = self._profile_event_start("prepare_muon_grads")
+                    try:
+                        self._ensure_grads_ready()
+                    finally:
+                        self._profile_event_end(profile_token)
+                profile_token = self._profile_event_start("group_pipeline")
+                try:
+                    self._step_muon_and_dispatch_groups_async()
+                finally:
+                    self._profile_event_end(profile_token)
+            else:
+                # 1. Prepare every group's Muon gradients before the sync update.
                 profile_token = self._profile_event_start("prepare_muon_grads")
                 try:
                     self._ensure_grads_ready()
                 finally:
                     self._profile_event_end(profile_token)
-            profile_token = self._profile_event_start("group_pipeline")
+
+                # 2. Dedicated updates on owner-managed params.
+                profile_token = self._profile_event_start("muon")
+                try:
+                    self._step_muon()
+                finally:
+                    self._profile_event_end(profile_token)
+                profile_token = self._profile_event_start("dedicated_adamw")
+                try:
+                    self._step_dedicated_adamw()
+                finally:
+                    self._profile_event_end(profile_token)
+
+            # 3. AdamW update on FSDP2 params
+            profile_token = self._profile_event_start("adamw")
             try:
-                self._step_muon_and_dispatch_groups_async()
-            finally:
-                self._profile_event_end(profile_token)
-        else:
-            # 1. Prepare every group's Muon gradients before the sync update.
-            profile_token = self._profile_event_start("prepare_muon_grads")
-            try:
-                self._ensure_grads_ready()
+                self._step_adamw()
             finally:
                 self._profile_event_end(profile_token)
 
-            # 2. Dedicated updates on owner-managed params.
-            profile_token = self._profile_event_start("muon")
-            try:
-                self._step_muon()
-            finally:
-                self._profile_event_end(profile_token)
-            profile_token = self._profile_event_start("dedicated_adamw")
-            try:
-                self._step_dedicated_adamw()
-            finally:
-                self._profile_event_end(profile_token)
+            if not self._replicate_async:
+                # 4. Fan updated _owned_data from global owner to replicate peers.
+                # Sync mode preserves the old full-step dispatch+wait contract.
+                profile_token = self._profile_event_start("post_step_publish")
+                try:
+                    broadcast_all_updates(self.model)
+                finally:
+                    self._profile_event_end(profile_token)
 
-        # 3. AdamW update on FSDP2 params
-        profile_token = self._profile_event_start("adamw")
-        try:
-            self._step_adamw()
-        finally:
-            self._profile_event_end(profile_token)
-
-        if not self._replicate_async:
-            # 4. Fan updated _owned_data from global owner to replicate peers.
-            # Sync mode preserves the old full-step dispatch+wait contract.
-            profile_token = self._profile_event_start("post_step_publish")
-            try:
-                broadcast_all_updates(self.model)
-            finally:
-                self._profile_event_end(profile_token)
-
-        self._grads_ready = False
+            self._grads_ready = False
+        except Exception:
+            self._first_step_progress_end(first_step_started_at, failed=True)
+            raise
+        self._first_step_progress_end(first_step_started_at)
         return loss
 
     def _step_muon_and_dispatch_groups_async(self) -> None:
@@ -1478,6 +1598,11 @@ class Muon(Optimizer):
             ns_input = grad.add(buf, alpha=mu) if self._nesterov else buf
 
             # Newton-Schulz on the full (un-sharded) matrix.
+            self._first_step_progress_shape(
+                dp,
+                ns_input,
+                path="tp_owner_full_matrix" if is_tp else "owner_full_matrix",
+            )
             profile_token = self._profile_event_start("ns_compute")
             try:
                 update = self._ns.local(ns_input, self._ns_steps)
