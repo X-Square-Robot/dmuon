@@ -1,6 +1,7 @@
 """Unit tests for the partition algorithm (single GPU, no dist required)."""
 
-import os, sys
+import os
+import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import pytest

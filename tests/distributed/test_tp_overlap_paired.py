@@ -175,7 +175,7 @@ def _run_step(
 
 def main() -> int:
     topology = os.environ.get("DMUON_PAIRED_TOPOLOGY", "tp4")
-    model_kind = os.environ.get("DMUON_PAIRED_MODEL", "llama")
+    model_kind = os.environ.get("DMUON_PAIRED_MODEL", "tiny")
     default_scope = "mlp" if model_kind == "tiny" else "full"
     tp_scope = os.environ.get("DMUON_PAIRED_TP_SCOPE", default_scope)
     left_mode = os.environ.get("DMUON_PAIRED_LEFT_MODE", "sync")

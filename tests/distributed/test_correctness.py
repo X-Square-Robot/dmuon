@@ -7,7 +7,8 @@ The ONLY difference is gradient communication:
 
 Run: torchrun --nproc_per_node=4 tests/test_correctness.py
 """
-import os, sys
+import os
+import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
@@ -17,7 +18,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-import dmuon
 from dmuon import Muon, dedicate_params
 from dmuon.optim.newton_schulz import gram_newton_schulz_local
 
@@ -186,7 +186,7 @@ def main():
     hidden = 256
 
     if rank == 0:
-        print(f"Correctness test: DMuon vs DDP+Muon")
+        print("Correctness test: DMuon vs DDP+Muon")
         print(f"  {world_size} GPUs, {num_steps} steps")
         print(f"  Muon: lr={lr}, ns_steps={ns_steps}, momentum=0")
         print(f"  AdamW: lr={adamw_lr}, betas={adamw_betas}, wd={adamw_wd}")
@@ -207,7 +207,8 @@ def main():
     # Run both
     ddp_losses = run_ddp_muon(model_state, device, rank, world_size, data_list,
                                lr, ns_steps, adamw_lr, adamw_betas, adamw_wd)
-    dist.barrier(); torch.cuda.empty_cache()
+    dist.barrier()
+    torch.cuda.empty_cache()
 
     dmuon_losses = run_dmuon(model_state, device, mesh, rank, world_size, data_list,
                               lr, ns_steps, adamw_lr, adamw_betas, adamw_wd)

@@ -5,7 +5,7 @@ NCCL or multi-rank orchestration.  The DTensor machinery still honours
 ``mesh_dim_names`` / placements even under the fake backend, which is
 all we need to exercise the T1 detection logic.
 
-See ``docs/internal/research/tp_design.md`` §9.1.
+Exercises DTensor TP auto-detection.
 """
 
 from __future__ import annotations

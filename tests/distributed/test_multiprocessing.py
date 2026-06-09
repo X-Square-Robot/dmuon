@@ -62,7 +62,9 @@ def test_single_param_broadcast(rank, world_size, device, dp_group):
     )
 
     d_param.reshard()
-    assert d_param._unsharded_param is None
+    assert d_param._unsharded_param is not None
+    assert not d_param._is_unsharded
+    assert module.weight is d_param._placeholder
 
     torch.cuda.synchronize()
     log(rank, "PASSED: test_single_param_broadcast")

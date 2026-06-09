@@ -5,7 +5,7 @@ Verifies:
     * per-backend JSON files are written / read correctly
     * pre-B5 legacy single-file cache is migrated and backed up
 
-See ``docs/internal/research/ns_backend_dispatch_plan.md`` §3 (B5).
+Exercises the per-backend autotune-cache isolation contract.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(
     0,

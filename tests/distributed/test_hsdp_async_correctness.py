@@ -24,7 +24,6 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-import dmuon
 from dmuon import Muon, dedicate_params
 
 

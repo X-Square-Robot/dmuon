@@ -4,7 +4,7 @@ Verifies the *dispatch-level* behaviour only (SM gating, import
 detection, error messages).  Correctness of the actual adapter code is
 covered in ``test_syrk_quack_adapter.py`` and only runs when the
 environment can execute quack kernels.  See
-``docs/internal/research/ns_backend_dispatch_plan.md`` §3 (B1) and §4 (B8).
+Exercises quack soft-dependency and circuit-breaker behavior.
 """
 
 from __future__ import annotations

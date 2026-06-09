@@ -17,7 +17,6 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from dmuon._backends.fsdp2.param import DedicatedParam
 
 
 class DirectWeightAccessModule(nn.Module):
