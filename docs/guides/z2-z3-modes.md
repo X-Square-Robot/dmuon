@@ -77,57 +77,22 @@ packed buffers — significant but not prohibitive for an 80 GB GPU.
 
 ## Decision tree
 
-- **Model > 10B parameters?** → Use DMuon-Z3 (default). The extra forward broadcast
-  is small relative to the memory savings.
+Treat these thresholds as starting points, not rules. The right choice still
+depends on the Muon-target parameter ratio, free GPU memory, network topology,
+activation memory, gradient accumulation settings, and measured throughput.
+
+- **Model > 10B parameters?** → Start with DMuon-Z3 (default). In most cases, the
+  extra forward broadcast is easier to accept than the additional resident memory.
 - **Model < 3B and 8+ GPUs?** → DMuon-Z2 is a candidate. The backward broadcast
   savings are meaningful when communication dominates compute.
-- **OOM with DMuon-Z3?** → This is unusual; packed buffers are transient in Z3. Check
-  activation memory and gradient accumulation buffer size first.
+- **OOM with DMuon-Z3?** → Do not switch to Z2 first; packed buffers are transient
+  in Z3. Check activation memory and gradient accumulation buffer size first.
 - **Paired with `fully_shard(..., reshard_after_forward=X)`?** → Mirror the same
   value in `dedicate_params`. Symmetric configs keep the memory model predictable
   across Muon-target and non-Muon parameters.
 - **HSDP (multi-node)?** → The choice applies equally. The shard-dimension broadcasts
   are counted above; the replicate-dimension broadcast is a separate post-step fan-out
   and is not affected by Z2/Z3.
-
----
-
-## Switching modes in code
-
-```python title="z3_z2_switch.py"
-import dmuon
-from torch.distributed.fsdp import fully_shard
-from torch.distributed.device_mesh import init_device_mesh
-
-mesh = init_device_mesh("cuda", (world_size,))
-model = MyModel().cuda()
-
-# DMuon-Z3 (default) — recommended for large models
-dmuon.dedicate_params(
-    model,
-    mesh,
-    predicate=lambda n, p: p.ndim == 2 and "proj" in n,
-    # reshard_after_forward=True is the default; no need to specify
-)
-for layer in model.layers:
-    fully_shard(layer, mesh=mesh)                   # FSDP2 also Z3 by default
-fully_shard(model, mesh=mesh)
-
-# --- OR ---
-
-# DMuon-Z2 — opt-in for smaller models where comm dominates
-dmuon.dedicate_params(
-    model,
-    mesh,
-    predicate=lambda n, p: p.ndim == 2 and "proj" in n,
-    reshard_after_forward=False,                     # ← DMuon-Z2
-)
-for layer in model.layers:
-    fully_shard(layer, mesh=mesh, reshard_after_forward=False)   # FSDP2 Z2
-fully_shard(model, mesh=mesh)
-
-optimizer = dmuon.Muon(model, lr=0.02, adamw_lr=1e-3)
-```
 
 ---
 

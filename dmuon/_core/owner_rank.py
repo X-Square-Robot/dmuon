@@ -1,7 +1,6 @@
 """Canonical ``owner_rank`` normalisation.
 
-Phase A of the HSDP-native refactor (``docs/internal/research/hsdp_native_dev_plan.md``)
-extends ``owner_rank`` from a bare shard-group index to a 2D coordinate
+HSDP support extends ``owner_rank`` from a bare shard-group index to a 2D coordinate
 ``(owner_shard, owner_replicate)`` so the same data structures can describe
 both shard-only (1D) and HSDP (2D) layouts.  All code that constructs, groups
 or compares ``owner_rank`` should route through :func:`normalize_owner_rank`

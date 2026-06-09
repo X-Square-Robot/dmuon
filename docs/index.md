@@ -123,7 +123,7 @@ Scale from a single node to multi-node HSDP clusters with a two-line API change.
 
 ## Benchmarks
 
-Current snapshot: A800-SXM4-80GB, bf16, seq=4096 for LLM runs, random initialization, synthetic data. MFU is computed from step-start intervals so cross-step communication overlap is not double-counted. Source: accepted summaries from the DMuon 256GPU experiment dashboard, 2026-05-24 run set. 256GPU entries are still pending the 32-node run window.
+Current snapshot: A800-SXM4-80GB, bf16, seq=4096 for LLM runs, random initialization, synthetic data. MFU is computed from step-start intervals so cross-step communication overlap is not double-counted. These rows are point-in-time research-preview summaries from controlled A800 runs; use them as relative performance context rather than a public reproduction recipe.
 
 ### LLM Z2/Z3 Scaling
 
@@ -136,23 +136,6 @@ Current snapshot: A800-SXM4-80GB, bf16, seq=4096 for LLM runs, random initializa
 
 The 128GPU rows cover FSDP-Z2, FSDP-Z3, HSDP-Z2, and HSDP-Z3.
 
-### VLA Z2/Z3 Scaling
-
-| Model / 128GPU | FSDP-Z2 | FSDP-Z3 | HSDP-Z2 | HSDP-Z3 |
-|:---------------|--------:|--------:|--------:|--------:|
-| Pi0 | 43.0% | 40.3% | 43.4% | 42.8% |
-| WallX/Qwen2.5-VL-3B | 30.9% | 29.9% | 31.2% | 29.1% |
-
-These VLA runs use the real Pi0 and WallX training entries.
-
-### Matrix-Update Replay
-
-| Model / FSDP-Z2 8GPU | Direct naive NS | Gram+SYRK naive NS | Direct DMuon NS | Gram+SYRK DMuon NS |
-|:---------------------|----------------:|-------------------:|----------------:|-------------------:|
-| Pi0 | 750 ms | 486 ms | 93 ms | 61 ms |
-| WallX/Qwen2.5-VL-3B | 1,135 ms | 661 ms | 143 ms | 92 ms |
-
-This replay isolates matrix-update compute after DMuon owner assignment. Gram+SYRK is the current Muon backend and reduces the single-owner NS cost by about 1.5× on these VLA matrix sets.
 
 ---
 

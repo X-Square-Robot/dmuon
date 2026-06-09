@@ -12,9 +12,8 @@ import logging
 import os
 import time as _time
 from pathlib import Path
-from typing import Optional
-
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
@@ -108,6 +107,27 @@ _DEFAULT_AUTOTUNE_BACKEND = "cute_sm80"
 
 # In-memory cache keyed by the full tuple including backend
 _syrk_autotune_cache: dict[tuple, tuple | None] = {}
+
+
+def _progress_log_enabled() -> bool:
+    value = os.environ.get("DMUON_SYRK_AUTOTUNE_LOG", "1").strip().lower()
+    return value not in {"0", "false", "off", "no"}
+
+
+def _rank_world_for_log() -> tuple[int, int]:
+    if dist.is_available() and dist.is_initialized():
+        try:
+            return dist.get_rank(), dist.get_world_size()
+        except RuntimeError:
+            pass
+    return 0, 1
+
+
+def _progress_log(message: str) -> None:
+    if not _progress_log_enabled():
+        return
+    rank, world = _rank_world_for_log()
+    print(f"[DMuon][rank={rank}/{world}] {message}", flush=True)
 
 
 def _cache_dir() -> Path:
@@ -249,22 +269,55 @@ def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
     if key in _syrk_autotune_cache:
         return _syrk_autotune_cache[key]
 
+    _progress_log(
+        "SYRK autotune cache miss; benchmarking per-shape backend "
+        f"for shape=({M}, {K}), dtype={dtype}, device={device}, "
+        f"has_C={has_C}, backend={backend}. This is expected on the first "
+        "optimizer step and can take noticeably longer than steady state."
+    )
+    started_at = _time.perf_counter()
+
     X = torch.randn(M, K, device=device, dtype=dtype)
     D = torch.empty(M, M, device=device, dtype=dtype)
 
     # cuBLAS baseline
+    _progress_log(
+        "SYRK autotune baseline started "
+        f"for shape=({M}, {K}), dtype={dtype}, backend={backend}, has_C={has_C}"
+    )
     if has_C:
         C_mat = torch.randn(M, M, device=device, dtype=dtype)
         t_cublas = _bench_median(lambda: torch.addmm(C_mat, X, X.T, alpha=0.5, beta=0.3))
     else:
         t_cublas = _bench_median(lambda: torch.mm(X, X.T, out=D))
+    _progress_log(
+        "SYRK autotune baseline finished "
+        f"for shape=({M}, {K}), dtype={dtype}, backend={backend}, "
+        f"cuBLAS={t_cublas*1e6:.0f}us"
+    )
 
     best_time = t_cublas
     best_config = None
 
-    for tile_m, tile_k, num_stages in _SYRK_CONFIGS:
-        if M % tile_m != 0:
-            continue
+    eligible_configs = [
+        (tile_m, tile_k, num_stages)
+        for tile_m, tile_k, num_stages in _SYRK_CONFIGS
+        if M % tile_m == 0
+    ]
+    if not eligible_configs:
+        _progress_log(
+            "SYRK autotune has no eligible tile configs "
+            f"for shape=({M}, {K}), dtype={dtype}, backend={backend}; "
+            "using cuBLAS fallback"
+        )
+
+    for idx, (tile_m, tile_k, num_stages) in enumerate(eligible_configs, start=1):
+        _progress_log(
+            "SYRK autotune candidate started "
+            f"{idx}/{len(eligible_configs)} for shape=({M}, {K}), "
+            f"dtype={dtype}, backend={backend}, "
+            f"tile_m={tile_m}, tile_k={tile_k}, num_stages={num_stages}"
+        )
         try:
             if has_C:
                 C_mat2 = torch.randn(M, M, device=device, dtype=dtype)
@@ -275,13 +328,35 @@ def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
                 def bench_syrk(tm=tile_m, tk=tile_k, ns=num_stages):
                     _syrk_sm80_fn(X, D, tile_m=tm, tile_k=tk, num_stages=ns)
             t = _bench_median(bench_syrk)
+            _progress_log(
+                "SYRK autotune candidate finished "
+                f"{idx}/{len(eligible_configs)} for shape=({M}, {K}), "
+                f"dtype={dtype}, backend={backend}, "
+                f"tile_m={tile_m}, tile_k={tile_k}, num_stages={num_stages}, "
+                f"time={t*1e6:.0f}us"
+            )
             if t < best_time:
                 best_time = t
                 best_config = (tile_m, tile_k, num_stages)
-        except Exception:
+        except Exception as exc:
+            _progress_log(
+                "SYRK autotune candidate failed "
+                f"{idx}/{len(eligible_configs)} for shape=({M}, {K}), "
+                f"dtype={dtype}, backend={backend}, "
+                f"tile_m={tile_m}, tile_k={tile_k}, num_stages={num_stages}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             continue
 
     speedup = t_cublas / best_time if best_config else 1.0
+    elapsed = _time.perf_counter() - started_at
+    _progress_log(
+        "SYRK autotune finished "
+        f"for shape=({M}, {K}), dtype={dtype}, backend={backend}: "
+        f"cuBLAS={t_cublas*1e6:.0f}us, best={best_time*1e6:.0f}us, "
+        f"config={best_config}, speedup={speedup:.2f}x, "
+        f"elapsed={elapsed:.3f}s"
+    )
     logger.info(
         f"SYRK autotune ({M},{K}) has_C={has_C}: "
         f"cuBLAS={t_cublas*1e6:.0f}us, best={best_time*1e6:.0f}us "

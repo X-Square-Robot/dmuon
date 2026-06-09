@@ -106,7 +106,7 @@ def test_default_accumulation(rank, world_size, device, mesh):
     # After step: _reduced_grad should be cleared
     for dp in owned:
         assert dp._reduced_grad is None, \
-            f"_reduced_grad not cleared after optimizer.step()"
+            "_reduced_grad not cleared after optimizer.step()"
 
     if rank == 0:
         print("  PASSED: test_default_accumulation")
@@ -159,7 +159,7 @@ def test_no_sync_accumulation(rank, world_size, device, mesh):
     # _accumulated_grad should be cleared (merged into reduce)
     for dp in all_params:
         assert dp._accumulated_grad is None, \
-            f"_accumulated_grad not cleared after sync reduce"
+            "_accumulated_grad not cleared after sync reduce"
 
     optimizer.step()
 
@@ -286,19 +286,23 @@ def main():
 
     if test_name in ("default", "all"):
         test_default_accumulation(rank, world_size, device, mesh)
-        dist.barrier(); torch.cuda.empty_cache()
+        dist.barrier()
+        torch.cuda.empty_cache()
 
     if test_name in ("no_sync", "all"):
         test_no_sync_accumulation(rank, world_size, device, mesh)
-        dist.barrier(); torch.cuda.empty_cache()
+        dist.barrier()
+        torch.cuda.empty_cache()
 
     if test_name in ("match", "all"):
         test_default_vs_no_sync_match(rank, world_size, device, mesh)
-        dist.barrier(); torch.cuda.empty_cache()
+        dist.barrier()
+        torch.cuda.empty_cache()
 
     if test_name in ("training", "all"):
         test_training_with_accum(rank, world_size, device, mesh)
-        dist.barrier(); torch.cuda.empty_cache()
+        dist.barrier()
+        torch.cuda.empty_cache()
 
     if rank == 0:
         print("\nAll gradient accumulation tests passed!")

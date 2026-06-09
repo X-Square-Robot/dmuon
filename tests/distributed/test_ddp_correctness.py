@@ -66,6 +66,12 @@ def _all_ranks_equal(t: torch.Tensor) -> bool:
     return True
 
 
+def _assert_global_positive_count(local_count: int, message: str) -> None:
+    count = torch.tensor([int(local_count)], device="cuda")
+    dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    assert count.item() > 0, message
+
+
 def _wallx_style_param_groups(model):
     base_params = []
     action_params = []
@@ -349,7 +355,17 @@ def test_param_groups_lower_and_step():
         group["group_name"]: idx for idx, group in enumerate(optimizer.param_groups)
     }
     assert set(group_idx) == {item[0] for item in expected}
-    assert optimizer._muon_group_dps[group_idx["action/muon"]]
+    action_muon_idx = group_idx["action/muon"]
+    action_muon_dps = [
+        dp
+        for dp in optimizer._all_dedicated_params
+        if optimizer._dp_to_muon_group_idx.get(id(dp)) == action_muon_idx
+    ]
+    assert action_muon_dps
+    _assert_global_positive_count(
+        len(optimizer._muon_group_dps[action_muon_idx]),
+        "expected at least one rank to own action/muon params",
+    )
     assert optimizer._adamw_group_params[group_idx["action/adamw"]]
     optim_sd = dmuon.get_optimizer_state_dict(
         model, optimizer, cpu_offload=True, rank0_only=False

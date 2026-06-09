@@ -21,7 +21,6 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-import dmuon
 from dmuon import Muon, dedicate_params
 
 
@@ -132,7 +131,7 @@ def main():
         peaks = [t.item() for t in all_peaks]
         print(f"\n  peak mem (MB) per rank: {['%.1f' % p for p in peaks]}")
         print(f"  loss[0]={loss_history[0]:+.4f}  loss[-1]={loss_history[-1]:+.4f}")
-        print(f"\nPASS: 100 steps NaN-free")
+        print("\nPASS: 100 steps NaN-free")
 
     dist.destroy_process_group()
 

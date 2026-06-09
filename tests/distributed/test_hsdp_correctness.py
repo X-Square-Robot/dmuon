@@ -31,7 +31,6 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-import dmuon
 from dmuon import Muon, dedicate_params
 
 
@@ -174,8 +173,8 @@ def main():
     if rank == 0:
         print("HSDP correctness test: HSDP-native DMuon vs shard-only DMuon")
         print(f"  {world_size} GPUs, {num_steps} steps")
-        print(f"  Path A: 1D mesh (shard=4)")
-        print(f"  Path B: 2D mesh (replicate=2 × shard=2)")
+        print("  Path A: 1D mesh (shard=4)")
+        print("  Path B: 2D mesh (replicate=2 × shard=2)")
 
     # Same initial model
     torch.manual_seed(42)

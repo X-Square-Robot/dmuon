@@ -1,7 +1,7 @@
 """B6-A — A-card benchmark & correctness matrix for the SYRK backend dispatch.
 
 Run on an A100 / A800 (SM80) machine with CuteDSL SYRK built.  Produces
-a markdown table that goes into ``docs/internal/benchmarks/ns_backend_bench_a800.md``.
+a markdown table under ``tests/precision/artifacts/`` by default.
 
 Usage::
 
@@ -31,7 +31,7 @@ from pathlib import Path
 
 import torch
 
-from dmuon import get_backend_status, get_ns_backend, NewtonSchulz
+from dmuon import get_backend_status, get_ns_backend
 from dmuon.kernels.syrk_backends import SyrkBackend, syrk_dispatch
 from dmuon.optim import syrk_dispatch as _sd
 
@@ -160,7 +160,7 @@ def render_markdown(rows: list[Row], status: dict) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path,
-                     default=Path("docs/internal/benchmarks/ns_backend_bench_a800.md"))
+                     default=Path("tests/precision/artifacts/ns_backend_bench_a800.md"))
     ap.add_argument("--quick", action="store_true",
                      help="Run a small subset for sanity (6 cells instead of ~24).")
     args = ap.parse_args()

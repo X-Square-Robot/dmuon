@@ -6,6 +6,8 @@ broadcast/reduce and tracks post-forward ordering for backward prefetch.
 
 from __future__ import annotations
 
+import os
+from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -94,6 +96,10 @@ class DedicatedCommContext:
         """
         self.device = device
         self.broadcast_stream = torch.cuda.Stream(device=device, priority=-1)
+        self.sharded_adamw_unshard_stream = torch.cuda.Stream(
+            device=device, priority=-1
+        )
+        self.sharded_adamw_unshard_separate_stream_enabled = False
         self.reduce_stream = torch.cuda.Stream(device=device, priority=-1)
         # FSDP2 sets the all-reduce (i.e. replicate-dim) stream at default
         # priority because inter-node AR traffic uses different network
@@ -112,12 +118,43 @@ class DedicatedCommContext:
             )
         self.post_forward_order: list = []  # DedicatedParamGroup | DedicatedParamGroupDDP
         self.all_states: list[DedicatedState] = []
+        self.forward_prefetch_depth = 1
         self.post_backward_final_callback_queued: bool = False
         # Rolling-drain pointer for the 1-outstanding reduce policy; see the
         # class docstring's "Rolling reduce drain" section.  Untyped because
         # it holds whichever concrete group type the active backend uses
         # (FSDP2 or DDP), same convention as ``post_forward_order``.
         self.last_reduced_group = None
+        self.record_forward_profile = _env_flag("DMUON_RECORD_FORWARD_PROFILE")
+        self._forward_profile_events: list[dict[str, object]] = []
+        self._forward_profile_counts: dict[str, dict[str, object]] = defaultdict(
+            lambda: {
+                "dispatch_calls": 0,
+                "prefetch_dispatch_calls": 0,
+                "demand_dispatch_calls": 0,
+                "prefetch_hits": 0,
+                "already_unsharded": 0,
+                "owner_broadcast_bytes": 0,
+                "owner_broadcast_max_bucket_bytes": 0,
+                "owner_broadcast_bucket_count": 0,
+                "sharded_adamw_all_gather_bytes": 0,
+                "sharded_adamw_param_count": 0,
+                "sharded_muon_all_gather_bytes": 0,
+                "sharded_muon_param_count": 0,
+                "wait_calls": 0,
+                "tp_publish_waits": 0,
+                "replicate_publish_waits": 0,
+                "sharded_muon_publish_waits": 0,
+                "prefetch_publish_not_ready_skips": 0,
+                "prefetch_tp_publish_not_ready_skips": 0,
+                "prefetch_replicate_publish_not_ready_skips": 0,
+                "prefetch_sharded_muon_publish_not_ready_skips": 0,
+                "prefetch_unready_publish_waits_queued": 0,
+                "prefetch_unready_tp_publish_waits_queued": 0,
+                "prefetch_unready_replicate_publish_waits_queued": 0,
+                "prefetch_unready_sharded_muon_publish_waits_queued": 0,
+            }
+        )
 
     @staticmethod
     def _normalize_tp_buffer_reuse(value: bool | str) -> str:
@@ -156,3 +193,114 @@ class DedicatedCommContext:
             indices = getattr(state.group, "_post_forward_indices", None)
             if indices is not None:
                 indices.clear()
+
+    def record_forward_unshard_counter(self, group_name: str, **values: int) -> None:
+        if not self.record_forward_profile:
+            return
+        stats = self._forward_profile_counts[group_name]
+        for key, value in values.items():
+            if key.endswith("_max_bucket_bytes"):
+                stats[key] = max(int(stats.get(key, 0)), int(value))
+            else:
+                stats[key] = int(stats.get(key, 0)) + int(value)
+
+    def record_forward_unshard_event(
+        self,
+        *,
+        group_name: str,
+        phase: str,
+        start: torch.cuda.Event,
+        end: torch.cuda.Event,
+        bytes: int = 0,
+        prefetch: bool = False,
+    ) -> None:
+        if not self.record_forward_profile:
+            return
+        self._forward_profile_events.append(
+            {
+                "group": group_name,
+                "phase": phase,
+                "bytes": int(bytes),
+                "prefetch": bool(prefetch),
+                "start": start,
+                "end": end,
+            }
+        )
+
+    def consume_forward_unshard_profile(self, *, clear: bool = True) -> dict[str, object]:
+        """Return aggregate CUDA-event timings for forward unshard diagnostics."""
+
+        events_ready = 0
+        events_pending = 0
+        by_group: dict[str, dict[str, object]] = {
+            group: dict(values) for group, values in self._forward_profile_counts.items()
+        }
+        by_phase: dict[str, dict[str, float | int]] = defaultdict(
+            lambda: {"count": 0, "ms": 0.0, "bytes": 0}
+        )
+
+        for item in self._forward_profile_events:
+            end = item["end"]
+            if isinstance(end, torch.cuda.Event) and not end.query():
+                events_pending += 1
+                continue
+            start = item["start"]
+            if not isinstance(start, torch.cuda.Event) or not isinstance(
+                end, torch.cuda.Event
+            ):
+                events_pending += 1
+                continue
+            try:
+                elapsed_ms = float(start.elapsed_time(end))
+            except RuntimeError:
+                events_pending += 1
+                continue
+
+            events_ready += 1
+            group = str(item["group"])
+            phase = str(item["phase"])
+            bytes_value = int(item.get("bytes", 0))
+            group_stats = by_group.setdefault(group, {})
+            key = f"{phase}_ms"
+            group_stats[key] = float(group_stats.get(key, 0.0)) + elapsed_ms
+            group_stats[f"{phase}_events"] = int(
+                group_stats.get(f"{phase}_events", 0)
+            ) + 1
+            if bytes_value:
+                group_stats[f"{phase}_bytes"] = int(
+                    group_stats.get(f"{phase}_bytes", 0)
+                ) + bytes_value
+
+            phase_stats = by_phase[phase]
+            phase_stats["count"] = int(phase_stats["count"]) + 1
+            phase_stats["ms"] = float(phase_stats["ms"]) + elapsed_ms
+            phase_stats["bytes"] = int(phase_stats["bytes"]) + bytes_value
+
+        for group_stats in by_group.values():
+            for key, value in list(group_stats.items()):
+                if key.endswith("_ms"):
+                    group_stats[key] = round(float(value), 6)
+
+        result: dict[str, object] = {
+            "enabled": self.record_forward_profile,
+            "events_ready": events_ready,
+            "events_pending": events_pending,
+            "by_group": by_group,
+            "by_phase": {
+                phase: {
+                    "count": int(values["count"]),
+                    "ms": round(float(values["ms"]), 6),
+                    "bytes": int(values["bytes"]),
+                }
+                for phase, values in by_phase.items()
+            },
+        }
+        if clear:
+            self._forward_profile_events.clear()
+            self._forward_profile_counts.clear()
+        return result
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}

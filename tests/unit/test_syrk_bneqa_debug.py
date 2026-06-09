@@ -31,7 +31,6 @@ if not torch.cuda.is_available():
     print("SKIP: CUDA not available")
     sys.exit(0)
 
-from dmuon.kernels.syrk_sm80 import SYRK_SM80_CONFIGS
 
 # We need to call the kernel internals directly, bypassing the B!=A guard.
 # Import the compilation function and call the compiled kernel directly.
@@ -372,11 +371,11 @@ def test_skip_mirror_isolation():
                   f"upper(NaN%={nomirror_upper_nan_pct:.1%})")
 
             if not nomirror_lower_nan and nomirror_lower_diff < 0.01:
-                print(f"    --> DIAGNOSIS: mainloop OK, bug is in mirror epilogue")
+                print("    --> DIAGNOSIS: mainloop OK, bug is in mirror epilogue")
             elif not nomirror_lower_nan:
                 print(f"    --> DIAGNOSIS: mainloop has precision issues (diff={nomirror_lower_diff:.6f})")
             else:
-                print(f"    --> DIAGNOSIS: mainloop produces NaN, bug is in tile indexing/MMA")
+                print("    --> DIAGNOSIS: mainloop produces NaN, bug is in tile indexing/MMA")
 
 
 # ---------------------------------------------------------------------------

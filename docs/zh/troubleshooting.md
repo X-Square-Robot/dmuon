@@ -27,7 +27,7 @@
 
     **修复：** 升级 PyTorch。
     ```bash
-    pip install "torch>=2.4" --index-url https://download.pytorch.org/whl/cu121
+    pip install "torch>=2.6" --index-url https://download.pytorch.org/whl/cu121
     ```
 
 ---
@@ -47,6 +47,13 @@
     请 `pip install dmuon[quack]`，`kernel="auto"` 会自动挑中 Tri Dao
     的 quack SYRK。完整的自动检测阶梯见
     [后端分发](reference/newton-schulz.md#backend-dispatch)。
+
+    首次遇到未缓存 shape 时，DMuon 会把 SYRK tile 配置和 cuBLAS 做
+    autotune，并打印带 rank 的进度行，例如
+    `[DMuon][rank=0/8] SYRK autotune candidate started ...`。这些日志用于
+    在集群日志里确认 per-shape autotune 没有卡住；它们不改变后端选择或
+    benchmark 结果。确认 autotune 正常后，可设置
+    `DMUON_SYRK_AUTOTUNE_LOG=0` 关闭。
 
 ---
 
@@ -153,6 +160,34 @@
     **修复：** 先用 `dmuon.Muon(..., replicate_async=False/True)` 对比同步
     与异步计时。如果只有少数 owner rank 慢，检查 dedicated 参数分配、
     hook 边界和 owner 策略。
+
+    **诊断：** 打印当前 rank 的 routing 和通信计划摘要：
+    ```python
+    import json
+    import dmuon
+
+    print(json.dumps(
+        dmuon.summarize_param_groups(model, optimizer),
+        indent=2,
+        default=str,
+    ))
+    print(json.dumps(
+        dmuon.summarize_comm_plan(model),
+        indent=2,
+        default=str,
+    ))
+    ```
+
+    如需查看 forward-unshard wait 计数器，在 `dmuon.dedicate_params()`
+    运行前设置 `DMUON_RECORD_FORWARD_PROFILE=1`，再在诊断边界读取：
+    ```python
+    profile = dmuon.collect_forward_unshard_profile(
+        model,
+        synchronize=True,
+    )
+    ```
+    不要把 `synchronize=True` 放进正常 step timing loop；它会强制 CUDA
+    同步，改变正在测量的 overlap 行为。
 
 ---
 

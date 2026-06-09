@@ -21,6 +21,12 @@ def log(rank, msg):
         print(msg, flush=True)
 
 
+def assert_global_positive_count(local_count, device, message):
+    count = torch.tensor([int(local_count)], device=device)
+    dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    assert count.item() > 0, message
+
+
 # ---------------------------------------------------------------------------
 # TinyModel
 # ---------------------------------------------------------------------------
@@ -321,8 +327,19 @@ def test_muon_param_groups_fsdp2(rank, world_size, device, mesh):
     group_idx = {
         group["group_name"]: idx for idx, group in enumerate(optimizer.param_groups)
     }
-    assert group_idx["action/muon"] in optimizer._muon_group_dps
-    assert optimizer._muon_group_dps[group_idx["action/muon"]]
+    action_muon_idx = group_idx["action/muon"]
+    assert action_muon_idx in optimizer._muon_group_dps
+    action_muon_dps = [
+        dp
+        for dp in optimizer._all_dedicated_params
+        if optimizer._dp_to_muon_group_idx.get(id(dp)) == action_muon_idx
+    ]
+    assert action_muon_dps
+    assert_global_positive_count(
+        len(optimizer._muon_group_dps[action_muon_idx]),
+        device,
+        "expected at least one rank to own action/muon params",
+    )
     assert optimizer._adamw_group_params[group_idx["action/adamw"]]
 
     optimizer.zero_grad()
@@ -396,13 +413,24 @@ def test_muon_all_trainable_type_split_fsdp2(rank, world_size, device, mesh):
     group_idx = {
         group["group_name"]: idx for idx, group in enumerate(optimizer.param_groups)
     }
-    matrix_dps = optimizer._muon_group_dps[group_idx["matrix/muon"]]
+    matrix_idx = group_idx["matrix/muon"]
+    matrix_dps = optimizer._muon_group_dps[matrix_idx]
+    matrix_all_dps = [
+        dp
+        for dp in optimizer._all_dedicated_params
+        if optimizer._dp_to_muon_group_idx.get(id(dp)) == matrix_idx
+    ]
     dedicated_adamw_dps = [
         dp
         for dp in optimizer._all_dedicated_params
         if id(dp) in optimizer._dp_to_adamw_group_idx
     ]
-    assert matrix_dps
+    assert matrix_all_dps
+    assert_global_positive_count(
+        len(matrix_dps),
+        device,
+        "expected at least one rank to own matrix/muon params",
+    )
     assert dedicated_adamw_dps
 
     optimizer.zero_grad()
@@ -840,7 +868,7 @@ def test_muon_tp_path(rank, world_size, device, mesh):
     tp_count = torch.tensor([len(tp_params)], device=device)
     dist.all_reduce(tp_count)
     assert tp_count.item() > 0, (
-        f"No TP-aware dedicated params found (is_dtensor=True, tp_group≠None)"
+        "No TP-aware dedicated params found (is_dtensor=True, tp_group≠None)"
     )
 
     losses = []

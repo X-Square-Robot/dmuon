@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -32,6 +33,13 @@ sys.path.insert(
     0,
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
 )
+
+from dmuon._backends.fsdp2.group import (
+    _event_is_ready,
+    _should_skip_unready_publish_prefetch,
+)
+from dmuon._core.state import DedicatedState, _root_post_backward_final_callback
+from dmuon.optim.muon import Muon
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +65,14 @@ class _FakeEvent:
     def wait(self):
         assert self.recorded, "wait on un-recorded event"
         self.wait_count += 1
+
+    def query(self):
+        return self.recorded
+
+
+class _BrokenQueryEvent:
+    def query(self):
+        raise RuntimeError("event not initialized")
 
 
 class _State(Enum):
@@ -173,6 +189,269 @@ def test_consume_once_event_not_waited_twice():
     # Instead verify we can dispatch fresh:
     g.dispatch_async()
     assert g._broadcast_state is not None
+
+
+def test_prefetch_event_readiness_query_is_conservative():
+    event = _FakeEvent()
+    assert not _event_is_ready(event)
+    event.record()
+    assert _event_is_ready(event)
+    assert _event_is_ready(None)
+    assert not _event_is_ready(_BrokenQueryEvent())
+
+
+def test_far_prefetch_skips_unready_publish_wait():
+    event = _FakeEvent()
+    should_skip, tp_not_ready, replicate_not_ready, sharded_muon_not_ready = (
+        _should_skip_unready_publish_prefetch(
+            None,
+            event,
+            allow_unready_publish_wait=False,
+        )
+    )
+    assert should_skip
+    assert not tp_not_ready
+    assert replicate_not_ready
+    assert not sharded_muon_not_ready
+
+
+def test_immediate_next_prefetch_can_queue_unready_publish_wait():
+    event = _FakeEvent()
+    should_skip, tp_not_ready, replicate_not_ready, sharded_muon_not_ready = (
+        _should_skip_unready_publish_prefetch(
+            None,
+            event,
+            allow_unready_publish_wait=True,
+        )
+    )
+    assert not should_skip
+    assert not tp_not_ready
+    assert replicate_not_ready
+    assert not sharded_muon_not_ready
+
+
+def test_far_prefetch_skips_even_ready_publish_event():
+    event = _FakeEvent()
+    event.record()
+    should_skip, tp_not_ready, replicate_not_ready, sharded_muon_not_ready = (
+        _should_skip_unready_publish_prefetch(
+            event,
+            None,
+            allow_unready_publish_wait=False,
+        )
+    )
+    # CUDA event readiness is rank-local.  Far prefetch must make a
+    # rank-consistent decision and retry later instead of allowing only ranks
+    # that locally see a ready event to enter collectives.
+    assert should_skip
+    assert tp_not_ready
+    assert not replicate_not_ready
+    assert not sharded_muon_not_ready
+
+
+def test_far_prefetch_skips_unready_sharded_muon_publish_wait():
+    event = _FakeEvent()
+    should_skip, tp_not_ready, replicate_not_ready, sharded_muon_not_ready = (
+        _should_skip_unready_publish_prefetch(
+            None,
+            None,
+            event,
+            allow_unready_publish_wait=False,
+        )
+    )
+    assert should_skip
+    assert not tp_not_ready
+    assert not replicate_not_ready
+    assert sharded_muon_not_ready
+
+
+class _DummyCommCtx:
+    def __init__(self, replicate_group=None):
+        self.replicate_group = replicate_group
+
+
+class _DummyDedicatedParam:
+    def __init__(self, *, sharded_muon_forward: bool):
+        self._sharded_muon_forward = sharded_muon_forward
+
+    def uses_sharded_muon_forward(self) -> bool:
+        return self._sharded_muon_forward
+
+
+class _DummyParamGroup:
+    def __init__(self, *, replicate_group=None, sharded_muon_forward: bool = False):
+        self.comm_ctx = _DummyCommCtx(replicate_group)
+        self.params = [
+            _DummyDedicatedParam(sharded_muon_forward=sharded_muon_forward)
+        ]
+
+
+def test_hsdp_sharded_muon_group_is_detected_for_guarded_prefetch():
+    group = _DummyParamGroup(replicate_group=object(), sharded_muon_forward=True)
+    assert Muon._group_has_hsdp_sharded_muon_params(group)
+
+
+def test_fsdp_sharded_muon_group_can_still_use_post_step_far_prefetch():
+    group = _DummyParamGroup(replicate_group=None, sharded_muon_forward=True)
+    assert not Muon._group_has_hsdp_sharded_muon_params(group)
+
+
+def test_hsdp_non_sharded_muon_group_can_still_prefetch():
+    group = _DummyParamGroup(replicate_group=object(), sharded_muon_forward=False)
+    assert not Muon._group_has_hsdp_sharded_muon_params(group)
+
+
+def test_hsdp_sharded_muon_policy_allows_one_guarded_tail_prefetch():
+    group = _DummyParamGroup(replicate_group=object(), sharded_muon_forward=True)
+    should_prefetch, allow_wait, counts_hsdp = Muon._post_step_prefetch_policy(
+        group,
+        group_idx=1,
+        post_step_prefetch_groups=4,
+        prefetched_hsdp_sharded_muon_groups=0,
+    )
+    assert should_prefetch
+    assert allow_wait
+    assert counts_hsdp
+
+
+def test_hsdp_sharded_muon_policy_rejects_second_tail_prefetch():
+    group = _DummyParamGroup(replicate_group=object(), sharded_muon_forward=True)
+    should_prefetch, allow_wait, counts_hsdp = Muon._post_step_prefetch_policy(
+        group,
+        group_idx=2,
+        post_step_prefetch_groups=4,
+        prefetched_hsdp_sharded_muon_groups=1,
+    )
+    assert not should_prefetch
+    assert not allow_wait
+    assert not counts_hsdp
+
+
+def test_fsdp_sharded_muon_policy_uses_normal_tail_prefetch():
+    group = _DummyParamGroup(replicate_group=None, sharded_muon_forward=True)
+    should_prefetch, allow_wait, counts_hsdp = Muon._post_step_prefetch_policy(
+        group,
+        group_idx=1,
+        post_step_prefetch_groups=4,
+        prefetched_hsdp_sharded_muon_groups=0,
+    )
+    assert should_prefetch
+    assert not allow_wait
+    assert not counts_hsdp
+
+
+def test_post_step_prefetch_policy_respects_window():
+    group = _DummyParamGroup(replicate_group=object(), sharded_muon_forward=True)
+    should_prefetch, allow_wait, counts_hsdp = Muon._post_step_prefetch_policy(
+        group,
+        group_idx=4,
+        post_step_prefetch_groups=4,
+        prefetched_hsdp_sharded_muon_groups=0,
+    )
+    assert not should_prefetch
+    assert not allow_wait
+    assert not counts_hsdp
+
+
+# ---------------------------------------------------------------------------
+# Tests — post-backward rolling reduce drain
+# ---------------------------------------------------------------------------
+
+
+class _FakeReduceGroup:
+    def __init__(self, *, delay_stage2_to_optimizer: bool = True):
+        self._post_backward_fired = False
+        self._delay_stage2_to_optimizer = delay_stage2_to_optimizer
+        self.stage1_waits = 0
+        self.full_waits = 0
+        self.reduce_calls = 0
+        self.reshard_calls = 0
+
+    def wait_for_stage1_reduce(self):
+        self.stage1_waits += 1
+
+    def wait_for_reduce(self):
+        self.full_waits += 1
+
+    def reduce_grads(self):
+        self.reduce_calls += 1
+
+    def reshard(self):
+        self.reshard_calls += 1
+
+
+class _LegacyReduceGroup:
+    def __init__(self):
+        self.full_waits = 0
+
+    def wait_for_reduce(self):
+        self.full_waits += 1
+
+
+def _dedicated_state_for_group(group, comm_ctx):
+    state = object.__new__(DedicatedState)
+    state.group = group
+    state.comm_ctx = comm_ctx
+    return state
+
+
+def test_post_backward_waits_previous_stage1_only_for_fsdp2_groups():
+    prev = _FakeReduceGroup()
+    cur = _FakeReduceGroup()
+    comm_ctx = SimpleNamespace(last_reduced_group=prev)
+
+    _dedicated_state_for_group(cur, comm_ctx)._run_post_backward()
+
+    assert prev.stage1_waits == 1
+    assert prev.full_waits == 0
+    assert cur.reduce_calls == 1
+    assert cur.reshard_calls == 1
+    assert cur._post_backward_fired
+    assert comm_ctx.last_reduced_group is cur
+
+
+def test_post_backward_legacy_group_falls_back_to_full_reduce_wait():
+    prev = _LegacyReduceGroup()
+    cur = _FakeReduceGroup()
+    comm_ctx = SimpleNamespace(last_reduced_group=prev)
+
+    _dedicated_state_for_group(cur, comm_ctx)._run_post_backward()
+
+    assert prev.full_waits == 1
+    assert cur.reduce_calls == 1
+    assert cur.reshard_calls == 1
+
+
+def test_root_callback_leaves_stage2_for_optimizer_by_default():
+    group = _FakeReduceGroup(delay_stage2_to_optimizer=True)
+    comm_ctx = SimpleNamespace(
+        all_states=[_dedicated_state_for_group(group, None)],
+        last_reduced_group=None,
+        post_backward_final_callback_queued=True,
+    )
+    comm_ctx.all_states[0].comm_ctx = comm_ctx
+
+    _root_post_backward_final_callback(comm_ctx)
+
+    assert group.reduce_calls == 1
+    assert group.full_waits == 0
+    assert comm_ctx.post_backward_final_callback_queued is False
+
+
+def test_root_callback_can_still_drain_full_reduce_for_legacy_mode():
+    group = _FakeReduceGroup(delay_stage2_to_optimizer=False)
+    comm_ctx = SimpleNamespace(
+        all_states=[_dedicated_state_for_group(group, None)],
+        last_reduced_group=None,
+        post_backward_final_callback_queued=True,
+    )
+    comm_ctx.all_states[0].comm_ctx = comm_ctx
+
+    _root_post_backward_final_callback(comm_ctx)
+
+    assert group.reduce_calls == 1
+    assert group.full_waits == 1
+    assert comm_ctx.post_backward_final_callback_queued is False
 
 
 # ---------------------------------------------------------------------------

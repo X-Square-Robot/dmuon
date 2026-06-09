@@ -105,8 +105,9 @@
 
     1. **HSDP vs. shard-only：** DMuon-HSDP（G=2, R=2）在 10 步训练中
        与 shard-only DMuon（G=4）产生相同的 loss 值。
-    2. **异步 vs. 同步：** `replicate_async=True`（默认）与
-       `replicate_async=False`（Phase B 同步路径）产生相同输出。
+    2. **非 TP HSDP 的异步 vs. 同步：** `replicate_async=True` 与
+       `replicate_async=False` 产生相同输出；存在 TP-sharded dedicated
+       参数时当前会使用同步 publish。
     3. **检查点恢复：** 从检查点恢复训练与不中断的连续训练在相同步数内
        产生相同 loss 值。
 

@@ -1,10 +1,12 @@
 # API 文档
 
 !!! tip "TL;DR"
-    DMuon 公开四个功能区：**初始化**（`dedicate_params`、`install_patch`）、
+    DMuon 公开五个功能区：**初始化**（`dedicate_params`、`install_patch`）、
     **优化器**（`Muon`、`NewtonSchulz`、NS 函数与常量）、**状态管理**
     （`no_sync`、`wait_all_reduces`、replicate-broadcast 工具函数、
-    `DedicatedCommContext`）以及**检查点**（`get/set_model/optimizer_state_dict`）。
+    `DedicatedCommContext`）、**诊断**（`summarize_param_groups`、
+    `summarize_comm_plan`、`collect_forward_unshard_profile`）以及**检查点**
+    （`get/set_model/optimizer_state_dict`）。
     从 `dedicate_params` + `Muon` 开始；需要精细控制时再使用其余接口。
 
 ---
@@ -271,6 +273,76 @@ DMuon 梯度裁剪的返回类型。
 大多数用户无需直接构造。
 
 ::: dmuon.DedicatedCommContext
+
+---
+
+## 诊断
+
+诊断函数返回当前 rank 的 JSON-friendly 摘要。它们不会发起 distributed
+collective，因此可以放在 benchmark 日志代码里。若需要全局视图，让每个
+rank 各自 dump，再由外部脚本汇总。
+
+### summarize_param_groups
+
+检查 `Muon` 如何把可训练参数路由到 optimizer groups。构造 optimizer 后调用
+它，可以确认 type-split routing、owner 数量，以及 `route_hint_fn` 是否按预期
+选择了 `muon`、`adamw` 或 `sharded_adamw`。
+
+```python
+import json
+import dmuon
+
+print(json.dumps(
+    dmuon.summarize_param_groups(model, optimizer),
+    indent=2,
+    default=str,
+))
+```
+
+::: dmuon.summarize_param_groups
+
+---
+
+### summarize_comm_plan
+
+检查 FSDP2/HSDP groups 的 DMuon 通信计划。摘要会报告 owner buckets、root
+ranks、route 标签和 payload 估算。它表示计划中的 tensor 大小，不是实测
+NCCL latency。
+
+```python
+print(json.dumps(
+    dmuon.summarize_comm_plan(model),
+    indent=2,
+    default=str,
+))
+```
+
+::: dmuon.summarize_comm_plan
+
+---
+
+### collect_forward_unshard_profile
+
+从通信上下文里收集 forward-unshard 计数器和 CUDA-event timing。必须在
+`dedicate_params()` 创建通信上下文前打开采集：
+
+```bash
+DMUON_RECORD_FORWARD_PROFILE=1 torchrun ...
+```
+
+然后在诊断边界读取：
+
+```python
+profile = dmuon.collect_forward_unshard_profile(
+    model,
+    synchronize=True,
+)
+```
+
+`synchronize=True` 只适合诊断边界。它会调用 `torch.cuda.synchronize()`；
+如果放进正常 step timing loop，会改变正在测量的 overlap 行为。
+
+::: dmuon.collect_forward_unshard_profile
 
 ---
 

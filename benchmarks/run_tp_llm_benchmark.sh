@@ -5,13 +5,13 @@
 #   model: llama3b
 #   matrix: core (TP2/TP4 LPT sync/async + rank0 sync)
 #   TP scope: full projection TP unless DMUON_TP_LLM_PARALLELIZE overrides it
-#   output: docs/internal/report/tp_llm_benchmark
+#   output: .pytest_artifacts/tp_llm_benchmark
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="${HERE}/bench_tp_llm.py"
-OUT="${DMUON_TP_LLM_DIR:-docs/internal/report/tp_llm_benchmark}"
+OUT="${DMUON_TP_LLM_DIR:-.pytest_artifacts/tp_llm_benchmark}"
 PORT_BASE="${DMUON_TP_LLM_PORT_BASE:-30200}"
 MODEL="${DMUON_TP_LLM_MODEL:-llama3b}"
 MATRIX="${DMUON_TP_LLM_MATRIX:-core}"

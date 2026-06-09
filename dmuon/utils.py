@@ -37,6 +37,28 @@ def get_comm_ctx(model: nn.Module) -> Optional[DedicatedCommContext]:
     return getattr(model, "_dedicated_comm_ctx", None)
 
 
+def collect_forward_unshard_profile(
+    model: nn.Module,
+    *,
+    clear: bool = True,
+    synchronize: bool = False,
+) -> dict[str, object]:
+    """Collect DMuon FSDP2 forward-unshard diagnostics for ``model``.
+
+    The counters are only populated when ``DMUON_RECORD_FORWARD_PROFILE=1`` is
+    set before :func:`dmuon.dedicate_params` builds the communication context.
+    ``synchronize=True`` should be used at diagnostic boundaries so CUDA-event
+    timings are complete; keep it disabled in normal measurement windows.
+    """
+
+    ctx = get_comm_ctx(model)
+    if ctx is None:
+        return {"enabled": False, "events_ready": 0, "events_pending": 0}
+    if synchronize and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return ctx.consume_forward_unshard_profile(clear=clear)
+
+
 def prepare_group_muon_grads(g, *, use_reduce_stream: bool = False) -> None:
     """Prepare one communication group's Muon gradients.
 
@@ -124,7 +146,8 @@ def _iter_groups(model: nn.Module):
 
 @contextmanager
 def _profile_range(name: str):
-    yield
+    with torch.profiler.record_function(name):
+        yield
 
 
 def _group_profile_name(g) -> str:
@@ -187,6 +210,10 @@ def _dispatch_post_step_sync(g) -> None:
                     scatter()
             with _profile_range("dmuon.replicate_broadcast.sync"):
                 g.replicate_broadcast_sync()
+            publish = getattr(g, "sharded_muon_publish_sync", None)
+            if publish is not None:
+                with _profile_range("dmuon.sharded_muon_publish.sync"):
+                    publish()
 
 
 def _dispatch_post_step_async(g, phase_recorder=None) -> None:
@@ -231,12 +258,20 @@ def _dispatch_post_step_async(g, phase_recorder=None) -> None:
                 else:
                     with _phase("replicate_broadcast"):
                         g.replicate_broadcast_async()
+            publish_async = getattr(g, "sharded_muon_publish_async", None)
+            if publish_async is not None:
+                with _profile_range("dmuon.sharded_muon_publish.async"):
+                    with _phase("sharded_muon_publish"):
+                        publish_async()
 
 def _wait_post_step(g) -> None:
     if isinstance(g, DedicatedParamGroupDDP):
         g.wait_for_post_step_broadcast()
     else:
         g.wait_for_replicate_broadcast()
+        wait_publish = getattr(g, "wait_for_sharded_muon_publish", None)
+        if wait_publish is not None:
+            wait_publish()
 
 
 def broadcast_all_updates(model: nn.Module) -> None:

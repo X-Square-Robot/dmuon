@@ -117,8 +117,9 @@
 
     1. **HSDP vs. shard-only:** DMuon-HSDP (G=2, R=2) produces identical loss
        values to shard-only DMuon (G=4) over 10 training steps.
-    2. **Async vs. sync:** `replicate_async=True` (default) produces identical
-       outputs to `replicate_async=False` (Phase B sync path).
+    2. **Async vs. sync for non-TP HSDP:** `replicate_async=True` produces
+       identical outputs to `replicate_async=False`.  TP-sharded dedicated
+       parameters currently use the synchronous publish path.
     3. **Checkpoint restart:** resuming from a checkpoint produces identical
        loss values to an uninterrupted run over the same steps.
 

@@ -6,7 +6,8 @@ This means:
   - B!=A is only valid when A@B^T is symmetric (as in Gram NS intermediate products)
 """
 
-import os, sys
+import os
+import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
@@ -198,14 +199,14 @@ def test_autotune_cache():
     assert len(_syrk_autotune_cache) == 2, (
         f"test_autotune_cache FAILED: expected 2 cache entries, got {len(_syrk_autotune_cache)}"
     )
-    print(f"  [test_autotune_cache] cache has 2 entries after second shape OK")
+    print("  [test_autotune_cache] cache has 2 entries after second shape OK")
 
     # Same shape (128,256) but has_C=True — should be a different key
     _autotune_syrk(128, 256, device, dtype, has_C=True)
     assert len(_syrk_autotune_cache) == 3, (
         f"test_autotune_cache FAILED: expected 3 cache entries, got {len(_syrk_autotune_cache)}"
     )
-    print(f"  [test_autotune_cache] cache has 3 entries after has_C=True variant OK")
+    print("  [test_autotune_cache] cache has 3 entries after has_C=True variant OK")
 
 
 # ---------------------------------------------------------------------------

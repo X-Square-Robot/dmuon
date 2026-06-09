@@ -10,10 +10,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="${HERE}/test_tp_comm_order.py"
-OUT="${DMUON_COMM_OUT_DIR:-docs/internal/report/tp_comm_order_smoke}"
+OUT="${DMUON_COMM_OUT_DIR:-.pytest_artifacts/tp_comm_order_smoke}"
 PORT_BASE="${DMUON_COMM_PORT_BASE:-31600}"
 STEPS="${DMUON_COMM_STEPS:-2}"
-MODEL="${DMUON_COMM_MODEL:-llama}"
+MODEL="${DMUON_COMM_MODEL:-tiny}"
 VISIBLE_4="${DMUON_COMM_VISIBLE_4:-0,1,2,3}"
 VISIBLE_8="${DMUON_COMM_VISIBLE_8:-0,1,2,3,4,5,6,7}"
 

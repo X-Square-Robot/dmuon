@@ -76,8 +76,12 @@ def _link_forward_prefetch_states(
     )
     for state in ordered:
         state._next_group = None
+        state._next_groups = []
     for idx in range(len(ordered) - 1):
         ordered[idx]._next_group = ordered[idx + 1].group
+        ordered[idx]._next_groups = [
+            later_state.group for later_state in ordered[idx + 1 :]
+        ]
     comm_ctx.all_states[:] = ordered
 
 
@@ -137,10 +141,11 @@ def _find_layer_module(
 
     # Build the full path to the layer module
     # e.g., parent_fqn = "model.layers.3.self_attn.q_proj", layer_id = "layers.3"
-    idx = parent_fqn.find(layer_id)
+    layer_path_id = layer_id.removeprefix("_root.")
+    idx = parent_fqn.find(layer_path_id)
     if idx < 0:
         return parent_module, parent_module, param_name
-    layer_path = parent_fqn[: idx + len(layer_id)]
+    layer_path = parent_fqn[: idx + len(layer_path_id)]
     try:
         layer_module = model.get_submodule(layer_path)
     except AttributeError:
@@ -263,6 +268,8 @@ def dedicate_params(
     owner_strategy: str = "lpt",
     tp_buffer_reuse: bool | str = False,
     replicate_broadcast_bucket_mb: float = 0.0,
+    muon_forward_unshard: str = "broadcast",
+    delay_stage2_to_optimizer: bool = True,
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -283,7 +290,6 @@ def dedicate_params(
     the TP group.  No TP mesh argument is required; simply pass the DP
     slice of your 3D mesh as ``mesh`` / ``replicate_mesh``, matching the
     FSDP2 convention (``fully_shard(mesh=mesh["replicate","shard"])``).
-    See ``docs/internal/research/tp_design.md`` §5.
 
     Typical 3D (replicate × shard × tp) call order::
 
@@ -350,6 +356,18 @@ def dedicate_params(
             Accepts ``False``/``True`` or ``"gather"``, ``"scatter"``, ``"all"``.
         replicate_broadcast_bucket_mb: Optional HSDP post-step publish bucket
             size in MiB. ``0`` keeps one coalesced publish per hook group.
+        muon_forward_unshard: Forward unshard placement for Muon-routed
+            parameters. ``"broadcast"`` keeps the existing owner-to-all
+            publish path. ``"all_gather"`` keeps the owner-side full-matrix
+            update, then scatters the updated tensor into rank-local shards
+            after the optimizer step and reconstructs the forward view with an
+            FSDP-style all-gather. The all-gather mode is experimental and is
+            currently supported only for non-TP Muon parameters.
+        delay_stage2_to_optimizer: When True, backward only waits the Stage-1
+            shard reduce for buffer lifetime; HSDP Stage-2 replicate reduce is
+            waited by per-group optimizer preparation.  This is the default
+            because it preserves overlap between late reduce tails and earlier
+            optimizer/publish work.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its DP owner
@@ -474,6 +492,7 @@ def dedicate_params(
                 if route_hint_fn is not None
                 else getattr(param, "_dmuon_route_hint", None)
             ),
+            muon_forward_unshard=muon_forward_unshard,
         )
         aliases = [
             (module, name)
@@ -488,7 +507,11 @@ def dedicate_params(
     all_states: list[DedicatedState] = []
     module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     for layer_module, d_params in layer_to_dparams.items():
-        group = DedicatedParamGroup(d_params, comm_ctx)
+        group = DedicatedParamGroup(
+            d_params,
+            comm_ctx,
+            delay_stage2_to_optimizer=delay_stage2_to_optimizer,
+        )
         group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         state = DedicatedState(layer_module, group, comm_ctx, reshard_after_forward)
         layer_module._dedicated_state = state
@@ -521,8 +544,7 @@ def dedicate_params_ddp(
     Every rank keeps the full parameter live on the module. Ownership
     applies only to (1) who runs Newton-Schulz, (2) the ``dist.reduce``
     destination after backward, and (3) the ``dist.broadcast`` source
-    after ``optim.step``. See ``docs/internal/research/ddp_adapter_plan.md``
-    for the full semantic model.
+    after ``optim.step``.
 
     Compared with :func:`dedicate_params`, this entry:
 

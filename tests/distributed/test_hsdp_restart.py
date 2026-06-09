@@ -17,7 +17,6 @@ Run: ``torchrun --nproc_per_node=4 tests/distributed/test_hsdp_restart.py``
 
 import os
 import sys
-import tempfile
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -171,7 +170,7 @@ def main():
 
     if rank == 0:
         print("HSDP restart test: uninterrupted vs save→load→resume")
-        print(f"  4 GPUs, G=2, R=2, 10 steps (checkpoint after step 5)")
+        print("  4 GPUs, G=2, R=2, 10 steps (checkpoint after step 5)")
         print()
         print(f"  {'Step':<6s} {'Baseline':>12s} {'Restart':>12s} {'Diff':>12s} {'Status':>8s}")
         all_pass = True

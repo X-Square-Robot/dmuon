@@ -29,7 +29,7 @@
 
     **Fix:** upgrade PyTorch.
     ```bash
-    pip install "torch>=2.4" --index-url https://download.pytorch.org/whl/cu121
+    pip install "torch>=2.6" --index-url https://download.pytorch.org/whl/cu121
     ```
 
 ---
@@ -51,6 +51,14 @@
     automatically via `kernel="auto"`.  See
     [Backend dispatch](reference/newton-schulz.md#backend-dispatch) for the
     full auto-detection ladder.
+
+    On the first uncached shape, DMuon autotunes the SYRK tile config against
+    cuBLAS and prints rank-tagged progress lines such as
+    `[DMuon][rank=0/8] SYRK autotune candidate started ...`.  These logs make
+    startup stalls during per-shape autotune visible in cluster logs; they do
+    not change the selected backend or benchmark result.  Set
+    `DMUON_SYRK_AUTOTUNE_LOG=0` to silence them after confirming autotune is
+    behaving normally.
 
 ---
 
@@ -165,6 +173,35 @@
     `dmuon.Muon(..., replicate_async=False/True)`.  If only a few owner ranks
     are slow, inspect the dedicated parameter assignment and consider a more
     even hook boundary or owner strategy.
+
+    **Diagnostics:** dump the rank-local routing and communication summaries:
+    ```python
+    import json
+    import dmuon
+
+    print(json.dumps(
+        dmuon.summarize_param_groups(model, optimizer),
+        indent=2,
+        default=str,
+    ))
+    print(json.dumps(
+        dmuon.summarize_comm_plan(model),
+        indent=2,
+        default=str,
+    ))
+    ```
+
+    For forward-unshard wait counters, set
+    `DMUON_RECORD_FORWARD_PROFILE=1` before `dmuon.dedicate_params()` runs,
+    then collect at a diagnostic boundary:
+    ```python
+    profile = dmuon.collect_forward_unshard_profile(
+        model,
+        synchronize=True,
+    )
+    ```
+    Do not put `synchronize=True` inside the normal step timing loop; it forces
+    a CUDA sync and changes overlap behavior.
 
 ---
 
