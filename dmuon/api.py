@@ -141,10 +141,11 @@ def _find_layer_module(
 
     # Build the full path to the layer module
     # e.g., parent_fqn = "model.layers.3.self_attn.q_proj", layer_id = "layers.3"
-    idx = parent_fqn.find(layer_id)
+    layer_path_id = layer_id.removeprefix("_root.")
+    idx = parent_fqn.find(layer_path_id)
     if idx < 0:
         return parent_module, parent_module, param_name
-    layer_path = parent_fqn[: idx + len(layer_id)]
+    layer_path = parent_fqn[: idx + len(layer_path_id)]
     try:
         layer_module = model.get_submodule(layer_path)
     except AttributeError:

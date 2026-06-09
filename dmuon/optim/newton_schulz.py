@@ -28,7 +28,6 @@ from torch import Tensor
 
 from dmuon.optim.syrk_dispatch import (
     HAS_SYRK as _HAS_SYRK,
-    get_ns_backend,
     syrk_or_cublas as _syrk_or_cublas,
 )
 

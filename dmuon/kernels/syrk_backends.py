@@ -54,9 +54,7 @@ if torch.cuda.is_available():
 # B-series transition.
 _HAS_CUTE_SM80 = False
 _syrk_sm80_fn = None
-_SYRK_SM80_CONFIGS: list[tuple[int, int, int]] = []
 try:
-    from dmuon.kernels.syrk_sm80 import SYRK_SM80_CONFIGS as _SYRK_SM80_CONFIGS
     from dmuon.kernels.syrk_sm80 import syrk_sm80 as _syrk_sm80_fn
 
     _HAS_CUTE_SM80 = True

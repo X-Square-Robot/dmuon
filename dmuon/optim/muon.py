@@ -83,7 +83,9 @@ class Muon(Optimizer):
             Recommended by original Muon paper and used by Moonlight.
         replicate_async: If True (default), publish owner updates asynchronously
             and consume the events in the next forward. If False, drain the
-            publish path inside ``step()`` for deterministic timing.
+            publish path inside ``step()`` for deterministic timing. When TP
+            dedicated parameters are present, DMuon currently keeps this path
+            synchronous for correctness.
         record_step_profile: If True, record CUDA-event timing for optimizer
             phases and expose it via ``consume_last_step_profile()``.
         group_prepare_ahead: If True, prepare the next group's reduced grads
@@ -1165,7 +1167,7 @@ class Muon(Optimizer):
                 int(factor.numel()) for factor in desc["gram_factor_segments"]
             )
         self._profile_add("tp_gram_factor_broadcast_numel", total_numel)
-        # Keep legacy profile key for old dashboard/analysis scripts.
+        # Keep legacy profile key for older analysis scripts.
         self._profile_add("tp_gram_q_broadcast_numel", total_numel)
 
     def _apply_tp_distributed_gram_descriptor(
