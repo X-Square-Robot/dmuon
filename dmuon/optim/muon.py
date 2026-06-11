@@ -1490,6 +1490,57 @@ class Muon(Optimizer):
                 wait_for_tp_gather=wait_for_tp_gather,
             )
 
+    def _step_muon_batched_nsk(self, dedicated_params, lr, mu, wd):
+        """DMUON_NSK fast path (non-TP only): batch same-shape owned params and run NS once
+        per shape via nsk_pkg (TileLang SYRK + CUTLASS epilogue). Large matrices (min-dim >=
+        DMUON_NSK_MAXM) keep per-matrix self._ns.local. Momentum + apply identical to the
+        per-param path; only the NS compute is batched."""
+        import os
+        import nsk_pkg
+        from collections import defaultdict
+        BATCH_MAX_M = int(os.environ.get("DMUON_NSK_MAXM", "1536"))
+        work = []
+        for dp in dedicated_params:
+            if dp._reduced_grad is None:
+                continue
+            if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
+                continue
+            grad = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1)
+            dp_id = id(dp)
+            if dp_id not in self.state:
+                self.state[dp_id] = {}
+            st = self.state[dp_id]
+            if "momentum_buffer" not in st:
+                st["momentum_buffer"] = grad.clone()
+            else:
+                st["momentum_buffer"].mul_(mu).add_(grad)
+            buf = st["momentum_buffer"]
+            ns_input = grad.add(buf, alpha=mu) if self._nesterov else buf
+            work.append((dp, ns_input))
+        updates = {}
+        small = defaultdict(list)
+        for dp, ni in work:
+            m = min(ni.shape[0], ni.shape[1])
+            if m >= BATCH_MAX_M:
+                updates[id(dp)] = self._ns.local(ni, self._ns_steps)
+            else:
+                small[tuple(ni.shape)].append((dp, ni))
+        for _shape, items in small.items():
+            Xs = torch.stack([ni for _, ni in items], 0)
+            Us = nsk_pkg.batched_gram_ns(Xs)
+            for k, (dp, _) in enumerate(items):
+                updates[id(dp)] = Us[k]
+        for dp, _ni in work:
+            update = updates[id(dp)]
+            owned = dp._owned_data
+            m = owned.shape[0]
+            n = owned.view(m, -1).shape[1]
+            scale = 0.2 * (max(m, n) ** 0.5)
+            if wd > 0:
+                owned.mul_(1.0 - lr * wd)
+            owned.add_(update.view(owned.shape).to(device=owned.device, dtype=owned.dtype), alpha=-lr * scale)
+            dp._reduced_grad = None
+
     def _step_muon_params(
         self, dedicated_params, group: dict, *, wait_for_tp_gather: bool = True
     ) -> None:
@@ -1544,6 +1595,11 @@ class Muon(Optimizer):
                 self._broadcast_tp_gram_factor_descriptor_batch(tp_gram_descriptors)
                 for desc in tp_gram_descriptors:
                     self._apply_tp_distributed_gram_descriptor(desc)
+
+        import os as _os
+        if _os.environ.get("DMUON_NSK") and not self._has_tp_dedicated:
+            self._step_muon_batched_nsk(dedicated_params, lr, mu, wd)
+            return
 
         for dp in dedicated_params:
             if dp._reduced_grad is None:
