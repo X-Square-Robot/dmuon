@@ -2,28 +2,23 @@
   <img src="assets/dmuon_icon.jpg" alt="DMuon icon" width="120" />
 </p>
 
-<h3 align="center">DMuon</h3>
-
-<p align="center">
-  <em>Drop-in Distributed Muon optimizer implementation in Near-AdamW cost</em>
-</p>
-
----
+> Dedicated ownership for [Muon](https://arxiv.org/abs/2502.16982) on PyTorch FSDP2.
+> **One owner. One Newton-Schulz. Zero optimizer all-gather.**
 
 <p align="center">
   <img src="assets/dmuon-banner.png" alt="DMuon" width="100%" />
 </p>
 
 <p align="center">
-  <img alt="Tech Report" src="https://img.shields.io/badge/Tech%20Report-Coming%20Soon-lightgrey">
-  <img alt="Wiki" src="https://img.shields.io/badge/Wiki-WIP-lightgrey">
+  <img alt="CUDA" src="https://img.shields.io/badge/CUDA-enabled-76B900?logo=nvidia&logoColor=white">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-black"></a>
 </p>
 
-**DMuon** is a high-performance distributed implementation of the Muon optimizer that drops
-into any existing training pipeline in **just 3 lines of code**. Through fine-grained kernel
-tuning, load-balanced work scheduling, and a redesigned distributed communication path, DMuon
-delivers **near-AdamW step time** while keeping Muon's optimization benefits — fully
-plug-and-play, with no changes to your model.
+DMuon assigns each matrix parameter to a single **owner rank**: the owner broadcasts the
+full parameter in forward, gradients are reduced to the owner in backward, and Newton-Schulz
+runs **only on the owner** in the optimizer step. This removes the all-gather that standard
+FSDP2 + Muon needs and cuts redundant NS compute from `R` ranks to `1`. Composes with FSDP2,
+HSDP (multi-node), DDP, and Tensor Parallel.
 
 ## Install
 
@@ -86,9 +81,10 @@ Measured on a 128-node cluster, DMuon runs the matrix optimizer at roughly AdamW
 
 | Model | AdamW step | DMuon step | Δ vs AdamW |
 |:------|-----------:|-----------:|-----------:|
-| WallX| 1259 ms | 1285 ms | +2.1% |
-| Pi0| 1617 ms | 1645 ms | +1.7 % |
-| Wall-WM| 3309 ms | 3424 ms | 3.4 % |
+| WallX| 1492 ms | 1522 ms | +2.0% |
+| PI05| xxx ms | xxx ms | +1.9 % |
+| Wall-WM| xxx ms | xxx ms | +1.9 % |
+
 
 
 ## Acknowledgments
