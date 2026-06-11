@@ -81,3 +81,16 @@ Measured on a 128-node cluster, DMuon runs the matrix optimizer at roughly AdamW
 |:------|-----------:|-----------:|-----------:|
 | WallX| 1492 ms | 1522 ms | +2.0% |
 | PI05| xxx ms | xxx ms | +1.9 % |
+| Wall-WM| xxx ms | xxx ms | +1.9 % |
+
+
+
+## Acknowledgments
+
+DMuon builds upon the ideas and engineering of several excellent prior works:
+
+- **[Muon](https://kellerjordan.github.io/posts/muon/)** by Keller Jordan et al. — the original Muon optimizer, which orthogonalizes momentum updates via Newton-Schulz iteration.
+- **[Moonlight](https://github.com/MoonshotAI/Moonlight)** ([*Muon is Scalable for LLM Training*](https://arxiv.org/abs/2502.16982)) by the Moonshot AI (Kimi) team — which demonstrated Muon's scalability to large-scale LLM training and introduced the weight-decay and update-scale adjustments that make it practical as a drop-in AdamW replacement. Our distributed design is heavily inspired by their ZeRO-1 Muon implementation.
+- **[Gram Newton-Schulz](https://github.com/Dao-AILab/gram-newton-schulz)** ([blog post](https://tridao.me/blog/2026/gram-newton-schulz/)) by Jack Zhang, Noah Amsel, Berlin Chen, and Tri Dao — a hardware-aware reformulation of Newton-Schulz that iterates on the Gram matrix and exploits its symmetry with dedicated CuTeDSL GEMM kernels. Our SYRK-based kernel design follows this line of work.
+
+We thank the authors of these projects for open-sourcing their code and insights.
