@@ -79,10 +79,9 @@ Measured on a 128-node cluster, DMuon runs the matrix optimizer at roughly AdamW
 
 | Model | AdamW step | DMuon step | Δ vs AdamW |
 |:------|-----------:|-----------:|-----------:|
-| WallX| 1492 ms | 1522 ms | +2.0% |
-| PI05| xxx ms | xxx ms | +1.9 % |
-| Wall-WM| xxx ms | xxx ms | +1.9 % |
-
+| WallX| 1259 ms | 1285 ms | +2.1% |
+| Pi0| 1617 ms | 1645 ms | +1.7 % |
+| Wall-WM| 3309 ms | 3424 ms | 3.4 % |
 
 
 ## Acknowledgments
