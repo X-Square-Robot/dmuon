@@ -60,6 +60,16 @@ class AssignmentResult:
     """TP rank within the TP group, **only** populated for TP-sharded
     params.  Empty dict when no parameter is TP-sharded."""
 
+    batch_groups: dict[nn.Parameter, object] = field(default_factory=dict)
+    """Optional per-parameter batched-runtime metadata.
+
+    Populated only by ``owner_strategy="profiled_ilp"``.  Legacy owner
+    strategies leave this empty and continue to behave as before.
+    """
+
+    metadata: dict[str, object] = field(default_factory=dict)
+    """Optional assignment diagnostics.  Empty for legacy strategies."""
+
     # ---- dict-like delegation over dp_owners (back-compat) ----
 
     def __getitem__(self, key):  # type: ignore[override]
@@ -208,6 +218,8 @@ def compute_balanced_assignment(
     tp_owner_strategy: str = "lpt",
     assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
     max_owners_per_group: Optional[int] = None,
+    route_hint_fn: Optional[Callable[[str, nn.Parameter], Optional[str]]] = None,
+    profiled_ilp_config: object = None,
 ) -> AssignmentResult:
     """Compute a globally balanced dedicated ownership assignment.
 
@@ -237,6 +249,8 @@ def compute_balanced_assignment(
         owner_strategy: Strategy for assigning DP/HSDP owner slots. ``"lpt"``
             is the production default. ``"round_robin"`` and ``"rank0"`` are
             diagnostic baselines for load-balance ablations.
+            ``"profiled_ilp"`` profiles same-shape owner-local Muon batches,
+            then solves an integer program to assign the measured work.
         tp_owner_strategy: Strategy for picking a TP rank as owner of each
             TP-sharded parameter.  Only ``"lpt"`` is supported publicly.
             Legacy ``"rank0"`` is intentionally rejected to avoid silently
@@ -260,10 +274,10 @@ def compute_balanced_assignment(
         (s, r) for s in range(shard_size) for r in range(replicate_size)
     ]
 
-    if owner_strategy not in {"lpt", "round_robin", "rank0"}:
+    if owner_strategy not in {"lpt", "round_robin", "rank0", "profiled_ilp"}:
         raise ValueError(
             f"Unsupported owner_strategy: {owner_strategy!r}; "
-            "expected 'lpt', 'round_robin', or 'rank0'."
+            "expected 'lpt', 'round_robin', 'rank0', or 'profiled_ilp'."
         )
     if tp_owner_strategy != "lpt":
         raise ValueError(
@@ -272,6 +286,24 @@ def compute_balanced_assignment(
         )
     if max_owners_per_group is not None and max_owners_per_group <= 0:
         raise ValueError("max_owners_per_group must be positive when set")
+
+    if owner_strategy == "profiled_ilp":
+        from .profiled_ilp import compute_profiled_ilp_assignment
+
+        dp_owners, tp_owners, batch_groups, metadata = compute_profiled_ilp_assignment(
+            model,
+            mesh,
+            predicate,
+            replicate_mesh=replicate_mesh,
+            route_hint_fn=route_hint_fn,
+            profiled_ilp_config=profiled_ilp_config,
+        )
+        return AssignmentResult(
+            dp_owners=dp_owners,
+            tp_owners=tp_owners,
+            batch_groups=batch_groups,
+            metadata=metadata,
+        )
 
     dp_names: set[str] = set()
     if mesh.mesh_dim_names:

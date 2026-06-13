@@ -4,6 +4,7 @@ Combines Newton-Schulz orthogonalization on dedicated parameters with
 AdamW on symmetric (FSDP2-managed) parameters in a single optimizer.
 """
 
+from collections import defaultdict
 from contextlib import contextmanager
 import time
 from typing import Optional, Union
@@ -219,6 +220,10 @@ class Muon(Optimizer):
             or getattr(getattr(dp, "_orig_param", None), "_dedicated_mode", None) == "ddp_tp"
             for dp in self._all_dedicated_params
         )
+        self._has_profiled_ilp_batches = any(
+            getattr(dp, "_profiled_ilp_group_key", None) is not None
+            for dp in self._all_dedicated_params
+        )
         self._has_hsdp_sharded_muon_forward = (
             getattr(self._comm_ctx, "replicate_group", None) is not None
             and any(
@@ -242,6 +247,14 @@ class Muon(Optimizer):
             # TP dedicated params publish through a TP-scatter stage before the
             # DP/HSDP fan-out. Keep the public training path synchronous until
             # async TP publish has sync-vs-async parity coverage.
+            self._replicate_async = False
+            replicate_async = False
+        if self._has_profiled_ilp_batches and replicate_async:
+            # profiled_ilp can intentionally batch same-shape params across
+            # communication groups.  The async path publishes each group as soon
+            # as that group's local Muon work finishes, which would split those
+            # cross-group batches.  Keep this strategy on the sync path so the
+            # runtime follows the ILP batch plan it profiled.
             self._replicate_async = False
             replicate_async = False
 
@@ -1490,6 +1503,109 @@ class Muon(Optimizer):
                 wait_for_tp_gather=wait_for_tp_gather,
             )
 
+    def _step_profiled_ilp_batch_params(
+        self,
+        dedicated_params,
+        *,
+        lr: float,
+        mu: float,
+        wd: float,
+    ) -> set[int]:
+        """Run profiled_ilp same-shape batches and return processed dp ids."""
+
+        if self._ns.backend != "gram":
+            return set()
+
+        buckets: dict[tuple[object, ...], list] = defaultdict(list)
+        for dp in dedicated_params:
+            group_key = getattr(dp, "_profiled_ilp_group_key", None)
+            if group_key is None or dp._reduced_grad is None:
+                continue
+            is_tp = dp.is_dtensor and dp.tp_group is not None
+            if is_tp:
+                continue
+            buckets[group_key].append(dp)
+
+        if not buckets:
+            return set()
+
+        from .profiled_batch import batched_gram_newton_schulz
+
+        processed: set[int] = set()
+        for group_key in sorted(buckets, key=repr):
+            dps = buckets[group_key]
+            if not dps:
+                continue
+            backend = getattr(dps[0], "_profiled_ilp_backend", "cublas")
+            if self._ns.deterministic:
+                backend = "cublas"
+            if (
+                backend == "tilelang"
+                and (
+                    self._ns.coefficients is not None
+                    or self._ns.restart_iterations is not None
+                )
+            ):
+                # The current TileLang adapter follows DMuon's default Gram-NS
+                # coefficients.  Custom NS objects must use the generic batched
+                # implementation to preserve math semantics.
+                backend = "cublas"
+
+            ns_inputs = []
+            for dp in dps:
+                grad = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1)
+                dp_id = id(dp)
+                if dp_id not in self.state:
+                    self.state[dp_id] = {}
+                state = self.state[dp_id]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = grad.clone()
+                else:
+                    state["momentum_buffer"].mul_(mu).add_(grad)
+                buf = state["momentum_buffer"]
+                ns_inputs.append(grad.add(buf, alpha=mu) if self._nesterov else buf)
+
+            ns_input_batch = torch.stack(ns_inputs, dim=0).contiguous()
+            self._first_step_progress_shape(
+                dps[0],
+                ns_input_batch[0],
+                path=f"profiled_ilp_batch_{backend}",
+            )
+            profile_token = self._profile_event_start("ns_compute")
+            try:
+                updates = batched_gram_newton_schulz(
+                    ns_input_batch,
+                    backend=backend,
+                    coefficients=self._ns.coefficients,
+                    restart_iterations=self._ns.restart_iterations,
+                )
+            finally:
+                self._profile_event_end(profile_token)
+
+            self._profile_add("ns_matrix_count", len(dps))
+            self._profile_add("ns_input_numel", int(ns_input_batch.numel()))
+            self._profile_add("profiled_ilp_batch_count", 1)
+
+            for idx, dp in enumerate(dps):
+                owned = dp._owned_data
+                m = owned.shape[0]
+                n = owned.view(m, -1).shape[1]
+                scale = 0.2 * (max(m, n) ** 0.5)
+
+                if wd > 0:
+                    owned.mul_(1.0 - lr * wd)
+                owned.add_(
+                    updates[idx].view(owned.shape).to(
+                        device=owned.device,
+                        dtype=owned.dtype,
+                    ),
+                    alpha=-lr * scale,
+                )
+                dp._reduced_grad = None
+                processed.add(id(dp))
+
+        return processed
+
     def _step_muon_params(
         self, dedicated_params, group: dict, *, wait_for_tp_gather: bool = True
     ) -> None:
@@ -1545,10 +1661,19 @@ class Muon(Optimizer):
                 for desc in tp_gram_descriptors:
                     self._apply_tp_distributed_gram_descriptor(desc)
 
+        profiled_ilp_param_ids = self._step_profiled_ilp_batch_params(
+            dedicated_params,
+            lr=lr,
+            mu=mu,
+            wd=wd,
+        )
+
         for dp in dedicated_params:
             if dp._reduced_grad is None:
                 continue
             if id(dp) in tp_gram_param_ids:
+                continue
+            if id(dp) in profiled_ilp_param_ids:
                 continue
 
             # TP path (All-to-All): only the TP owner runs NS on the

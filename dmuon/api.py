@@ -270,6 +270,7 @@ def dedicate_params(
     replicate_broadcast_bucket_mb: float = 0.0,
     muon_forward_unshard: str = "broadcast",
     delay_stage2_to_optimizer: bool = True,
+    profiled_ilp_config: object = None,
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -351,7 +352,12 @@ def dedicate_params(
             assignment group.
         owner_strategy: DP/HSDP owner assignment strategy. ``"lpt"`` is the
             production default; ``"round_robin"`` and ``"rank0"`` are intended
-            for benchmark ablations.
+            for benchmark ablations. ``"profiled_ilp"`` profiles owner-local
+            batched Muon compute before training and solves an integer program
+            over the measured batch costs.
+        profiled_ilp_config: Optional dict/config object used only when
+            ``owner_strategy="profiled_ilp"``.  By default it profiles all
+            batch sizes ``1..min(8, count)`` for each shape.
         tp_buffer_reuse: Optional TP gather/scatter scratch-buffer reuse policy.
             Accepts ``False``/``True`` or ``"gather"``, ``"scatter"``, ``"all"``.
         replicate_broadcast_bucket_mb: Optional HSDP post-step publish bucket
@@ -386,6 +392,8 @@ def dedicate_params(
         owner_strategy=owner_strategy,
         assignment_group_key_fn=assignment_group_key_fn,
         max_owners_per_group=max_owners_per_group,
+        route_hint_fn=route_hint_fn,
+        profiled_ilp_config=profiled_ilp_config,
     )
     assignment = result.dp_owners
     if not assignment:
@@ -430,6 +438,14 @@ def dedicate_params(
         f"owner slots (shard={shard_size}, replicate={replicate_size}), "
         f"imbalance={imbalance:.1%}, loads={loads_list}{tp_tag}"
     )
+    if result.metadata.get("strategy") == "profiled_ilp":
+        logger.info(
+            "dedicate_params[%s]: profiled_ilp measured owner loads ms=%s, "
+            "fallback_params=%s",
+            mode,
+            result.metadata.get("rank_loads_ms_with_fallback"),
+            result.metadata.get("fallback_param_count", 0),
+        )
 
     # 2. Mark parameters
     for param, coord in normalized.items():
@@ -446,6 +462,7 @@ def dedicate_params(
         tp_buffer_reuse=tp_buffer_reuse,
         replicate_broadcast_bucket_mb=replicate_broadcast_bucket_mb,
     )
+    comm_ctx.profiled_ilp_metadata = result.metadata
 
     # 4. Group by layer module and create DedicatedParam + DedicatedState
     layer_to_dparams: dict[nn.Module, list[DedicatedParam]] = defaultdict(list)
@@ -494,6 +511,13 @@ def dedicate_params(
             ),
             muon_forward_unshard=muon_forward_unshard,
         )
+        batch_meta = result.batch_groups.get(param)
+        if batch_meta is not None:
+            d_param._profiled_ilp_group_key = batch_meta.group_key
+            d_param._profiled_ilp_backend = batch_meta.backend
+            d_param._profiled_ilp_batch_size = batch_meta.batch_size
+            d_param._profiled_ilp_shape = batch_meta.shape
+            d_param._profiled_ilp_measured_cost_ms = batch_meta.measured_cost_ms
         aliases = [
             (module, name)
             for module, name in parent_modules[1:]
@@ -538,6 +562,7 @@ def dedicate_params_ddp(
     assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
     max_owners_per_group: Optional[int] = None,
     owner_strategy: str = "lpt",
+    profiled_ilp_config: object = None,
 ) -> dict[nn.Parameter, int]:
     """DDP-path variant of :func:`dedicate_params`.
 
@@ -590,6 +615,7 @@ def dedicate_params_ddp(
         owner_strategy=owner_strategy,
         assignment_group_key_fn=assignment_group_key_fn,
         max_owners_per_group=max_owners_per_group,
+        profiled_ilp_config=profiled_ilp_config,
     )
     assignment = result.dp_owners
     if not assignment:
@@ -631,6 +657,7 @@ def dedicate_params_ddp(
     device_type = mesh.device_type
     device = torch.device(device_type, torch.cuda.current_device())
     comm_ctx = DedicatedCommContext(device, replicate_group=None)
+    comm_ctx.profiled_ilp_metadata = result.metadata
 
     layer_to_dparams: dict[nn.Module, list[DedicatedParamDDP]] = defaultdict(list)
     param_to_fqn = {param: name for name, param in model.named_parameters()}
@@ -655,6 +682,13 @@ def dedicate_params_ddp(
             device=device,
             compute_dtype=compute_dtype,
         )
+        batch_meta = result.batch_groups.get(param)
+        if batch_meta is not None:
+            d_param._profiled_ilp_group_key = batch_meta.group_key
+            d_param._profiled_ilp_backend = batch_meta.backend
+            d_param._profiled_ilp_batch_size = batch_meta.batch_size
+            d_param._profiled_ilp_shape = batch_meta.shape
+            d_param._profiled_ilp_measured_cost_ms = batch_meta.measured_cost_ms
         layer_to_dparams[layer_module].append(d_param)
 
     all_states: list[DedicatedState] = []
