@@ -2,23 +2,28 @@
   <img src="assets/dmuon_icon.jpg" alt="DMuon icon" width="120" />
 </p>
 
-> Dedicated ownership for [Muon](https://arxiv.org/abs/2502.16982) on PyTorch FSDP2.
-> **One owner. One Newton-Schulz. Zero optimizer all-gather.**
+<h3 align="center">DMuon</h3>
+
+<p align="center">
+  <em>Drop-in Distributed Muon optimizer implementation in Near-AdamW cost</em>
+</p>
+
+---
 
 <p align="center">
   <img src="assets/dmuon-banner.png" alt="DMuon" width="100%" />
 </p>
 
 <p align="center">
-  <img alt="CUDA" src="https://img.shields.io/badge/CUDA-enabled-76B900?logo=nvidia&logoColor=white">
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-black"></a>
+  <img alt="Tech Report" src="https://img.shields.io/badge/Tech%20Report-Coming%20Soon-lightgrey">
+  <img alt="Wiki" src="https://img.shields.io/badge/Wiki-WIP-lightgrey">
 </p>
 
-DMuon assigns each matrix parameter to a single **owner rank**: the owner broadcasts the
-full parameter in forward, gradients are reduced to the owner in backward, and Newton-Schulz
-runs **only on the owner** in the optimizer step. This removes the all-gather that standard
-FSDP2 + Muon needs and cuts redundant NS compute from `R` ranks to `1`. Composes with FSDP2,
-HSDP (multi-node), DDP, and Tensor Parallel.
+**DMuon** is a high-performance distributed implementation of the Muon optimizer that drops
+into any existing training pipeline in **just 3 lines of code**. Through fine-grained kernel
+tuning, load-balanced work scheduling, and a redesigned distributed communication path, DMuon
+delivers **near-AdamW step time** while keeping Muon's optimization benefits — fully
+plug-and-play, with no changes to your model.
 
 ## Install
 
