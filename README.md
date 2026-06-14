@@ -82,7 +82,7 @@ and `fully_shard(..., mesh=hsdp)`; everything else is identical.
 
 ## Benchmark
 
-Measured on a 128-node cluster, DMuon runs the matrix optimizer at roughly AdamW step time.
+Measured on a 16-node cluster, DMuon runs the matrix optimizer at roughly AdamW step time.
 
 | Model | AdamW step | DMuon step | Δ vs AdamW |
 |:------|-----------:|-----------:|-----------:|
