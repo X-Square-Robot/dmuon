@@ -1,11 +1,13 @@
 """Public API: dedicate_params and DDP variants."""
 
 import logging
+import os
 from collections import defaultdict
 from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
+
 try:
     from torch.distributed import DeviceMesh
 except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
@@ -23,7 +25,9 @@ from ._core.tp import is_tp_sharded
 logger = logging.getLogger(__name__)
 
 
-def _find_parent_module(model: nn.Module, target_param: nn.Parameter) -> tuple[nn.Module, str]:
+def _find_parent_module(
+    model: nn.Module, target_param: nn.Parameter
+) -> tuple[nn.Module, str]:
     """Find the direct parent module and param name for a parameter."""
     for module_name, module in model.named_modules():
         for param_name, param in module.named_parameters(recurse=False):
@@ -32,7 +36,9 @@ def _find_parent_module(model: nn.Module, target_param: nn.Parameter) -> tuple[n
     raise ValueError(f"Parameter not found in model: {target_param.shape}")
 
 
-def _find_parent_modules(model: nn.Module, target_param: nn.Parameter) -> list[tuple[nn.Module, str]]:
+def _find_parent_modules(
+    model: nn.Module, target_param: nn.Parameter
+) -> list[tuple[nn.Module, str]]:
     """Find all direct module attributes that reference a parameter.
 
     Tied embeddings expose the same ``nn.Parameter`` through multiple parent
@@ -216,6 +222,44 @@ AssignmentGroupKeyFn = Callable[[str, nn.Parameter], Optional[str]]
 RouteHintFn = Callable[[str, nn.Parameter], Optional[str]]
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean flag, got {value!r}")
+
+
+def _resolve_owner_strategy(owner_strategy: Optional[str]) -> str:
+    resolved = owner_strategy or os.environ.get("DMUON_OWNER_STRATEGY", "lpt")
+    if resolved not in {"lpt", "round_robin", "rank0"}:
+        raise ValueError(
+            f"Unsupported owner_strategy: {resolved!r}; "
+            "expected 'lpt', 'round_robin', or 'rank0'."
+        )
+    return resolved
+
+
+def _resolve_owner_cost_model(owner_cost_model: Optional[str]) -> str:
+    resolved = owner_cost_model or os.environ.get("DMUON_OWNER_COST_MODEL", "optimizer")
+    if resolved not in {"optimizer", "numel"}:
+        raise ValueError(
+            f"Unsupported owner_cost_model: {resolved!r}; "
+            "expected 'optimizer' or 'numel'."
+        )
+    return resolved
+
+
+def _resolve_owner_pack_small_params(pack_small_params: Optional[bool]) -> bool:
+    if pack_small_params is None:
+        return _env_flag("DMUON_OWNER_PACK_SMALL_PARAMS", True)
+    return bool(pack_small_params)
+
+
 def _resolve_hook_module(
     model: nn.Module,
     target_param: nn.Parameter,
@@ -246,9 +290,7 @@ def _resolve_hook_module(
         assert module is not None
         return module
 
-    layer_module, _parent_module, _param_name = _find_layer_module(
-        model, target_param
-    )
+    layer_module, _parent_module, _param_name = _find_layer_module(model, target_param)
     return layer_module
 
 
@@ -265,7 +307,10 @@ def dedicate_params(
     assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
     route_hint_fn: Optional[RouteHintFn] = None,
     max_owners_per_group: Optional[int] = None,
-    owner_strategy: str = "lpt",
+    owner_strategy: Optional[str] = None,
+    owner_cost_model: Optional[str] = None,
+    hsdp_column_balance: Optional[bool] = None,
+    pack_small_params: Optional[bool] = None,
     tp_buffer_reuse: bool | str = False,
     replicate_broadcast_bucket_mb: float = 0.0,
     muon_forward_unshard: str = "broadcast",
@@ -351,7 +396,20 @@ def dedicate_params(
             assignment group.
         owner_strategy: DP/HSDP owner assignment strategy. ``"lpt"`` is the
             production default; ``"round_robin"`` and ``"rank0"`` are intended
-            for benchmark ablations.
+            for benchmark ablations. When omitted, ``DMUON_OWNER_STRATEGY`` can
+            override the default ``"lpt"`` for benchmark jobs.
+        owner_cost_model: LPT cost model. ``"optimizer"`` uses shape-aware
+            matrix optimizer cost plus footprint. ``"numel"`` is a diagnostic
+            numel-only ablation. When omitted, ``DMUON_OWNER_COST_MODEL`` can
+            override the default ``"optimizer"`` for benchmark jobs.
+        hsdp_column_balance: Whether HSDP LPT should balance shard-column load
+            before per-owner load. Disable only for placement ablations. When
+            omitted, ``DMUON_HSDP_COLUMN_BALANCE`` can override the default
+            ``True``.
+        pack_small_params: Whether same-layer small parameters are merged into
+            packed allocation units before owner assignment. Disable only for
+            true per-matrix baseline jobs. When omitted,
+            ``DMUON_OWNER_PACK_SMALL_PARAMS`` can override the default ``True``.
         tp_buffer_reuse: Optional TP gather/scatter scratch-buffer reuse policy.
             Accepts ``False``/``True`` or ``"gather"``, ``"scatter"``, ``"all"``.
         replicate_broadcast_bucket_mb: Optional HSDP post-step publish bucket
@@ -380,12 +438,25 @@ def dedicate_params(
     #    carries ``dp_owners`` with the same int / tuple shape as pre-TP
     #    code plus a sparse ``tp_owners`` dict populated only for the
     #    subset of params that are TP-sharded DTensors).
+    owner_strategy = _resolve_owner_strategy(owner_strategy)
+    owner_cost_model = _resolve_owner_cost_model(owner_cost_model)
+    hsdp_column_balance = (
+        _env_flag("DMUON_HSDP_COLUMN_BALANCE", True)
+        if hsdp_column_balance is None
+        else bool(hsdp_column_balance)
+    )
+    pack_small_params = _resolve_owner_pack_small_params(pack_small_params)
     result = compute_balanced_assignment(
-        model, mesh, predicate,
+        model,
+        mesh,
+        predicate,
         replicate_mesh=replicate_mesh,
         owner_strategy=owner_strategy,
         assignment_group_key_fn=assignment_group_key_fn,
         max_owners_per_group=max_owners_per_group,
+        owner_cost_model=owner_cost_model,
+        hsdp_column_balance=hsdp_column_balance,
+        pack_small_params=pack_small_params,
     )
     assignment = result.dp_owners
     if not assignment:
@@ -428,6 +499,10 @@ def dedicate_params(
     logger.info(
         f"dedicate_params[{mode}]: {len(normalized)} params over {total_slots} "
         f"owner slots (shard={shard_size}, replicate={replicate_size}), "
+        f"owner_strategy={owner_strategy}, owner_cost_model={owner_cost_model}, "
+        f"pack_small_params={pack_small_params}, "
+        f"allocation_units={result.allocation_unit_count}, "
+        f"packed_units={result.packed_allocation_unit_count}, "
         f"imbalance={imbalance:.1%}, loads={loads_list}{tp_tag}"
     )
 
@@ -467,10 +542,7 @@ def dedicate_params(
                 hook_boundary_resolver=hook_boundary_resolver,
                 strict=hook_boundary_strict,
             )
-        if (
-            is_tp_sharded(param, dp_mesh_dim_names)
-            and param not in result.tp_owners
-        ):
+        if is_tp_sharded(param, dp_mesh_dim_names) and param not in result.tp_owners:
             raise RuntimeError(
                 f"{param_name}: TP-sharded dedicated parameter is missing "
                 "from AssignmentResult.tp_owners"
@@ -494,10 +566,7 @@ def dedicate_params(
             ),
             muon_forward_unshard=muon_forward_unshard,
         )
-        aliases = [
-            (module, name)
-            for module, name in parent_modules[1:]
-        ]
+        aliases = [(module, name) for module, name in parent_modules[1:]]
         if aliases:
             d_param._alias_modules = aliases
             for alias_module, alias_name in aliases:
@@ -505,7 +574,9 @@ def dedicate_params(
         layer_to_dparams[layer_module].append(d_param)
 
     all_states: list[DedicatedState] = []
-    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
+    module_fqns = {
+        id(module): name or "<root>" for name, module in model.named_modules()
+    }
     for layer_module, d_params in layer_to_dparams.items():
         group = DedicatedParamGroup(
             d_params,
@@ -537,7 +608,9 @@ def dedicate_params_ddp(
     hook_boundary_resolver: Optional[HookBoundaryResolver] = None,
     assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
     max_owners_per_group: Optional[int] = None,
-    owner_strategy: str = "lpt",
+    owner_strategy: Optional[str] = None,
+    owner_cost_model: Optional[str] = None,
+    pack_small_params: Optional[bool] = None,
 ) -> dict[nn.Parameter, int]:
     """DDP-path variant of :func:`dedicate_params`.
 
@@ -572,6 +645,8 @@ def dedicate_params_ddp(
         assignment_group_key_fn: Same as :func:`dedicate_params`.
         max_owners_per_group: Same as :func:`dedicate_params`.
         owner_strategy: Same as :func:`dedicate_params`.
+        owner_cost_model: Same as :func:`dedicate_params`.
+        pack_small_params: Same as :func:`dedicate_params`.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its owner
@@ -583,6 +658,9 @@ def dedicate_params_ddp(
             "For HSDP use dedicate_params + fully_shard with replicate_mesh."
         )
 
+    owner_strategy = _resolve_owner_strategy(owner_strategy)
+    owner_cost_model = _resolve_owner_cost_model(owner_cost_model)
+    pack_small_params = _resolve_owner_pack_small_params(pack_small_params)
     result = compute_balanced_assignment(
         model,
         mesh,
@@ -590,6 +668,8 @@ def dedicate_params_ddp(
         owner_strategy=owner_strategy,
         assignment_group_key_fn=assignment_group_key_fn,
         max_owners_per_group=max_owners_per_group,
+        owner_cost_model=owner_cost_model,
+        pack_small_params=pack_small_params,
     )
     assignment = result.dp_owners
     if not assignment:
@@ -617,6 +697,10 @@ def dedicate_params_ddp(
     imbalance = (max_load - min_load) / max(max_load, 1)
     logger.info(
         f"dedicate_params_ddp: {len(normalized)} params over {shard_size} ranks, "
+        f"owner_strategy={owner_strategy}, owner_cost_model={owner_cost_model}, "
+        f"pack_small_params={pack_small_params}, "
+        f"allocation_units={result.allocation_unit_count}, "
+        f"packed_units={result.packed_allocation_unit_count}, "
         f"imbalance={imbalance:.1%}, loads={loads_list}"
     )
 
@@ -658,7 +742,9 @@ def dedicate_params_ddp(
         layer_to_dparams[layer_module].append(d_param)
 
     all_states: list[DedicatedState] = []
-    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
+    module_fqns = {
+        id(module): name or "<root>" for name, module in model.named_modules()
+    }
     for layer_module, d_params in layer_to_dparams.items():
         group = DedicatedParamGroupDDP(d_params, comm_ctx)
         group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
@@ -689,7 +775,9 @@ def dedicate_params_ddp_tp(
     hook_boundary_resolver: Optional[HookBoundaryResolver] = None,
     assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
     max_owners_per_group: Optional[int] = None,
-    owner_strategy: str = "lpt",
+    owner_strategy: Optional[str] = None,
+    owner_cost_model: Optional[str] = None,
+    pack_small_params: Optional[bool] = None,
     tp_buffer_reuse: bool | str = False,
 ) -> dict[nn.Parameter, int]:
     """DDP-path variant that allows TP-sharded DTensor dedicated params.
@@ -712,6 +800,9 @@ def dedicate_params_ddp_tp(
             f"dedicate_params_ddp_tp requires a 1D DP mesh; got ndim={mesh.ndim}."
         )
 
+    owner_strategy = _resolve_owner_strategy(owner_strategy)
+    owner_cost_model = _resolve_owner_cost_model(owner_cost_model)
+    pack_small_params = _resolve_owner_pack_small_params(pack_small_params)
     result = compute_balanced_assignment(
         model,
         mesh,
@@ -719,6 +810,8 @@ def dedicate_params_ddp_tp(
         owner_strategy=owner_strategy,
         assignment_group_key_fn=assignment_group_key_fn,
         max_owners_per_group=max_owners_per_group,
+        owner_cost_model=owner_cost_model,
+        pack_small_params=pack_small_params,
     )
     assignment = result.dp_owners
     if not assignment:
@@ -742,6 +835,10 @@ def dedicate_params_ddp_tp(
     logger.info(
         f"dedicate_params_ddp_tp: {len(normalized)} params over {shard_size} "
         f"DP ranks, TP-sharded={len(result.tp_owners)}, "
+        f"owner_strategy={owner_strategy}, owner_cost_model={owner_cost_model}, "
+        f"pack_small_params={pack_small_params}, "
+        f"allocation_units={result.allocation_unit_count}, "
+        f"packed_units={result.packed_allocation_unit_count}, "
         f"imbalance={imbalance:.1%}, loads={loads_list}"
     )
 
@@ -771,10 +868,7 @@ def dedicate_params_ddp_tp(
             hook_boundary_resolver=hook_boundary_resolver,
             strict=hook_boundary_strict,
         )
-        if (
-            is_tp_sharded(param, dp_mesh_dim_names)
-            and param not in result.tp_owners
-        ):
+        if is_tp_sharded(param, dp_mesh_dim_names) and param not in result.tp_owners:
             raise RuntimeError(
                 f"{param_name}: TP-sharded DDP+TP dedicated parameter is "
                 "missing from AssignmentResult.tp_owners"
@@ -794,7 +888,9 @@ def dedicate_params_ddp_tp(
         layer_to_dparams[layer_module].append(d_param)
 
     all_states: list[DedicatedState] = []
-    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
+    module_fqns = {
+        id(module): name or "<root>" for name, module in model.named_modules()
+    }
     for layer_module, d_params in layer_to_dparams.items():
         group = DedicatedParamGroupDDP(d_params, comm_ctx)
         group._debug_name = module_fqns.get(id(layer_module), "<unknown>")

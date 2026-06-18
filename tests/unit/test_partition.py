@@ -2,7 +2,10 @@
 
 import os
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 import pytest
 import torch
@@ -33,7 +36,10 @@ class FakeDeviceMesh:
 
 def test_extract_layer_id_standard():
     assert _extract_layer_id("model.layers.3.mlp.gate_proj.weight") == "model.layers.3"
-    assert _extract_layer_id("model.layers.12.self_attn.q_proj.weight") == "model.layers.12"
+    assert (
+        _extract_layer_id("model.layers.12.self_attn.q_proj.weight")
+        == "model.layers.12"
+    )
 
 
 def test_extract_layer_id_no_layer():
@@ -83,7 +89,10 @@ class MiniModel(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(1000, hidden)
         self.layers = nn.ModuleDict(
-            {str(i): MiniTransformerBlock(hidden, intermediate) for i in range(num_layers)}
+            {
+                str(i): MiniTransformerBlock(hidden, intermediate)
+                for i in range(num_layers)
+            }
         )
         self.norm = nn.LayerNorm(hidden)
 
@@ -102,7 +111,9 @@ def model():
 def test_assignment_covers_all_proj(model):
     """All proj params should be assigned."""
     mesh = FakeDeviceMesh(8)
-    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(
+        model, mesh, predicate=lambda n, p: "proj" in n
+    )
     assignment = result.dp_owners
     proj_params = [p for n, p in model.named_parameters() if "proj" in n]
     assert len(assignment) == len(proj_params)
@@ -113,7 +124,9 @@ def test_assignment_covers_all_proj(model):
 def test_assignment_excludes_non_proj(model):
     """Non-proj params (embed, layernorm) should NOT be assigned."""
     mesh = FakeDeviceMesh(8)
-    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(
+        model, mesh, predicate=lambda n, p: "proj" in n
+    )
     assignment = result.dp_owners
     for n, p in model.named_parameters():
         if "proj" not in n:
@@ -123,7 +136,9 @@ def test_assignment_excludes_non_proj(model):
 def test_balance(model):
     """Rank loads should be balanced within 5%."""
     mesh = FakeDeviceMesh(8)
-    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(
+        model, mesh, predicate=lambda n, p: "proj" in n
+    )
     assignment = result.dp_owners
     rank_loads = [0] * 8
     for param, rank in assignment.items():
@@ -168,10 +183,34 @@ def test_shape_aware_cost_weights_projection_compute_above_embedding_bytes():
     proj = nn.Parameter(torch.empty(4096, 4096, device="meta"))
 
     assert embed.numel() > proj.numel()
-    assert (
-        _matrix_optimizer_cost_units("model.layers.0.self_attn.q_proj.weight", proj)
-        > _matrix_optimizer_cost_units("model.embed_tokens.weight", embed)
-    )
+    assert _matrix_optimizer_cost_units(
+        "model.layers.0.self_attn.q_proj.weight", proj
+    ) > _matrix_optimizer_cost_units("model.embed_tokens.weight", embed)
+
+
+def test_owner_cost_model_ablation_changes_lpt_order():
+    mesh = FakeDeviceMesh(2)
+    model = nn.Module()
+    model.embed_tokens = nn.Embedding(65536, 1024, device="meta")
+    model.proj = nn.Linear(4096, 4096, bias=False, device="meta")
+
+    numel_assignment = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate=lambda _n, _p: True,
+        owner_cost_model="numel",
+    ).dp_owners
+    optimizer_assignment = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate=lambda _n, _p: True,
+        owner_cost_model="optimizer",
+    ).dp_owners
+
+    assert numel_assignment[model.embed_tokens.weight] == 0
+    assert numel_assignment[model.proj.weight] == 1
+    assert optimizer_assignment[model.proj.weight] == 0
+    assert optimizer_assignment[model.embed_tokens.weight] == 1
 
 
 def test_unknown_owner_strategy_rejected(model):
@@ -186,10 +225,24 @@ def test_unknown_owner_strategy_rejected(model):
         )
 
 
+def test_unknown_owner_cost_model_rejected(model):
+    mesh = FakeDeviceMesh(8)
+
+    with pytest.raises(ValueError, match="Unsupported owner_cost_model"):
+        compute_balanced_assignment(
+            model,
+            mesh,
+            predicate=lambda n, p: "proj" in n,
+            owner_cost_model="bogus",
+        )
+
+
 def test_same_layer_different_ranks(model):
     """Large params in the same layer should go to different ranks."""
     mesh = FakeDeviceMesh(8)
-    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(
+        model, mesh, predicate=lambda n, p: "proj" in n
+    )
     assignment = result.dp_owners
     # Check layer 0
     layer0_large = {}
@@ -199,9 +252,9 @@ def test_same_layer_different_ranks(model):
 
     # All large params in the same layer should have different owner ranks
     ranks = list(layer0_large.values())
-    assert len(ranks) == len(set(ranks)), (
-        f"Same-layer large params assigned to same rank: {layer0_large}"
-    )
+    assert len(ranks) == len(
+        set(ranks)
+    ), f"Same-layer large params assigned to same rank: {layer0_large}"
 
 
 def test_max_owners_per_assignment_group_caps_owner_spread():
@@ -243,7 +296,9 @@ def test_max_owners_per_assignment_group_rejects_non_positive():
 def test_small_params_merged(model):
     """Small params (k_proj, v_proj) in the same layer should share owner."""
     mesh = FakeDeviceMesh(8)
-    result = compute_balanced_assignment(model, mesh, predicate=lambda n, p: "proj" in n)
+    result = compute_balanced_assignment(
+        model, mesh, predicate=lambda n, p: "proj" in n
+    )
     assignment = result.dp_owners
     for layer_idx in range(4):
         k_params = [
@@ -265,3 +320,38 @@ def test_small_params_merged(model):
                     f"Layer {layer_idx}: k_proj→rank{k_rank}, v_proj→rank{v_rank}, "
                     "expected same owner for small params"
                 )
+
+
+def test_pack_small_params_can_disable_same_layer_merge():
+    """True RR baselines must assign original matrices, not packed units."""
+    mesh = FakeDeviceMesh(8)
+    model = MiniModel(num_layers=1, hidden=512, intermediate=2048)
+    proj_params = [
+        p
+        for name, p in model.named_parameters()
+        if "layers.0" in name and "proj" in name
+    ]
+
+    packed = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate=lambda n, p: "proj" in n,
+        owner_strategy="round_robin",
+    )
+    no_pack = compute_balanced_assignment(
+        model,
+        mesh,
+        predicate=lambda n, p: "proj" in n,
+        owner_strategy="round_robin",
+        pack_small_params=False,
+    )
+
+    assert packed.allocation_unit_count == 1
+    assert packed.packed_allocation_unit_count == 1
+    assert packed.pack_small_params is True
+    assert len(set(packed.dp_owners[p] for p in proj_params)) == 1
+
+    assert no_pack.allocation_unit_count == len(proj_params)
+    assert no_pack.packed_allocation_unit_count == 0
+    assert no_pack.pack_small_params is False
+    assert len(set(no_pack.dp_owners[p] for p in proj_params)) > 1

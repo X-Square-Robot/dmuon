@@ -14,6 +14,7 @@ object across both forward and the subsequent re-unshard, so nothing has to
 be transferred.
 """
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -39,6 +40,18 @@ except ImportError:
 def _is_backward_pass() -> bool:
     """Check if we are inside a backward pass (used to guard AC recompute)."""
     return torch._C._current_graph_task_id() != -1
+
+
+def _defer_sharded_adamw_reduce_to_root() -> bool:
+    value = os.environ.get("DMUON_DEFER_SHARDED_ADAMW_REDUCE_TO_ROOT", "1")
+    return value not in {"", "0", "false", "False", "FALSE"}
+
+
+def _group_has_sharded_adamw(group: object) -> bool:
+    return any(
+        bool(getattr(p, "uses_sharded_adamw", lambda: False)())
+        for p in getattr(group, "params", ())
+    )
 
 
 class _DedicatedPreBackward(torch.autograd.Function):
@@ -141,8 +154,8 @@ class DedicatedState:
         # ``_pre_forward_wait`` is a no-op when the group is idle
         # (1D mode or already-consumed event).
         self.group._pre_forward_wait()
-        self.group.unshard()            # no-op if already unsharded or prefetched
-        self.group.wait_for_unshard()   # no-op if already unsharded
+        self.group.unshard()  # no-op if already unsharded or prefetched
+        self.group.wait_for_unshard()  # no-op if already unsharded
         # Forward prefetch: dispatch next layer's unshard (no wait).
         # During activation-checkpoint recompute this hook runs inside backward;
         # the next forward layer is not the next layer consumed by backward.
@@ -204,6 +217,14 @@ class DedicatedState:
         """
         if self.group._post_backward_fired:
             return
+        # Sharded AdamW clears full grads while materializing optimizer shards.
+        # Run it only from the root callback so every autograd edge has finished.
+        if (
+            _defer_sharded_adamw_reduce_to_root()
+            and _group_has_sharded_adamw(self.group)
+            and not bool(getattr(self.comm_ctx, "_in_root_post_backward", False))
+        ):
+            return
         prev = self.comm_ctx.last_reduced_group
         if prev is not None and prev is not self.group:
             wait_stage1 = getattr(prev, "wait_for_stage1_reduce", None)
@@ -249,7 +270,7 @@ class DedicatedState:
         for i, obj in enumerate(args):
             if isinstance(obj, torch.Tensor) and obj.requires_grad:
                 wrapped = _DedicatedPostBackward.apply(self, obj)[0]
-                new_args = args[:i] + (wrapped,) + args[i + 1:]
+                new_args = args[:i] + (wrapped,) + args[i + 1 :]
                 return new_args, kwargs
         # Scan kwargs top level
         for k, obj in kwargs.items():
@@ -276,7 +297,7 @@ class DedicatedState:
             for i, obj in enumerate(output):
                 if isinstance(obj, torch.Tensor) and obj.requires_grad:
                     wrapped = _DedicatedPreBackward.apply(self, obj)[0]
-                    return output[:i] + (wrapped,) + output[i + 1:]
+                    return output[:i] + (wrapped,) + output[i + 1 :]
         elif isinstance(output, list):
             for i, obj in enumerate(output):
                 if isinstance(obj, torch.Tensor) and obj.requires_grad:
@@ -317,6 +338,7 @@ def _root_post_backward_final_callback(comm_ctx: DedicatedCommContext) -> None:
     drain in step 2 has to run *after* all dispatches are in flight.
     """
     try:
+        comm_ctx._in_root_post_backward = True
         for state in comm_ctx.all_states:
             if state.group._post_backward_fired:
                 continue
@@ -330,4 +352,5 @@ def _root_post_backward_final_callback(comm_ctx: DedicatedCommContext) -> None:
                 state.group.wait_for_reduce()
         comm_ctx.last_reduced_group = None
     finally:
+        comm_ctx._in_root_post_backward = False
         comm_ctx.post_backward_final_callback_queued = False

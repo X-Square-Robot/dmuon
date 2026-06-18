@@ -86,6 +86,7 @@ plugins:
             Core Concepts: 核心概念
             User Guide: 使用指南
             Training: 训练流程
+            Pure DMuon Routing: Pure DMuon 路由
             HSDP (Multi-Node): HSDP 训练（多机）
             Custom Hook Boundaries: 自定义 Hook 边界
             Z2 vs Z3 Modes: Z2 与 Z3 模式
@@ -151,6 +152,7 @@ nav:
     - Core Concepts: getting-started/concepts.md
   - User Guide:
     - Training: guides/training.md
+    - Pure DMuon Routing: guides/pure-dmuon-routing.md
     - HSDP (Multi-Node): guides/hsdp.md
     - Custom Hook Boundaries: guides/custom-hook-boundaries.md
     - Z2 vs Z3 Modes: guides/z2-z3-modes.md

@@ -99,8 +99,8 @@ class Muon(Optimizer):
             to full-scatter byte ratio allowed by the ``"beneficial"`` policy.
         first_step_progress_log: Print a small number of first optimizer step
             progress messages on owner ranks. This makes one-time NS/SYRK
-            per-shape dispatch or autotune visible in cluster logs.
-        first_step_progress_log_limit: Maximum number of per-shape first-step
+            per-parameter dispatch or autotune visible in cluster logs.
+        first_step_progress_log_limit: Maximum number of per-parameter first-step
             progress messages to print per rank.
 
     Example::
@@ -179,9 +179,7 @@ class Muon(Optimizer):
         self._post_step_prefetch_sharded_adamw = bool(post_step_prefetch_sharded_adamw)
         self._optimizer_step_index = 0
         self._first_step_progress_log = bool(first_step_progress_log)
-        self._first_step_progress_log_limit = max(
-            0, int(first_step_progress_log_limit)
-        )
+        self._first_step_progress_log_limit = max(0, int(first_step_progress_log_limit))
         self._first_step_logged_shapes: set[tuple[object, ...]] = set()
 
         # Discover all dedicated params, and the subset owned by this rank.
@@ -207,6 +205,9 @@ class Muon(Optimizer):
                     self._all_dedicated_params.append(dp)
                     if dp.is_owner:
                         self._dedicated_params.append(dp)
+        self._dedicated_param_fqns_by_id = self._compute_dedicated_param_fqns(
+            model, self._all_dedicated_params
+        )
         self._has_tp_dedicated = any(
             getattr(dp, "tp_group", None) is not None
             for dp in self._all_dedicated_params
@@ -216,15 +217,15 @@ class Muon(Optimizer):
                 dp.__class__.__name__ == "DedicatedParamDDP"
                 and getattr(dp, "tp_group", None) is not None
             )
-            or getattr(getattr(dp, "_orig_param", None), "_dedicated_mode", None) == "ddp_tp"
+            or getattr(getattr(dp, "_orig_param", None), "_dedicated_mode", None)
+            == "ddp_tp"
             for dp in self._all_dedicated_params
         )
-        self._has_hsdp_sharded_muon_forward = (
-            getattr(self._comm_ctx, "replicate_group", None) is not None
-            and any(
-                getattr(dp, "uses_sharded_muon_forward", lambda: False)()
-                for dp in self._all_dedicated_params
-            )
+        self._has_hsdp_sharded_muon_forward = getattr(
+            self._comm_ctx, "replicate_group", None
+        ) is not None and any(
+            getattr(dp, "uses_sharded_muon_forward", lambda: False)()
+            for dp in self._all_dedicated_params
         )
         if self._has_hsdp_sharded_muon_forward:
             # HSDP sharded-Muon publish has a two-stage post-step dependency:
@@ -339,6 +340,30 @@ class Muon(Optimizer):
                 adamw_count += 1
         return muon_count, adamw_count, len(shape_keys)
 
+    @staticmethod
+    def _compute_dedicated_param_fqns(
+        model: nn.Module, dedicated_params
+    ) -> dict[int, str]:
+        module_to_fqn = {id(mod): name for name, mod in model.named_modules()}
+        result: dict[int, str] = {}
+        for dp in dedicated_params:
+            raw_name = getattr(dp, "param_name", None) or getattr(
+                getattr(dp, "_orig_param", None), "_dmuon_name", "<unnamed>"
+            )
+            param_name = str(raw_name)
+            prefix = module_to_fqn.get(id(getattr(dp, "module", None)), "")
+            result[id(dp)] = f"{prefix}.{param_name}" if prefix else param_name
+        return result
+
+    def _dedicated_param_display_name(self, dp) -> str:
+        name = self._dedicated_param_fqns_by_id.get(id(dp))
+        if name:
+            return name
+        raw_name = getattr(dp, "param_name", None) or getattr(
+            getattr(dp, "_orig_param", None), "_dmuon_name", "<unnamed>"
+        )
+        return str(raw_name)
+
     def _first_step_progress_begin(self) -> Optional[float]:
         if self._optimizer_step_index != 0:
             return None
@@ -353,7 +378,7 @@ class Muon(Optimizer):
             kernel_msg = f", ns_kernel={kernel}" if kernel is not None else ""
             self._first_step_log(
                 "first optimizer step started; one-time NS/SYRK "
-                "per-shape backend dispatch or autotune may run now "
+                "per-parameter backend dispatch or autotune may run now "
                 f"(owned_muon_params={muon_count}, "
                 f"owned_adamw_params={adamw_count}, "
                 f"unique_muon_shapes={unique_muon_shapes}, "
@@ -394,7 +419,9 @@ class Muon(Optimizer):
             return
         shape = tuple(int(dim) for dim in tensor.shape)
         kernel = getattr(getattr(self._ns, "kernel", None), "value", None)
-        key = (path, shape, str(tensor.dtype), self._ns.backend, kernel)
+        param_name = self._dedicated_param_display_name(dp)
+        route = getattr(dp, "_dmuon_route", "muon")
+        key = (path, param_name, shape, str(tensor.dtype), self._ns.backend, kernel)
         if key in self._first_step_logged_shapes:
             return
         if len(self._first_step_logged_shapes) >= self._first_step_progress_log_limit:
@@ -405,13 +432,10 @@ class Muon(Optimizer):
             gram_dim = min(shape[0], shape[1])
         else:
             gram_dim = shape[0] if shape else 0
-        param_name = getattr(dp, "param_name", None) or getattr(
-            getattr(dp, "_orig_param", None), "_dmuon_name", "<unnamed>"
-        )
         kernel_msg = f", ns_kernel={kernel}" if kernel is not None else ""
         self._first_step_log(
             "first optimizer step is entering NS/backend dispatch "
-            f"for path={path}, param={param_name}, shape={shape}, "
+            f"for path={path}, param={param_name}, route={route}, shape={shape}, "
             f"gram_dim={gram_dim}, dtype={tensor.dtype}, "
             f"ns_backend={self._ns.backend}{kernel_msg}"
         )
@@ -476,6 +500,13 @@ class Muon(Optimizer):
                 f"'adamw', or 'sharded_adamw', got {route!r}"
             )
         return route
+
+    @staticmethod
+    def _group_has_dedicated_route_override(group: dict) -> bool:
+        return any(
+            key in group
+            for key in ("dmuon_route", "dmuon_optimizer", "matrix_optimizer")
+        )
 
     @staticmethod
     def _dedicated_adamw_updates_on_this_rank(dp) -> bool:
@@ -769,7 +800,11 @@ class Muon(Optimizer):
             owned_adamw_dps = []
             all_adamw_dps = []
             adamw_params: list[nn.Parameter] = []
-            dedicated_route = self._dedicated_route_for_group(user_group)
+            dedicated_route_override = (
+                self._dedicated_route_for_group(user_group)
+                if self._group_has_dedicated_route_override(user_group)
+                else None
+            )
 
             for param in raw_params:
                 if not isinstance(param, torch.Tensor):
@@ -795,6 +830,13 @@ class Muon(Optimizer):
                             f"param_groups: {assigned[assignment_key]} and {semantic_name}"
                         )
                     assigned[assignment_key] = semantic_name
+                    dedicated_route = (
+                        dedicated_route_override
+                        if dedicated_route_override is not None
+                        else self._dedicated_route_for_group(
+                            {"dmuon_route": getattr(dp, "_dmuon_route", "muon")}
+                        )
+                    )
                     if dedicated_route == "muon":
                         dp._dmuon_route = "muon"
                         dp._dmuon_adamw_replicate_allreduce = False
@@ -817,8 +859,7 @@ class Muon(Optimizer):
                         dp._dmuon_route = dedicated_route
                         dp._dmuon_adamw_replicate_allreduce = (
                             dedicated_route == "adamw"
-                            and
-                            self._dedicated_adamw_replicate_allreduce_requested()
+                            and self._dedicated_adamw_replicate_allreduce_requested()
                             and getattr(dp, "replicate_group", None) is not None
                         )
                         adamw_refs.append(param)
@@ -1079,12 +1120,14 @@ class Muon(Optimizer):
             )
             profile_token = self._profile_event_start("ns_compute")
             try:
-                factor_segments, actual_transposed, normalizer = gram_newton_schulz_factors(
-                    ns_input_full,
-                    steps=self._ns_steps,
-                    coefficients=self._ns.coefficients,
-                    restart_iterations=self._ns.restart_iterations,
-                    deterministic=self._ns.deterministic,
+                factor_segments, actual_transposed, normalizer = (
+                    gram_newton_schulz_factors(
+                        ns_input_full,
+                        steps=self._ns_steps,
+                        coefficients=self._ns.coefficients,
+                        restart_iterations=self._ns.restart_iterations,
+                        deterministic=self._ns.deterministic,
+                    )
                 )
                 for factor in factor_segments:
                     if factor.dtype != _TP_GRAM_FACTOR_WIRE_DTYPE:
@@ -1170,9 +1213,7 @@ class Muon(Optimizer):
         # Keep legacy profile key for older analysis scripts.
         self._profile_add("tp_gram_q_broadcast_numel", total_numel)
 
-    def _apply_tp_distributed_gram_descriptor(
-        self, desc: dict[str, object]
-    ) -> None:
+    def _apply_tp_distributed_gram_descriptor(self, desc: dict[str, object]) -> None:
         dp = desc["dp"]
         rows = desc["rows"]
         cols = desc["cols"]

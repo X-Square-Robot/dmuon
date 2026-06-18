@@ -33,6 +33,7 @@ _SYRK_CONFIGS = []
 try:
     from dmuon.kernels.syrk_sm80 import syrk_sm80 as _syrk_sm80_fn
     from dmuon.kernels.syrk_sm80 import SYRK_SM80_CONFIGS as _SYRK_CONFIGS
+
     HAS_SYRK = True
 except ImportError:
     pass
@@ -82,6 +83,7 @@ def get_backend_status() -> dict:
     Useful for programmatic checks and bug reports.
     """
     from dmuon.kernels.syrk_backends import get_backend_status as _status
+
     return _status()
 
 
@@ -158,6 +160,7 @@ def _get_legacy_cache_path() -> Path:
 
 _DTYPE_TO_STR = {torch.float16: "fp16", torch.bfloat16: "bf16", torch.float32: "fp32"}
 _STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
+_AUTOTUNE_RNG_SEED = 0xD00D5EED
 
 
 def _key_to_json(key: tuple) -> str:
@@ -194,7 +197,9 @@ def _migrate_legacy_cache_if_present() -> None:
         legacy.replace(backup)
         logger.info(
             "Migrated pre-B5 autotune cache %s → %s (backup: %s)",
-            legacy, new_path, backup,
+            legacy,
+            new_path,
+            backup,
         )
     except OSError as e:
         logger.debug("Could not migrate legacy cache: %s", e)
@@ -213,7 +218,9 @@ def _load_autotune_cache(backend: str = _DEFAULT_AUTOTUNE_BACKEND) -> None:
                 _syrk_autotune_cache[key] = tuple(v) if v is not None else None
             logger.info(
                 "Loaded %d autotune entries for backend=%s from %s",
-                len(data), backend, path,
+                len(data),
+                backend,
+                path,
             )
     except Exception as e:
         logger.debug("Could not load autotune cache for backend=%s: %s", backend, e)
@@ -257,9 +264,29 @@ def _bench_median(fn, warmup=5, repeat=20):
     return times[len(times) // 2]
 
 
-def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
-                    has_C: bool = False,
-                    backend: str = _DEFAULT_AUTOTUNE_BACKEND) -> tuple | None:
+def _autotune_generator(device: torch.device) -> torch.Generator:
+    gen = torch.Generator(device=device)
+    gen.manual_seed(_AUTOTUNE_RNG_SEED)
+    return gen
+
+
+def _autotune_randn(
+    *shape: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+) -> Tensor:
+    return torch.randn(*shape, device=device, dtype=dtype, generator=generator)
+
+
+def _autotune_syrk(
+    M: int,
+    K: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    has_C: bool = False,
+    backend: str = _DEFAULT_AUTOTUNE_BACKEND,
+) -> tuple | None:
     """Find best SYRK config for shape (M, K).  Returns ``(tile_m, tile_k,
     num_stages)`` or ``None`` if cuBLAS wins.
 
@@ -277,7 +304,11 @@ def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
     )
     started_at = _time.perf_counter()
 
-    X = torch.randn(M, K, device=device, dtype=dtype)
+    # Autotune runs inside the first optimizer step for cold shapes.  Keep its
+    # benchmark tensors on a private RNG so it cannot shift the training RNG
+    # stream used later by flow/noise sampling.
+    autotune_gen = _autotune_generator(device)
+    X = _autotune_randn(M, K, device=device, dtype=dtype, generator=autotune_gen)
     D = torch.empty(M, M, device=device, dtype=dtype)
 
     # cuBLAS baseline
@@ -286,8 +317,12 @@ def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
         f"for shape=({M}, {K}), dtype={dtype}, backend={backend}, has_C={has_C}"
     )
     if has_C:
-        C_mat = torch.randn(M, M, device=device, dtype=dtype)
-        t_cublas = _bench_median(lambda: torch.addmm(C_mat, X, X.T, alpha=0.5, beta=0.3))
+        C_mat = _autotune_randn(
+            M, M, device=device, dtype=dtype, generator=autotune_gen
+        )
+        t_cublas = _bench_median(
+            lambda: torch.addmm(C_mat, X, X.T, alpha=0.5, beta=0.3)
+        )
     else:
         t_cublas = _bench_median(lambda: torch.mm(X, X.T, out=D))
     _progress_log(
@@ -320,13 +355,27 @@ def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
         )
         try:
             if has_C:
-                C_mat2 = torch.randn(M, M, device=device, dtype=dtype)
+                C_mat2 = _autotune_randn(
+                    M, M, device=device, dtype=dtype, generator=autotune_gen
+                )
+
                 def bench_syrk(tm=tile_m, tk=tile_k, ns=num_stages):
-                    _syrk_sm80_fn(X, D, C=C_mat2, alpha=0.5, beta=0.3,
-                                  tile_m=tm, tile_k=tk, num_stages=ns)
+                    _syrk_sm80_fn(
+                        X,
+                        D,
+                        C=C_mat2,
+                        alpha=0.5,
+                        beta=0.3,
+                        tile_m=tm,
+                        tile_k=tk,
+                        num_stages=ns,
+                    )
+
             else:
+
                 def bench_syrk(tm=tile_m, tk=tile_k, ns=num_stages):
                     _syrk_sm80_fn(X, D, tile_m=tm, tile_k=tk, num_stages=ns)
+
             t = _bench_median(bench_syrk)
             _progress_log(
                 "SYRK autotune candidate finished "
@@ -368,9 +417,15 @@ def _autotune_syrk(M: int, K: int, device: torch.device, dtype: torch.dtype,
     return best_config
 
 
-def syrk_or_cublas(A: Tensor, D: Tensor, B: Tensor | None = None,
-                   C: Tensor | None = None, alpha: float = 1.0,
-                   beta: float = 1.0, diag_add: float = 0.0) -> None:
+def syrk_or_cublas(
+    A: Tensor,
+    D: Tensor,
+    B: Tensor | None = None,
+    C: Tensor | None = None,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    diag_add: float = 0.0,
+) -> None:
     """Symmetric GEMM with autotuned SYRK or cuBLAS fallback.
 
     Computes D = alpha * A @ B^T + beta * C + diag_add * I.
@@ -384,10 +439,19 @@ def syrk_or_cublas(A: Tensor, D: Tensor, B: Tensor | None = None,
     config = _autotune_syrk(M, K, A.device, A.dtype, has_C)
     if config is not None:
         tile_m, tile_k, num_stages = config
-        _syrk_sm80_fn(A, D, B=B, C=C, alpha=alpha, beta=beta,
-                       diag_add=diag_add,
-                       tile_m=tile_m, tile_k=tile_k, num_stages=num_stages,
-                       _symmetric=not is_true_syrk)
+        _syrk_sm80_fn(
+            A,
+            D,
+            B=B,
+            C=C,
+            alpha=alpha,
+            beta=beta,
+            diag_add=diag_add,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            num_stages=num_stages,
+            _symmetric=not is_true_syrk,
+        )
     else:
         # cuBLAS fallback
         if has_C:

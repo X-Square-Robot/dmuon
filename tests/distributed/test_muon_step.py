@@ -10,7 +10,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 import dmuon
 from torch.distributed.fsdp import fully_shard
@@ -30,6 +32,7 @@ def assert_global_positive_count(local_count, device, message):
 # ---------------------------------------------------------------------------
 # TinyModel
 # ---------------------------------------------------------------------------
+
 
 class MLP(nn.Module):
     def __init__(self, hidden=256, intermediate=1024):
@@ -70,13 +73,15 @@ class TinyModel(nn.Module):
 # Test 1: reduced grad is set on all owned dedicated params after backward
 # ---------------------------------------------------------------------------
 
+
 def test_muon_reduced_grad_all_set(rank, world_size, device, mesh):
 
     torch.manual_seed(0)
     model = TinyModel().to(device)
 
     dmuon.dedicate_params(
-        model, mesh,
+        model,
+        mesh,
         predicate=lambda n, p: "proj" in n and p.ndim == 2,
     )
 
@@ -94,15 +99,15 @@ def test_muon_reduced_grad_all_set(rank, world_size, device, mesh):
     dmuon.wait_all_reduces(model)
 
     for dp in optimizer._dedicated_params:
-        assert dp._reduced_grad is not None, (
-            f"Rank {rank}: _reduced_grad is None for param with shape {dp._orig_size}"
-        )
-        assert dp._reduced_grad.shape == dp._orig_size, (
-            f"Rank {rank}: shape mismatch {dp._reduced_grad.shape} vs {dp._orig_size}"
-        )
-        assert dp._reduced_grad.abs().max().item() > 0, (
-            f"Rank {rank}: _reduced_grad is all zeros for param with shape {dp._orig_size}"
-        )
+        assert (
+            dp._reduced_grad is not None
+        ), f"Rank {rank}: _reduced_grad is None for param with shape {dp._orig_size}"
+        assert (
+            dp._reduced_grad.shape == dp._orig_size
+        ), f"Rank {rank}: shape mismatch {dp._reduced_grad.shape} vs {dp._orig_size}"
+        assert (
+            dp._reduced_grad.abs().max().item() > 0
+        ), f"Rank {rank}: _reduced_grad is all zeros for param with shape {dp._orig_size}"
 
     torch.cuda.synchronize()
     log(rank, "PASSED: test_muon_reduced_grad_all_set")
@@ -112,13 +117,15 @@ def test_muon_reduced_grad_all_set(rank, world_size, device, mesh):
 # Test 2: momentum buffer accumulates correctly
 # ---------------------------------------------------------------------------
 
+
 def test_muon_momentum_accumulation(rank, world_size, device, mesh):
 
     torch.manual_seed(0)
     model = TinyModel().to(device)
 
     dmuon.dedicate_params(
-        model, mesh,
+        model,
+        mesh,
         predicate=lambda n, p: "proj" in n and p.ndim == 2,
     )
 
@@ -138,7 +145,10 @@ def test_muon_momentum_accumulation(rank, world_size, device, mesh):
     optimizer.step()
 
     if len(optimizer._dedicated_params) == 0:
-        log(rank, "PASSED: test_muon_momentum_accumulation (no owned params on this rank)")
+        log(
+            rank,
+            "PASSED: test_muon_momentum_accumulation (no owned params on this rank)",
+        )
         return
 
     dp = optimizer._dedicated_params[0]
@@ -153,9 +163,9 @@ def test_muon_momentum_accumulation(rank, world_size, device, mesh):
 
     dmuon.wait_all_reduces(model)
 
-    assert dp._reduced_grad is not None, (
-        f"Rank {rank}: _reduced_grad is None before step 2"
-    )
+    assert (
+        dp._reduced_grad is not None
+    ), f"Rank {rank}: _reduced_grad is None before step 2"
     grad2 = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1).clone()
 
     optimizer.step()
@@ -176,9 +186,10 @@ def test_muon_momentum_accumulation(rank, world_size, device, mesh):
     # Verify shape: buf should be 2D matching param reshaped
     expected_rows = dp._orig_size[0]
     expected_cols = dp._orig_size.numel() // expected_rows
-    assert buf2.shape == (expected_rows, expected_cols), (
-        f"Rank {rank}: buf shape {buf2.shape} != expected ({expected_rows}, {expected_cols})"
-    )
+    assert buf2.shape == (
+        expected_rows,
+        expected_cols,
+    ), f"Rank {rank}: buf shape {buf2.shape} != expected ({expected_rows}, {expected_cols})"
 
     torch.cuda.synchronize()
     log(rank, "PASSED: test_muon_momentum_accumulation")
@@ -187,6 +198,7 @@ def test_muon_momentum_accumulation(rank, world_size, device, mesh):
 # ---------------------------------------------------------------------------
 # Test 3: Nesterov momentum — NS receives grad + μ*buf, not just buf
 # ---------------------------------------------------------------------------
+
 
 def test_muon_nesterov(rank, world_size, device, mesh):
     """Verify Nesterov vs non-Nesterov produce different weight updates.
@@ -202,7 +214,9 @@ def test_muon_nesterov(rank, world_size, device, mesh):
     # --- Run with Nesterov=True ---
     torch.manual_seed(0)
     model1 = TinyModel().to(device)
-    dmuon.dedicate_params(model1, mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2)
+    dmuon.dedicate_params(
+        model1, mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2
+    )
     for layer in model1.layers:
         fully_shard(layer, mesh=mesh)
     fully_shard(model1, mesh=mesh)
@@ -217,7 +231,9 @@ def test_muon_nesterov(rank, world_size, device, mesh):
     # --- Run with Nesterov=False ---
     torch.manual_seed(0)
     model2 = TinyModel().to(device)
-    dmuon.dedicate_params(model2, mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2)
+    dmuon.dedicate_params(
+        model2, mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2
+    )
     for layer in model2.layers:
         fully_shard(layer, mesh=mesh)
     fully_shard(model2, mesh=mesh)
@@ -255,19 +271,24 @@ def test_muon_nesterov(rank, world_size, device, mesh):
     )
 
     torch.cuda.synchronize()
-    log(rank, f"PASSED: test_muon_nesterov (weight diff={diff:.6f}, buf diff={buf_diff:.2e})")
+    log(
+        rank,
+        f"PASSED: test_muon_nesterov (weight diff={diff:.6f}, buf diff={buf_diff:.2e})",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Test 4: PyTorch-style param_groups on FSDP2-wrapped model
 # ---------------------------------------------------------------------------
 
+
 def test_muon_param_groups_fsdp2(rank, world_size, device, mesh):
     torch.manual_seed(0)
     model = TinyModel().to(device)
 
     dmuon.dedicate_params(
-        model, mesh,
+        model,
+        mesh,
         predicate=lambda n, p: "proj" in n and p.ndim == 2,
     )
 
@@ -350,6 +371,86 @@ def test_muon_param_groups_fsdp2(rank, world_size, device, mesh):
 
     torch.cuda.synchronize()
     log(rank, "PASSED: test_muon_param_groups_fsdp2")
+
+
+def test_muon_param_groups_preserve_route_hints_fsdp2(rank, world_size, device, mesh):
+    torch.manual_seed(0)
+    model = TinyModel().to(device)
+
+    matrix_names = set()
+    for name, param in model.named_parameters():
+        if "proj" in name and param.ndim == 2:
+            matrix_names.add(name)
+
+    dmuon.dedicate_params(
+        model,
+        mesh,
+        predicate=lambda _n, p: p.requires_grad,
+        route_hint_fn=lambda n, _p: "muon" if n in matrix_names else "adamw",
+    )
+
+    params = [param for param in model.parameters() if param.requires_grad]
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh)
+    fully_shard(model, mesh=mesh)
+
+    optimizer = dmuon.Muon(
+        model,
+        lr=0.01,
+        ns_steps=2,
+        adamw_lr=0.001,
+        adamw_weight_decay=0.0,
+        param_groups=[
+            {
+                "params": params,
+                "group_name": "action",
+                "muon_lr": 0.02,
+                "adamw_lr": 0.002,
+                "adamw_weight_decay": 0.0,
+            },
+        ],
+    )
+
+    group_idx = {
+        group["group_name"]: idx for idx, group in enumerate(optimizer.param_groups)
+    }
+    action_muon_idx = group_idx["action/muon"]
+    action_adamw_idx = group_idx["action/adamw"]
+
+    muon_dps = [
+        dp
+        for dp in optimizer._all_dedicated_params
+        if optimizer._dp_to_muon_group_idx.get(id(dp)) == action_muon_idx
+    ]
+    adamw_dps = [
+        dp
+        for dp in optimizer._all_dedicated_params
+        if optimizer._dp_to_adamw_group_idx.get(id(dp)) == action_adamw_idx
+    ]
+    assert muon_dps, "expected route_hint_fn-selected Muon params"
+    assert adamw_dps, "expected route_hint_fn-selected AdamW params"
+    assert all(getattr(dp, "_dmuon_route", None) == "muon" for dp in muon_dps)
+    assert all(getattr(dp, "_dmuon_route", None) == "adamw" for dp in adamw_dps)
+
+    assert_global_positive_count(
+        len(optimizer._muon_group_dps[action_muon_idx]),
+        device,
+        "expected at least one rank to own action/muon params",
+    )
+    assert_global_positive_count(
+        len(optimizer._adamw_group_dps[action_adamw_idx]),
+        device,
+        "expected at least one rank to own action/adamw params",
+    )
+
+    optimizer.zero_grad()
+    x = torch.randn(4, 256, device=device)
+    loss = model(x)
+    loss.backward()
+    optimizer.step()
+
+    torch.cuda.synchronize()
+    log(rank, "PASSED: test_muon_param_groups_preserve_route_hints_fsdp2")
 
 
 def test_muon_all_trainable_type_split_fsdp2(rank, world_size, device, mesh):
@@ -553,8 +654,7 @@ def test_muon_all_trainable_type_split_hsdp(rank, world_size, device, mesh):
     ]
     assert adamw_dps, "expected dedicated AdamW-route params"
     assert all(
-        not getattr(dp, "_dmuon_adamw_replicate_allreduce", False)
-        for dp in adamw_dps
+        not getattr(dp, "_dmuon_adamw_replicate_allreduce", False) for dp in adamw_dps
     )
 
     torch.manual_seed(42)
@@ -603,9 +703,7 @@ def test_muon_all_trainable_type_split_hsdp(rank, world_size, device, mesh):
         and id(dp) in reloaded_optimizer.state
         and "exp_avg" in reloaded_optimizer.state[id(dp)]
     )
-    expected_reloaded_count = sum(
-        1 for dp in reloaded_adamw_dps if dp.is_owner
-    )
+    expected_reloaded_count = sum(1 for dp in reloaded_adamw_dps if dp.is_owner)
     assert restored_local_count == expected_reloaded_count, (
         f"restored local dedicated AdamW state count mismatch: "
         f"{restored_local_count} != {expected_reloaded_count}"
@@ -657,7 +755,9 @@ def test_muon_sharded_base_adamw_fsdp2(rank, world_size, device, mesh):
         if getattr(dp, "_dmuon_route", None) == "sharded_adamw"
     ]
     assert sharded_dps, "expected sharded AdamW-route dedicated params"
-    assert all(getattr(dp, "_sharded_adamw_data", None) is not None for dp in sharded_dps)
+    assert all(
+        getattr(dp, "_sharded_adamw_data", None) is not None for dp in sharded_dps
+    )
     assert all(id(dp) in optimizer._dp_to_adamw_group_idx for dp in sharded_dps)
 
     torch.manual_seed(42)
@@ -795,7 +895,9 @@ def test_muon_sharded_base_adamw_hsdp(rank, world_size, device, mesh):
         if getattr(dp, "_dmuon_route", None) == "sharded_adamw"
     ]
     assert sharded_dps, "expected sharded AdamW-route dedicated params"
-    assert all(getattr(dp, "_sharded_adamw_data", None) is not None for dp in sharded_dps)
+    assert all(
+        getattr(dp, "_sharded_adamw_data", None) is not None for dp in sharded_dps
+    )
 
     torch.manual_seed(42)
     x = torch.randn(4, 128, device=device)
@@ -822,6 +924,7 @@ def test_muon_sharded_base_adamw_hsdp(rank, world_size, device, mesh):
 # the current contract: TP-sharded dedicated params must complete a DMuon step
 # without falling back to the removed pre-T2 NotImplementedError guard.
 # ---------------------------------------------------------------------------
+
 
 def test_muon_tp_path(rank, world_size, device, mesh):
     assert world_size >= 4, "test_muon_tp_path requires at least 4 GPUs"
@@ -853,7 +956,8 @@ def test_muon_tp_path(rank, world_size, device, mesh):
         )
 
     dmuon.dedicate_params(
-        model, dp_mesh,
+        model,
+        dp_mesh,
         predicate=lambda n, p: "proj" in n and p.ndim == 2,
     )
 
@@ -864,12 +968,16 @@ def test_muon_tp_path(rank, world_size, device, mesh):
     optimizer = dmuon.Muon(model, lr=0.01, ns_steps=5, adamw_lr=0.01)
 
     # Verify TP params are flagged correctly
-    tp_params = [dp for dp in optimizer._dedicated_params if dp.is_dtensor and dp.tp_group is not None]
+    tp_params = [
+        dp
+        for dp in optimizer._dedicated_params
+        if dp.is_dtensor and dp.tp_group is not None
+    ]
     tp_count = torch.tensor([len(tp_params)], device=device)
     dist.all_reduce(tp_count)
-    assert tp_count.item() > 0, (
-        "No TP-aware dedicated params found (is_dtensor=True, tp_group≠None)"
-    )
+    assert (
+        tp_count.item() > 0
+    ), "No TP-aware dedicated params found (is_dtensor=True, tp_group≠None)"
 
     losses = []
     for step in range(2):
@@ -902,6 +1010,7 @@ if __name__ == "__main__":
     device = torch.device("cuda", rank)
 
     from torch.distributed.device_mesh import init_device_mesh
+
     mesh = init_device_mesh("cuda", (world_size,))
 
     test_name = sys.argv[1] if len(sys.argv) > 1 else "all"
@@ -911,6 +1020,9 @@ if __name__ == "__main__":
         "momentum": test_muon_momentum_accumulation,
         "nesterov": test_muon_nesterov,
         "param_groups_fsdp2": test_muon_param_groups_fsdp2,
+        "param_groups_preserve_route_hints_fsdp2": (
+            test_muon_param_groups_preserve_route_hints_fsdp2
+        ),
         "all_trainable_type_split_fsdp2": test_muon_all_trainable_type_split_fsdp2,
         "all_trainable_type_split_hsdp": test_muon_all_trainable_type_split_hsdp,
         "sharded_base_adamw_fsdp2": test_muon_sharded_base_adamw_fsdp2,

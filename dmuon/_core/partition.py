@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
 import torch.nn as nn
+
 try:
     from torch.distributed import DeviceMesh
 except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
@@ -35,6 +36,7 @@ SMALL_PARAM_THRESHOLD = 5_000_000
 OwnerCoord = Tuple[int, int]
 OwnerValue = Union[int, OwnerCoord]
 AssignmentGroupKeyFn = Callable[[str, nn.Parameter], Optional[str]]
+OwnerCostModel = str
 
 
 @dataclass
@@ -59,6 +61,15 @@ class AssignmentResult:
     tp_owners: dict[nn.Parameter, int] = field(default_factory=dict)
     """TP rank within the TP group, **only** populated for TP-sharded
     params.  Empty dict when no parameter is TP-sharded."""
+
+    allocation_unit_count: int = 0
+    """Number of DP/HSDP allocation units used by owner assignment."""
+
+    packed_allocation_unit_count: int = 0
+    """Number of allocation units containing more than one original param."""
+
+    pack_small_params: bool = True
+    """Whether small same-layer parameters were packed before assignment."""
 
     # ---- dict-like delegation over dp_owners (back-compat) ----
 
@@ -208,6 +219,9 @@ def compute_balanced_assignment(
     tp_owner_strategy: str = "lpt",
     assignment_group_key_fn: Optional[AssignmentGroupKeyFn] = None,
     max_owners_per_group: Optional[int] = None,
+    owner_cost_model: OwnerCostModel = "optimizer",
+    hsdp_column_balance: bool = True,
+    pack_small_params: bool = True,
 ) -> AssignmentResult:
     """Compute a globally balanced dedicated ownership assignment.
 
@@ -247,6 +261,16 @@ def compute_balanced_assignment(
         max_owners_per_group: Optional cap on distinct DP/HSDP owner slots used
             by one assignment group. This lets models trade some optimizer load
             balance for far fewer packed broadcasts at a layer/module boundary.
+        owner_cost_model: Cost model used by LPT. ``"optimizer"`` uses the
+            shape-aware matrix optimizer model plus numel footprint. ``"numel"``
+            is a diagnostic ablation that makes LPT behave like numel-only
+            balancing.
+        hsdp_column_balance: Whether HSDP LPT should balance shard-column load
+            before per-owner load. Disabling this is a diagnostic ablation for
+            measuring column-level endpoint pressure.
+        pack_small_params: Whether non-TP same-layer params smaller than
+            ``SMALL_PARAM_THRESHOLD`` are merged into one allocation unit.
+            Disable this only for true per-matrix owner-assignment baselines.
 
     Returns:
         ``AssignmentResult`` with ``dp_owners`` (shape matches pre-TP
@@ -272,6 +296,11 @@ def compute_balanced_assignment(
         )
     if max_owners_per_group is not None and max_owners_per_group <= 0:
         raise ValueError("max_owners_per_group must be positive when set")
+    if owner_cost_model not in {"optimizer", "numel"}:
+        raise ValueError(
+            f"Unsupported owner_cost_model: {owner_cost_model!r}; "
+            "expected 'optimizer' or 'numel'."
+        )
 
     dp_names: set[str] = set()
     if mesh.mesh_dim_names:
@@ -283,9 +312,9 @@ def compute_balanced_assignment(
     # Collect candidates grouped by layer
     param_names: dict[nn.Parameter, str] = {}
     param_order: dict[nn.Parameter, int] = {}
-    layer_params: dict[
-        Optional[str], list[tuple[nn.Parameter, str, int, int]]
-    ] = defaultdict(list)
+    layer_params: dict[Optional[str], list[tuple[nn.Parameter, str, int, int]]] = (
+        defaultdict(list)
+    )
     for order, (name, param) in enumerate(model.named_parameters()):
         if predicate(name, param):
             param_names[param] = name
@@ -296,31 +325,39 @@ def compute_balanced_assignment(
                 else _extract_layer_id(name)
             )
             tp_sharded = is_tp_sharded(param, dp_mesh_dim_names)
-            numel = (
-                _param_logical_numel(param) if tp_sharded else _param_numel(param)
+            numel = _param_logical_numel(param) if tp_sharded else _param_numel(param)
+            cost = (
+                numel
+                if owner_cost_model == "numel"
+                else _matrix_optimizer_cost_units(name, param)
             )
-            cost = _matrix_optimizer_cost_units(name, param)
             layer_params[layer_id].append((param, name, numel, cost))
 
-    # Build allocation units: large params standalone, small params merged per-layer
+    # Build allocation units. Production packs same-layer small params into one
+    # unit so they share owner and packed communication. Baseline jobs can
+    # disable this to replay true per-matrix round-robin/LPT assignment.
     alloc_units: list[tuple[list[nn.Parameter], Optional[str], int, int]] = []
+    packed_allocation_unit_count = 0
 
     for layer_id, params in layer_params.items():
+        if not pack_small_params:
+            for p, _n, s, c in params:
+                alloc_units.append(([p], layer_id, s, c))
+            continue
+
         tp_params = [
-            (p, n, s, c) for p, n, s, c in params
-            if is_tp_sharded(p, dp_mesh_dim_names)
+            (p, n, s, c) for p, n, s, c in params if is_tp_sharded(p, dp_mesh_dim_names)
         ]
         non_tp_params = [
-            (p, n, s, c) for p, n, s, c in params
+            (p, n, s, c)
+            for p, n, s, c in params
             if not is_tp_sharded(p, dp_mesh_dim_names)
         ]
         small = [
-            (p, n, s, c) for p, n, s, c in non_tp_params
-            if s < SMALL_PARAM_THRESHOLD
+            (p, n, s, c) for p, n, s, c in non_tp_params if s < SMALL_PARAM_THRESHOLD
         ]
         large = [
-            (p, n, s, c) for p, n, s, c in non_tp_params
-            if s >= SMALL_PARAM_THRESHOLD
+            (p, n, s, c) for p, n, s, c in non_tp_params if s >= SMALL_PARAM_THRESHOLD
         ]
 
         for p, _n, s, c in tp_params:
@@ -336,6 +373,8 @@ def compute_balanced_assignment(
             merged_numel = sum(s for _, _, s, _ in small)
             merged_cost = sum(c for _, _, _, c in small)
             alloc_units.append((merged_params, layer_id, merged_numel, merged_cost))
+            if len(merged_params) > 1:
+                packed_allocation_unit_count += 1
 
     if owner_strategy == "lpt":
         # Sort by shape-aware optimizer cost descending (LPT), then by stable
@@ -354,9 +393,7 @@ def compute_balanced_assignment(
     else:
         # Diagnostic baselines follow module order so round-robin reflects the
         # natural layer traversal rather than inheriting LPT's size ordering.
-        alloc_units.sort(
-            key=lambda x: min(param_order.get(p, 0) for p in x[0])
-        )
+        alloc_units.sort(key=lambda x: min(param_order.get(p, 0) for p in x[0]))
 
     # Greedy assignment with same-layer concurrency constraint.  Owner slots
     # are the full 2D grid; in shard-only mode every slot has replicate=0
@@ -381,10 +418,7 @@ def compute_balanced_assignment(
     for params_list, layer_id, total_numel, total_cost in alloc_units:
         used_slots = layer_usage[layer_id]
         candidate_slots = slots
-        if (
-            max_owners_per_group is not None
-            and len(used_slots) >= max_owners_per_group
-        ):
+        if max_owners_per_group is not None and len(used_slots) >= max_owners_per_group:
             candidate_slots = sorted(used_slots)
         if owner_strategy == "rank0":
             best_slot = slots[0]
@@ -396,9 +430,17 @@ def compute_balanced_assignment(
                 candidate_slots,
                 key=lambda s: (
                     s in used_slots,
-                    shard_column_cost_loads[s[0]] if is_hsdp else 0,
+                    (
+                        shard_column_cost_loads[s[0]]
+                        if is_hsdp and hsdp_column_balance
+                        else 0
+                    ),
                     rank_cost_loads[s],
-                    shard_column_loads[s[0]] if is_hsdp else 0,
+                    (
+                        shard_column_loads[s[0]]
+                        if is_hsdp and hsdp_column_balance
+                        else 0
+                    ),
                     rank_loads[s],
                 ),
             )
@@ -445,7 +487,11 @@ def compute_balanced_assignment(
         for p in sorted(
             params,
             key=lambda p: (
-                -_matrix_optimizer_cost_units(param_names.get(p, ""), p),
+                -(
+                    _param_logical_numel(p)
+                    if owner_cost_model == "numel"
+                    else _matrix_optimizer_cost_units(param_names.get(p, ""), p)
+                ),
                 -_param_logical_numel(p),
                 param_names.get(p, ""),
             ),
@@ -459,9 +505,17 @@ def compute_balanced_assignment(
                 ),
             )
             tp_owners[p] = owner
-            tp_cost_loads[owner] += _matrix_optimizer_cost_units(
-                param_names.get(p, ""), p
+            tp_cost_loads[owner] += (
+                _param_logical_numel(p)
+                if owner_cost_model == "numel"
+                else _matrix_optimizer_cost_units(param_names.get(p, ""), p)
             )
             tp_numel_loads[owner] += _param_logical_numel(p)
 
-    return AssignmentResult(dp_owners=dp_owners, tp_owners=tp_owners)
+    return AssignmentResult(
+        dp_owners=dp_owners,
+        tp_owners=tp_owners,
+        allocation_unit_count=len(alloc_units),
+        packed_allocation_unit_count=packed_allocation_unit_count,
+        pack_small_params=pack_small_params,
+    )

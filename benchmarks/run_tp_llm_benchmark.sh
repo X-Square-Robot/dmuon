@@ -24,11 +24,15 @@ run_case() {
     local world="$3"
     local owner="$4"
     local async="$5"
+    local owner_cost_model="${6:-optimizer}"
+    local hsdp_column_balance="${7:-1}"
     local port="$PORT_BASE"
     PORT_BASE=$((PORT_BASE + 1))
     local outfile="${OUT}/${MODEL}_${key}.json"
-    echo "=== ${MODEL}_${key}: topology=${topology} owner=${owner} async=${async} world=${world} port=${port} ==="
+    echo "=== ${MODEL}_${key}: topology=${topology} owner=${owner} cost=${owner_cost_model} hcol=${hsdp_column_balance} async=${async} world=${world} port=${port} ==="
     DMUON_TP_LLM_OWNER="$owner" \
+    DMUON_TP_LLM_OWNER_COST_MODEL="$owner_cost_model" \
+    DMUON_TP_LLM_HSDP_COLUMN_BALANCE="$hsdp_column_balance" \
     DMUON_TP_LLM_ASYNC="$async" \
     DMUON_TP_LLM_OUT="$outfile" \
     torchrun --nproc_per_node="$world" --master_port="$port" "$SCRIPT" "$MODEL" "$topology"
@@ -74,6 +78,20 @@ run_full_matrix() {
     run_case hsdp_tp2_rank0_sync hsdp_tp2 8 rank0 0
 }
 
+run_lpt_ablation_matrix() {
+    run_case hsdp_lpt_optimizer_colbal_sync hsdp 8 lpt 0 optimizer 1
+    run_case hsdp_lpt_numel_colbal_sync hsdp 8 lpt 0 numel 1
+    run_case hsdp_lpt_optimizer_nocol_sync hsdp 8 lpt 0 optimizer 0
+    run_case hsdp_lpt_numel_nocol_sync hsdp 8 lpt 0 numel 0
+    run_case hsdp_rank0_sync hsdp 8 rank0 0 optimizer 1
+
+    run_case hsdp_tp2_lpt_optimizer_colbal_sync hsdp_tp2 8 lpt 0 optimizer 1
+    run_case hsdp_tp2_lpt_numel_colbal_sync hsdp_tp2 8 lpt 0 numel 1
+    run_case hsdp_tp2_lpt_optimizer_nocol_sync hsdp_tp2 8 lpt 0 optimizer 0
+    run_case hsdp_tp2_lpt_numel_nocol_sync hsdp_tp2 8 lpt 0 numel 0
+    run_case hsdp_tp2_rank0_sync hsdp_tp2 8 rank0 0 optimizer 1
+}
+
 case "$MATRIX" in
     core)
         run_core_matrix
@@ -84,8 +102,11 @@ case "$MATRIX" in
     full)
         run_full_matrix
         ;;
+    lpt_ablation)
+        run_lpt_ablation_matrix
+        ;;
     *)
-        echo "Unknown DMUON_TP_LLM_MATRIX=${MATRIX}; expected core, phase4, or full" >&2
+        echo "Unknown DMUON_TP_LLM_MATRIX=${MATRIX}; expected core, phase4, full, or lpt_ablation" >&2
         exit 2
         ;;
 esac
@@ -124,6 +145,8 @@ for fp in sorted(glob.glob(os.path.join(out, f"{model}_*.json"))):
         key,
         d["topology"],
         d["owner"],
+        d.get("owner_cost_model", "optimizer"),
+        d.get("hsdp_column_balance", True),
         "async" if d["replicate_async"] else "sync",
         d["world_size"],
         data_factor,
@@ -137,15 +160,32 @@ for fp in sorted(glob.glob(os.path.join(out, f"{model}_*.json"))):
     ))
 
 print(
-    f"{'case':<24} {'topology':<9} {'owner':<6} {'mode':<6} {'world':>5} {'data':>4} "
+    f"{'case':<36} {'topology':<9} {'owner':<6} {'cost':<9} {'hcol':<5} {'mode':<6} {'world':>5} {'data':>4} "
     f"{'p50_ms':>10} {'p90_ms':>10} {'local tok/s':>12} {'global tok/s':>13} "
     f"{'MFU':>8} {'memGB':>8} coverage"
 )
-print("-" * 150)
+print("-" * 175)
 for row in rows:
-    key, topo, owner, mode, world, data_factor, p50, p90, tok_s, global_tok_s, mfu, mem, cov = row
+    (
+        key,
+        topo,
+        owner,
+        owner_cost_model,
+        hsdp_column_balance,
+        mode,
+        world,
+        data_factor,
+        p50,
+        p90,
+        tok_s,
+        global_tok_s,
+        mfu,
+        mem,
+        cov,
+    ) = row
     print(
-        f"{key:<24} {topo:<9} {owner:<6} {mode:<6} {world:>5} {data_factor:>4} "
+        f"{key:<36} {topo:<9} {owner:<6} {owner_cost_model:<9} "
+        f"{str(bool(hsdp_column_balance)):<5} {mode:<6} {world:>5} {data_factor:>4} "
         f"{p50:>10.3f} {p90:>10.3f} {tok_s:>12.1f} {global_tok_s:>13.1f} "
         f"{mfu:>8.3f} {mem:>8.2f} {cov}"
     )
@@ -165,4 +205,20 @@ for topo in topologies:
         sync_ms = data[sync_key]["summary"]["step_ms_p50"]
         rank0_ms = data[rank0_key]["summary"]["step_ms_p50"]
         print(f"{topo:<9} lpt_speedup_vs_rank0 = {rank0_ms / sync_ms:.3f}x")
+
+for topo in topologies:
+    base_key = f"{topo}_lpt_optimizer_colbal_sync"
+    if base_key not in data:
+        continue
+    base_ms = data[base_key]["summary"]["step_ms_p50"]
+    for key in (
+        f"{topo}_lpt_numel_colbal_sync",
+        f"{topo}_lpt_optimizer_nocol_sync",
+        f"{topo}_lpt_numel_nocol_sync",
+        f"{topo}_rank0_sync",
+    ):
+        if key not in data:
+            continue
+        other_ms = data[key]["summary"]["step_ms_p50"]
+        print(f"{topo:<9} {key.removeprefix(topo + '_')}_vs_prod = {other_ms / base_ms:.3f}x step_ms")
 PY
