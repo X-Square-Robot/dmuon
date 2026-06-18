@@ -104,15 +104,20 @@ def predicate(name: str, param: nn.Parameter) -> bool:
 For large scaling runs where DMuon should own communication for all trainable
 parameters, pass a broader `predicate` and a `route_hint_fn`.  Route
 `"muon"` keeps large matrix parameters on the matrix-optimizer path; route
-`"sharded_adamw"` keeps non-Muon trainable parameters on a DMuon-managed
-sharded AdamW path.  This avoids mixing FSDP2 collectives and DMuon collectives
-inside the same training step.
+`"adamw"` keeps small AdamW parameters on DMuon's owner broadcast/reduce path;
+route `"sharded_adamw"` is reserved for very large AdamW tensors such as
+embeddings and `lm_head`, where all ranks should share the communication.
 
 ```python
+SHARDED_ADAMW_NAME_PARTS = ("embed_tokens", "lm_head")
+
+
 def route_hint(name, param):
     if param.ndim == 2 and "proj" in name:
         return "muon"
-    return "sharded_adamw"
+    if param.ndim == 2 and any(part in name for part in SHARDED_ADAMW_NAME_PARTS):
+        return "sharded_adamw"
+    return "adamw"
 
 dmuon.dedicate_params(
     model,
@@ -125,6 +130,7 @@ dmuon.dedicate_params(
 The default `predicate=lambda n, p: "proj" in n and p.ndim == 2` remains the
 simpler integration path.  Use type-split routing only when you want DMuon to
 own placement and collectives for the non-Muon trainable parameters as well.
+See [Pure DMuon Routing](pure-dmuon-routing.md) for the full route policy.
 
 ### Inspecting the Assignment
 
@@ -179,7 +185,7 @@ rate groups, such as a VLA action expert with a higher LR. Build the groups
 from the same wrapped model object that you pass to `dmuon.Muon`; with FSDP2,
 this means after `dedicate_params()` and after wrapping. DMuon lowers each user
 group into two optimizer subgroups: `<name>/muon` for dedicated parameters and
-`<name>/adamw` for symmetric parameters.
+`<name>/adamw` for symmetric parameters and AdamW-routed dedicated parameters.
 
 ```python
 base_params = []
@@ -209,6 +215,15 @@ callers can override route-specific values with `muon_lr`, `adamw_lr`,
 `adamw_eps`. Every trainable parameter must appear in exactly one user group;
 stale pre-wrapping parameters, duplicate parameters, and missing parameters
 raise during optimizer construction.
+
+Semantic `param_groups` are a hyperparameter grouping surface by default; they
+do not choose DMuon routes. For DMuon-managed parameters, the per-parameter
+route written by `dedicate_params(route_hint_fn=...)` is preserved even when a
+user group contains a mix of `"muon"`, `"adamw"`, and `"sharded_adamw"`
+parameters. A group-level route is applied only when the user group explicitly
+sets `dmuon_route`, `dmuon_optimizer`, or `matrix_optimizer`; use those keys only
+when every DMuon-managed parameter in that semantic group should be forced onto
+the same route.
 
 Schedulers and checkpoints work through `optimizer.param_groups` as usual. The
 visible group names become `base/muon`, `base/adamw`, `action/muon`, and

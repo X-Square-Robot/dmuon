@@ -109,6 +109,42 @@ def test_save_only_writes_requested_backend(tmp_cache_dir):
     assert cublas_file.exists()
 
 
+def test_autotune_does_not_advance_default_torch_rng(tmp_cache_dir, monkeypatch):
+    def fake_bench(fn, warmup=5, repeat=20):
+        fn()
+        return 1.0
+
+    def fake_syrk(A, D, B=None, C=None, alpha=1.0, beta=1.0, diag_add=0.0, **_kwargs):
+        BT = A.T if B is None else B.T
+        if C is None:
+            torch.mm(A, BT, out=D)
+        else:
+            torch.addmm(C, A, BT, alpha=alpha, beta=beta, out=D)
+        if diag_add != 0.0:
+            D.diagonal().add_(diag_add)
+
+    monkeypatch.setattr(syrk_dispatch, "_bench_median", fake_bench)
+    monkeypatch.setattr(syrk_dispatch, "_syrk_sm80_fn", fake_syrk)
+    monkeypatch.setattr(syrk_dispatch, "_SYRK_CONFIGS", [(4, 4, 1)])
+    monkeypatch.setattr(syrk_dispatch, "_progress_log", lambda *_args, **_kwargs: None)
+
+    device = torch.device("cpu")
+    for has_C in (False, True):
+        syrk_dispatch._syrk_autotune_cache.clear()
+        torch.manual_seed(123)
+        before = torch.get_rng_state().clone()
+        syrk_dispatch._autotune_syrk(
+            4,
+            4,
+            device,
+            torch.float32,
+            has_C=has_C,
+            backend=f"rng_test_{has_C}",
+        )
+        after = torch.get_rng_state()
+        assert torch.equal(before, after)
+
+
 # ---------------------------------------------------------------------------
 # Legacy cache migration
 # ---------------------------------------------------------------------------

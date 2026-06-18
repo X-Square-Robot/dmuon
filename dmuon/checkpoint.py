@@ -175,10 +175,7 @@ def _broadcast_state_tensor(
     # owner's shard column; on other ranks the replicate_group is a
     # different process group (belonging to their own shard column) and
     # this param's data is distributed to them via Stage 2 instead.
-    if (
-        dp.replicate_group is not None
-        and dp.dp_group.rank() == dp.owner_shard
-    ):
+    if dp.replicate_group is not None and dp.dp_group.rank() == dp.owner_shard:
         dist.broadcast(
             buf,
             src=dp._owner_replicate_global_rank,
@@ -212,10 +209,7 @@ def _broadcast_dedicated_adamw_tensor(
     buf = torch.empty(dp._orig_size, dtype=dtype, device=dp.device)
     if dp.is_owner and tensor is not None:
         buf.copy_(tensor.to(dtype))
-    if (
-        dp.replicate_group is not None
-        and dp.dp_group.rank() == dp.owner_shard
-    ):
+    if dp.replicate_group is not None and dp.dp_group.rank() == dp.owner_shard:
         dist.broadcast(
             buf,
             src=dp._owner_replicate_global_rank,
@@ -238,10 +232,7 @@ def _broadcast_dedicated_adamw_step(dp: DedicatedParam, step: int | None) -> int
         return int(buf.item())
     value = int(step or 0) if dp.is_owner else 0
     buf = torch.tensor([value], dtype=torch.int64, device=dp.device)
-    if (
-        dp.replicate_group is not None
-        and dp.dp_group.rank() == dp.owner_shard
-    ):
+    if dp.replicate_group is not None and dp.dp_group.rank() == dp.owner_shard:
         dist.broadcast(
             buf,
             src=dp._owner_replicate_global_rank,
@@ -340,10 +331,13 @@ def _all_gather_fsdp_tensor(
         world_size = dp_mesh.size(shard_dim)
 
     # Exchange shard sizes (handles uneven splits)
-    local_size = torch.tensor([local_tensor.shape[0]], dtype=torch.int64,
-                              device=local_tensor.device)
-    all_sizes = [torch.zeros(1, dtype=torch.int64, device=local_tensor.device)
-                 for _ in range(world_size)]
+    local_size = torch.tensor(
+        [local_tensor.shape[0]], dtype=torch.int64, device=local_tensor.device
+    )
+    all_sizes = [
+        torch.zeros(1, dtype=torch.int64, device=local_tensor.device)
+        for _ in range(world_size)
+    ]
     dist.all_gather(all_sizes, local_size, group=dp_group)
     sizes = [s.item() for s in all_sizes]
 
@@ -360,14 +354,18 @@ def _all_gather_fsdp_tensor(
                 return None
             full_shape = list(local_tensor.shape)
             full_shape[0] = 0
-            return torch.empty(full_shape, dtype=local_tensor.dtype,
-                               device="cpu" if cpu_offload else local_tensor.device)
+            return torch.empty(
+                full_shape,
+                dtype=local_tensor.dtype,
+                device="cpu" if cpu_offload else local_tensor.device,
+            )
         padded_shape = list(local_tensor.shape)
         padded_shape[0] = max_size
-        padded = torch.zeros(padded_shape, dtype=local_tensor.dtype,
-                             device=local_tensor.device)
+        padded = torch.zeros(
+            padded_shape, dtype=local_tensor.dtype, device=local_tensor.device
+        )
         if local_tensor.shape[0] > 0:
-            padded[:local_tensor.shape[0]].copy_(local_tensor)
+            padded[: local_tensor.shape[0]].copy_(local_tensor)
         gathered = [torch.empty_like(padded) for _ in range(world_size)]
         dist.all_gather(gathered, padded.contiguous(), group=dp_group)
         # Trim each shard to its actual size
@@ -463,8 +461,11 @@ def get_model_state_dict(
     #    DDP path: every rank already has the live ``nn.Parameter`` in sync
     #    (post-step broadcast was drained above), so read .data directly.
     for dp, fqn in dp_fqns.items():
-        mode = getattr(dp._orig_param if hasattr(dp, "_orig_param") else None,
-                       "_dedicated_mode", None)
+        mode = getattr(
+            dp._orig_param if hasattr(dp, "_orig_param") else None,
+            "_dedicated_mode",
+            None,
+        )
         if mode == "ddp":
             if keep:
                 t = dp._orig_param.data
@@ -502,9 +503,7 @@ def get_model_state_dict(
     return sd
 
 
-def set_model_state_dict(
-    model: nn.Module, state_dict: dict[str, torch.Tensor]
-) -> None:
+def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
     """Load a full state dict into a DMuon model.
 
     Handles both dedicated params (copy to owner's ``_owned_data``) and
@@ -546,8 +545,13 @@ def set_model_state_dict(
             dp._owned_data.copy_(state_dict[fqn].to(dp._orig_dtype).to(dp.device))
         # DDP path: sync the live parameter too.
         orig_param = getattr(dp, "_orig_param", None)
-        if orig_param is not None and getattr(orig_param, "_dedicated_mode", None) == "ddp":
-            orig_param.data.copy_(state_dict[fqn].to(orig_param.dtype).to(orig_param.device))
+        if (
+            orig_param is not None
+            and getattr(orig_param, "_dedicated_mode", None) == "ddp"
+        ):
+            orig_param.data.copy_(
+                state_dict[fqn].to(orig_param.dtype).to(orig_param.device)
+            )
 
     # 3. Load symmetric params: manually shard full tensors into FSDP2 DTensors.
     for name, param in model.named_parameters():
@@ -572,7 +576,9 @@ def set_model_state_dict(
                 shard_rank = mesh.get_local_rank(mesh_dim=shard_dim)
                 shard_world = mesh.size(shard_dim)
             full_on_device = full_tensor.to(local.dtype).to(local.device)
-            local.copy_(_padded_local_shard(full_on_device, shard_rank, shard_world, local))
+            local.copy_(
+                _padded_local_shard(full_on_device, shard_rank, shard_world, local)
+            )
         else:
             param.data.copy_(full_tensor.to(param.dtype).to(param.device))
 
@@ -581,7 +587,10 @@ def set_model_state_dict(
 
 
 def get_optimizer_state_dict(
-    model: nn.Module, optimizer: Any, *, cpu_offload: bool = True,
+    model: nn.Module,
+    optimizer: Any,
+    *,
+    cpu_offload: bool = True,
     rank0_only: bool = True,
 ) -> dict:
     """Get optimizer state dict for a DMuon Muon optimizer.
@@ -629,7 +638,9 @@ def get_optimizer_state_dict(
         for dp in muon_dps
         if _owns_dedicated_optimizer_state(dp)
     )
-    has_state_tensor = torch.tensor([int(any_has_state)], device=next(iter(dp_fqns)).device)
+    has_state_tensor = torch.tensor(
+        [int(any_has_state)], device=next(iter(dp_fqns)).device
+    )
     dist.all_reduce(has_state_tensor, op=dist.ReduceOp.MAX)
 
     if has_state_tensor.item() > 0:
@@ -653,9 +664,7 @@ def get_optimizer_state_dict(
     # 2. Dedicated AdamW state: broadcast local owner state.
     dedicated_adamw_state: dict[str, dict[str, Any]] = {}
     dp_to_adamw_group = getattr(optimizer, "_dp_to_adamw_group_idx", {})
-    dedicated_adamw_dps = [
-        dp for dp in all_dedicated if id(dp) in dp_to_adamw_group
-    ]
+    dedicated_adamw_dps = [dp for dp in all_dedicated if id(dp) in dp_to_adamw_group]
     any_has_adamw_state = any(
         id(dp) in optimizer.state
         for dp in dedicated_adamw_dps
@@ -761,16 +770,29 @@ def set_optimizer_state_dict(
                 continue
             dp = fqn_to_dp[fqn]
             if "momentum_buffer" in state:
-                buf = state["momentum_buffer"].to(dp.device)
+                target_dtype = (
+                    getattr(dp, "_compute_dtype", None)
+                    or getattr(dp, "_orig_dtype", None)
+                    or state["momentum_buffer"].dtype
+                )
+                buf = state["momentum_buffer"].to(
+                    device=dp.device,
+                    dtype=target_dtype,
+                )
                 m, _n = _momentum_matrix_shape(dp)
                 buf = buf.view(m, -1)
                 opt_state = optimizer.state.setdefault(id(dp), {})
                 if _owns_dedicated_optimizer_state(dp):
                     opt_state["momentum_buffer"] = buf
-                if getattr(dp, "tp_group", None) is not None and dp._owned_data is not None:
-                    opt_state["tp_local_momentum_buffer"] = _tp_local_momentum_from_full(
-                        buf.float(),
-                        dp,
+                if (
+                    getattr(dp, "tp_group", None) is not None
+                    and dp._owned_data is not None
+                ):
+                    opt_state["tp_local_momentum_buffer"] = (
+                        _tp_local_momentum_from_full(
+                            buf,
+                            dp,
+                        )
                     )
 
     # 2. Dedicated AdamW state: restore on local owners.
@@ -835,7 +857,9 @@ def set_optimizer_state_dict(
                         )
                         shard_rank = dp_mesh.get_local_rank(mesh_dim=shard_dim)
                         shard_world = dp_mesh.size(shard_dim)
-                    local_ref = p._local_tensor if hasattr(p, "_local_tensor") else p.data
+                    local_ref = (
+                        p._local_tensor if hasattr(p, "_local_tensor") else p.data
+                    )
                     full_on_device = val.to(local_ref.dtype).to(local_ref.device)
                     opt_state[key] = _padded_local_shard(
                         full_on_device, shard_rank, shard_world, local_ref

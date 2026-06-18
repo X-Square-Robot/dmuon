@@ -116,7 +116,9 @@ class DedicatedCommContext:
             self.replicate_broadcast_bucket_bytes = int(
                 float(replicate_broadcast_bucket_mb) * 1024 * 1024
             )
-        self.post_forward_order: list = []  # DedicatedParamGroup | DedicatedParamGroupDDP
+        self.post_forward_order: list = (
+            []
+        )  # DedicatedParamGroup | DedicatedParamGroupDDP
         self.all_states: list[DedicatedState] = []
         self.forward_prefetch_depth = 1
         self.post_backward_final_callback_queued: bool = False
@@ -126,7 +128,11 @@ class DedicatedCommContext:
         # (FSDP2 or DDP), same convention as ``post_forward_order``.
         self.last_reduced_group = None
         self.record_forward_profile = _env_flag("DMUON_RECORD_FORWARD_PROFILE")
+        self.record_post_step_profile = self.record_forward_profile or _env_flag(
+            "DMUON_RECORD_POST_STEP_PROFILE"
+        )
         self._forward_profile_events: list[dict[str, object]] = []
+        self._post_step_profile_events: list[dict[str, object]] = []
         self._forward_profile_counts: dict[str, dict[str, object]] = defaultdict(
             lambda: {
                 "dispatch_calls": 0,
@@ -227,19 +233,41 @@ class DedicatedCommContext:
             }
         )
 
-    def consume_forward_unshard_profile(self, *, clear: bool = True) -> dict[str, object]:
-        """Return aggregate CUDA-event timings for forward unshard diagnostics."""
+    def record_post_step_event(
+        self,
+        *,
+        group_name: str,
+        phase: str,
+        start: torch.cuda.Event,
+        end: torch.cuda.Event,
+        bytes: int = 0,
+    ) -> None:
+        if not self.record_post_step_profile:
+            return
+        self._post_step_profile_events.append(
+            {
+                "group": group_name,
+                "phase": phase,
+                "bytes": int(bytes),
+                "start": start,
+                "end": end,
+            }
+        )
 
+    def _consume_event_profile(
+        self,
+        events: list[dict[str, object]],
+        *,
+        clear: bool,
+    ) -> dict[str, object]:
         events_ready = 0
         events_pending = 0
-        by_group: dict[str, dict[str, object]] = {
-            group: dict(values) for group, values in self._forward_profile_counts.items()
-        }
+        by_group: dict[str, dict[str, object]] = {}
         by_phase: dict[str, dict[str, float | int]] = defaultdict(
             lambda: {"count": 0, "ms": 0.0, "bytes": 0}
         )
 
-        for item in self._forward_profile_events:
+        for item in events:
             end = item["end"]
             if isinstance(end, torch.cuda.Event) and not end.query():
                 events_pending += 1
@@ -263,13 +291,13 @@ class DedicatedCommContext:
             group_stats = by_group.setdefault(group, {})
             key = f"{phase}_ms"
             group_stats[key] = float(group_stats.get(key, 0.0)) + elapsed_ms
-            group_stats[f"{phase}_events"] = int(
-                group_stats.get(f"{phase}_events", 0)
-            ) + 1
+            group_stats[f"{phase}_events"] = (
+                int(group_stats.get(f"{phase}_events", 0)) + 1
+            )
             if bytes_value:
-                group_stats[f"{phase}_bytes"] = int(
-                    group_stats.get(f"{phase}_bytes", 0)
-                ) + bytes_value
+                group_stats[f"{phase}_bytes"] = (
+                    int(group_stats.get(f"{phase}_bytes", 0)) + bytes_value
+                )
 
             phase_stats = by_phase[phase]
             phase_stats["count"] = int(phase_stats["count"]) + 1
@@ -282,7 +310,6 @@ class DedicatedCommContext:
                     group_stats[key] = round(float(value), 6)
 
         result: dict[str, object] = {
-            "enabled": self.record_forward_profile,
             "events_ready": events_ready,
             "events_pending": events_pending,
             "by_group": by_group,
@@ -296,8 +323,51 @@ class DedicatedCommContext:
             },
         }
         if clear:
-            self._forward_profile_events.clear()
+            events.clear()
+        return result
+
+    def consume_forward_unshard_profile(
+        self, *, clear: bool = True
+    ) -> dict[str, object]:
+        """Return aggregate CUDA-event timings for forward unshard diagnostics."""
+
+        event_profile = self._consume_event_profile(
+            self._forward_profile_events,
+            clear=clear,
+        )
+        events_ready = int(event_profile["events_ready"])
+        events_pending = int(event_profile["events_pending"])
+        by_group: dict[str, dict[str, object]] = {
+            group: dict(values)
+            for group, values in self._forward_profile_counts.items()
+        }
+        for group, profile_stats in event_profile["by_group"].items():
+            group_stats = by_group.setdefault(group, {})
+            group_stats.update(profile_stats)
+
+        for group_stats in by_group.values():
+            for key, value in list(group_stats.items()):
+                if key.endswith("_ms"):
+                    group_stats[key] = round(float(value), 6)
+
+        result: dict[str, object] = {
+            "enabled": self.record_forward_profile,
+            "events_ready": events_ready,
+            "events_pending": events_pending,
+            "by_group": by_group,
+            "by_phase": event_profile["by_phase"],
+            "post_step_profile": self.consume_post_step_profile(clear=clear),
+        }
+        if clear:
             self._forward_profile_counts.clear()
+        return result
+
+    def consume_post_step_profile(self, *, clear: bool = True) -> dict[str, object]:
+        result = self._consume_event_profile(
+            self._post_step_profile_events,
+            clear=clear,
+        )
+        result["enabled"] = self.record_post_step_profile
         return result
 
 

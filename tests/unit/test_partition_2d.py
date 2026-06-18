@@ -44,12 +44,17 @@ class MiniModel(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(1000, hidden)
         self.layers = nn.ModuleDict(
-            {str(i): MiniTransformerBlock(hidden, intermediate) for i in range(num_layers)}
+            {
+                str(i): MiniTransformerBlock(hidden, intermediate)
+                for i in range(num_layers)
+            }
         )
         self.norm = nn.LayerNorm(hidden)
 
 
-def _model(num_layers: int = 6, hidden: int = 512, intermediate: int = 2048) -> nn.Module:
+def _model(
+    num_layers: int = 6, hidden: int = 512, intermediate: int = 2048
+) -> nn.Module:
     return MiniModel(num_layers=num_layers, hidden=hidden, intermediate=intermediate)
 
 
@@ -85,9 +90,9 @@ def test_2d_returns_tuple_owners():
     ).dp_owners
     assert assignment
     for owner in assignment.values():
-        assert isinstance(owner, tuple) and len(owner) == 2, (
-            f"HSDP path must return (shard, replicate) tuple; got {owner!r}"
-        )
+        assert (
+            isinstance(owner, tuple) and len(owner) == 2
+        ), f"HSDP path must return (shard, replicate) tuple; got {owner!r}"
         s, r = owner
         assert 0 <= s < 4 and 0 <= r < 2
 
@@ -98,10 +103,10 @@ def test_2d_returns_tuple_owners():
 @pytest.mark.parametrize(
     "shard,replicate,num_layers",
     [
-        (4, 2, 6),   # 8 slots
-        (2, 4, 6),   # 8 slots, tall replicate
-        (8, 2, 8),   # 16 slots
-        (4, 4, 8),   # 16 slots, square
+        (4, 2, 6),  # 8 slots
+        (2, 4, 6),  # 8 slots, tall replicate
+        (8, 2, 8),  # 16 slots
+        (4, 4, 8),  # 16 slots, square
     ],
 )
 def test_2d_load_balance(shard, replicate, num_layers):
@@ -163,6 +168,27 @@ def test_hsdp_lpt_balances_large_root_params_across_shard_columns():
     )
 
 
+def test_hsdp_column_balance_can_be_disabled_for_ablation():
+    shard_mesh = FakeDeviceMesh(4)
+    replicate_mesh = FakeDeviceMesh(2)
+    model = nn.Module()
+    model.embed_tokens = nn.Embedding(1024, 8192)
+    model.lm_head = nn.Linear(8192, 1024, bias=False)
+
+    assignment = compute_balanced_assignment(
+        model,
+        shard_mesh,
+        predicate=lambda _n, _p: True,
+        replicate_mesh=replicate_mesh,
+        hsdp_column_balance=False,
+    ).dp_owners
+
+    embed_owner = assignment[model.embed_tokens.weight]
+    head_owner = assignment[model.lm_head.weight]
+    assert embed_owner[0] == head_owner[0]
+    assert embed_owner != head_owner
+
+
 # --- Same-layer concurrency in 2D ------------------------------------------
 
 
@@ -215,13 +241,19 @@ def test_small_params_merged_in_hsdp():
     ).dp_owners
     for layer_idx in range(4):
         k = next(
-            (p for n, p in model.named_parameters()
-             if f"layers.{layer_idx}" in n and "k_proj" in n),
+            (
+                p
+                for n, p in model.named_parameters()
+                if f"layers.{layer_idx}" in n and "k_proj" in n
+            ),
             None,
         )
         v = next(
-            (p for n, p in model.named_parameters()
-             if f"layers.{layer_idx}" in n and "v_proj" in n),
+            (
+                p
+                for n, p in model.named_parameters()
+                if f"layers.{layer_idx}" in n and "v_proj" in n
+            ),
             None,
         )
         if k is None or v is None:
@@ -231,6 +263,38 @@ def test_small_params_merged_in_hsdp():
                 f"Layer {layer_idx}: small k/v on different slots "
                 f"({assignment[k]} vs {assignment[v]})"
             )
+
+
+def test_pack_small_params_can_be_disabled_in_hsdp():
+    shard_mesh = FakeDeviceMesh(4)
+    replicate_mesh = FakeDeviceMesh(2)
+    model = _model(num_layers=1)
+    proj_params = [
+        p
+        for name, p in model.named_parameters()
+        if "layers.0" in name and "proj" in name
+    ]
+
+    packed = compute_balanced_assignment(
+        model,
+        shard_mesh,
+        predicate=lambda n, p: "proj" in n,
+        replicate_mesh=replicate_mesh,
+        owner_strategy="round_robin",
+    )
+    no_pack = compute_balanced_assignment(
+        model,
+        shard_mesh,
+        predicate=lambda n, p: "proj" in n,
+        replicate_mesh=replicate_mesh,
+        owner_strategy="round_robin",
+        pack_small_params=False,
+    )
+
+    assert packed.allocation_unit_count == 1
+    assert len(set(packed.dp_owners[p] for p in proj_params)) == 1
+    assert no_pack.allocation_unit_count == len(proj_params)
+    assert len(set(no_pack.dp_owners[p] for p in proj_params)) > 1
 
 
 # --- Owner coord coverage --------------------------------------------------
@@ -278,6 +342,4 @@ def test_replicate_size_1_matches_shard_only():
 
     assert set(flat.keys()) == set(twod.keys())
     for p in flat:
-        assert twod[p] == (flat[p], 0), (
-            f"mismatch: flat={flat[p]!r}, twod={twod[p]!r}"
-        )
+        assert twod[p] == (flat[p], 0), f"mismatch: flat={flat[p]!r}, twod={twod[p]!r}"

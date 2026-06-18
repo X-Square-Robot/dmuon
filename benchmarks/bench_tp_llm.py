@@ -160,9 +160,7 @@ def _resolved_spec(model_key: str) -> tuple[ModelSpec, dict[str, Any]]:
         "heads": _env_int("DMUON_TP_LLM_HEADS", spec.heads),
         "kv_heads": _env_int("DMUON_TP_LLM_KV_HEADS", spec.kv_heads),
         "vocab": _env_int("DMUON_TP_LLM_VOCAB", spec.vocab),
-        "max_positions": _env_int(
-            "DMUON_TP_LLM_MAX_POSITIONS", spec.max_positions
-        ),
+        "max_positions": _env_int("DMUON_TP_LLM_MAX_POSITIONS", spec.max_positions),
         "tie_word_embeddings": bool(spec.tie_word_embeddings),
         "attn_implementation": os.environ.get("DMUON_TP_LLM_ATTN_IMPL") or None,
     }
@@ -223,9 +221,7 @@ def _make_mesh(topology: str, world_size: int):
     if topology == "hsdp":
         if world_size != 8:
             raise RuntimeError(f"hsdp needs world=8, got {world_size}")
-        mesh = init_device_mesh(
-            "cuda", (2, 4), mesh_dim_names=("replicate", "shard")
-        )
+        mesh = init_device_mesh("cuda", (2, 4), mesh_dim_names=("replicate", "shard"))
         return mesh, mesh["shard"], None, mesh["replicate", "shard"], mesh["replicate"]
     if topology == "tp2":
         if world_size != 2:
@@ -263,7 +259,13 @@ def _make_mesh(topology: str, world_size: int):
         mesh = init_device_mesh(
             "cuda", (2, 2, 2), mesh_dim_names=("replicate", "shard", "tp")
         )
-        return mesh, mesh["shard"], mesh["tp"], mesh["replicate", "shard"], mesh["replicate"]
+        return (
+            mesh,
+            mesh["shard"],
+            mesh["tp"],
+            mesh["replicate", "shard"],
+            mesh["replicate"],
+        )
     raise RuntimeError(
         "topology must be one of: dp_only | hsdp | tp2 | tp4 | tp8 | dp_tp2 | "
         "dp_tp4 | dp_tp8 | hsdp_tp2"
@@ -276,10 +278,14 @@ def _validate_tp_config(cfg: dict[str, Any], tp_size: int, mode: str) -> None:
             f"intermediate={cfg['intermediate']} must be divisible by tp_size={tp_size}"
         )
     if cfg["hidden"] % tp_size != 0:
-        raise ValueError(f"hidden={cfg['hidden']} must be divisible by tp_size={tp_size}")
+        raise ValueError(
+            f"hidden={cfg['hidden']} must be divisible by tp_size={tp_size}"
+        )
     if mode == "full":
         if cfg["heads"] % tp_size != 0:
-            raise ValueError(f"heads={cfg['heads']} must be divisible by tp_size={tp_size}")
+            raise ValueError(
+                f"heads={cfg['heads']} must be divisible by tp_size={tp_size}"
+            )
         if cfg["kv_heads"] % tp_size != 0:
             raise ValueError(
                 f"kv_heads={cfg['kv_heads']} must be divisible by tp_size={tp_size}"
@@ -847,8 +853,12 @@ def main() -> int:
     model_key = sys.argv[1] if len(sys.argv) > 1 else "llama3b"
     topology = sys.argv[2] if len(sys.argv) > 2 else "tp4"
     owner = os.environ.get("DMUON_TP_LLM_OWNER", "lpt")
-    if owner not in ("lpt", "rank0"):
-        raise ValueError("DMUON_TP_LLM_OWNER must be 'lpt' or 'rank0'")
+    if owner not in ("lpt", "round_robin", "rank0"):
+        raise ValueError("DMUON_TP_LLM_OWNER must be 'lpt', 'round_robin', or 'rank0'")
+    owner_cost_model = os.environ.get("DMUON_TP_LLM_OWNER_COST_MODEL", "optimizer")
+    if owner_cost_model not in ("optimizer", "numel"):
+        raise ValueError("DMUON_TP_LLM_OWNER_COST_MODEL must be 'optimizer' or 'numel'")
+    hsdp_column_balance = _env_bool("DMUON_TP_LLM_HSDP_COLUMN_BALANCE", True)
 
     parallelize_mode = os.environ.get("DMUON_TP_LLM_PARALLELIZE", "full")
     replicate_async = bool(int(os.environ.get("DMUON_TP_LLM_ASYNC", "0") or 0))
@@ -864,7 +874,9 @@ def main() -> int:
     peak_tflops_per_gpu = float(os.environ.get("DMUON_TP_LLM_PEAK_TFLOPS", "312"))
     exec_mode = os.environ.get("DMUON_TP_LLM_EXEC", "eager")
     if exec_mode not in ("eager", "compile", "cuda_graph"):
-        raise ValueError("DMUON_TP_LLM_EXEC must be 'eager', 'compile', or 'cuda_graph'")
+        raise ValueError(
+            "DMUON_TP_LLM_EXEC must be 'eager', 'compile', or 'cuda_graph'"
+        )
     tp_impl = os.environ.get("DMUON_TP_LLM_TP_IMPL", "dtensor")
     if tp_impl not in ("dtensor", "fused_manual"):
         raise ValueError("DMUON_TP_LLM_TP_IMPL must be 'dtensor' or 'fused_manual'")
@@ -890,7 +902,9 @@ def main() -> int:
     skip_size1_fsdp_env = os.environ.get("DMUON_TP_LLM_SKIP_SIZE1_FSDP")
     if exec_mode == "cuda_graph":
         if step_scope != "fwd_bwd":
-            raise ValueError("cuda_graph currently requires DMUON_TP_LLM_STEP_SCOPE=fwd_bwd")
+            raise ValueError(
+                "cuda_graph currently requires DMUON_TP_LLM_STEP_SCOPE=fwd_bwd"
+            )
         zero_set_to_none = False
 
     dist.init_process_group("nccl")
@@ -928,7 +942,9 @@ def main() -> int:
         }
         if tp_mesh is not None:
             _validate_tp_config(model_cfg, int(tp_mesh.size()), parallelize_mode)
-            tp_backend_info = apply_tp_backend(model, tp_mesh, parallelize_mode, tp_impl)
+            tp_backend_info = apply_tp_backend(
+                model, tp_mesh, parallelize_mode, tp_impl
+            )
         else:
             effective_parallelize_mode = "none"
         if skip_size1_fsdp:
@@ -941,6 +957,9 @@ def main() -> int:
             predicate=lambda n, p: "proj" in n and p.ndim == 2,
             compute_dtype=torch.bfloat16,
             reshard_after_forward=False,
+            owner_strategy=owner,
+            owner_cost_model=owner_cost_model,
+            hsdp_column_balance=hsdp_column_balance,
         )
         if owner == "rank0":
             _force_tp_owner_rank0(model)
@@ -965,7 +984,9 @@ def main() -> int:
             )
         else:
             optimizer = _FwdBwdGradManager(model)
-        forward_model = _compile_forward_model(model) if exec_mode == "compile" else model
+        forward_model = (
+            _compile_forward_model(model) if exec_mode == "compile" else model
+        )
 
         profile = collect_tp_profile(
             model,
@@ -977,6 +998,8 @@ def main() -> int:
             print(
                 f"bench model={model_cfg['model_label']} topology={topology} "
                 f"owner={owner} async={replicate_async} "
+                f"owner_cost_model={owner_cost_model} "
+                f"hsdp_column_balance={hsdp_column_balance} "
                 f"tp={1 if tp_mesh is None else tp_mesh.size()} "
                 f"mode={effective_parallelize_mode} tp_impl={tp_impl} "
                 f"exec={exec_mode} scope={step_scope} "
@@ -1015,8 +1038,7 @@ def main() -> int:
                     "DMUON_TP_LLM_PROFILE=1"
                 )
             trace_path = str(
-                Path(profile_dir)
-                / f"{model_key}_{topology}_{owner}_"
+                Path(profile_dir) / f"{model_key}_{topology}_{owner}_"
                 f"{'async' if replicate_async else 'sync'}_"
                 f"{step_scope}_{exec_mode}_rank0.trace.json"
             )
@@ -1043,12 +1065,11 @@ def main() -> int:
         local_payload = {
             "rank": rank,
             "trial_step_ms": trial_step_ms,
-            "losses": losses[-min(len(losses), 5):],
+            "losses": losses[-min(len(losses), 5) :],
             "reference_losses": reference_losses,
             "peak_memory_allocated_gb": torch.cuda.max_memory_allocated(device)
             / 1024**3,
-            "peak_memory_reserved_gb": torch.cuda.max_memory_reserved(device)
-            / 1024**3,
+            "peak_memory_reserved_gb": torch.cuda.max_memory_reserved(device) / 1024**3,
         }
         rank_payloads = [None for _ in range(world_size)]
         dist.all_gather_object(rank_payloads, local_payload)
@@ -1069,6 +1090,8 @@ def main() -> int:
                 "logical_param_count": logical_param_count,
                 "topology": topology,
                 "owner": owner,
+                "owner_cost_model": owner_cost_model,
+                "hsdp_column_balance": hsdp_column_balance,
                 "parallelize_mode": effective_parallelize_mode,
                 "tp_backend": tp_impl,
                 "tp_backend_info": tp_backend_info,
@@ -1091,6 +1114,8 @@ def main() -> int:
                     "no_sync_fwd_bwd": no_sync_fwd_bwd,
                     "drain_after_step": drain_after_step,
                     "deterministic": deterministic,
+                    "owner_cost_model": owner_cost_model,
+                    "hsdp_column_balance": hsdp_column_balance,
                     "fsdp_wrapped": fsdp_wrapped,
                     "skip_size1_fsdp": skip_size1_fsdp,
                     "compile_backend": os.environ.get(
@@ -1102,9 +1127,7 @@ def main() -> int:
                     "compile_fullgraph": _env_bool(
                         "DMUON_TP_LLM_COMPILE_FULLGRAPH", False
                     ),
-                    "compile_dynamic": _env_bool(
-                        "DMUON_TP_LLM_COMPILE_DYNAMIC", False
-                    ),
+                    "compile_dynamic": _env_bool("DMUON_TP_LLM_COMPILE_DYNAMIC", False),
                     "compile_disable_cudagraph_trees": _env_bool(
                         "DMUON_TP_LLM_COMPILE_DISABLE_CUDAGRAPH_TREES", True
                     ),
