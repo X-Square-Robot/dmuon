@@ -1088,7 +1088,10 @@ class Muon(Optimizer):
         assert dp.tp_group is not None
         assert dp._tp_owner_global_rank is not None
 
-        local_grad = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1)
+        current_stream = torch.cuda.current_stream()
+        local_grad_tensor = dp._reduced_grad
+        local_grad_tensor.record_stream(current_stream)
+        local_grad = local_grad_tensor.view(local_grad_tensor.shape[0], -1)
         if "tp_local_momentum_buffer" not in state:
             state["tp_local_momentum_buffer"] = local_grad.clone()
         else:
@@ -1104,7 +1107,9 @@ class Muon(Optimizer):
                 f"{getattr(dp, 'param_name', '?')}: tp_gather_grads did "
                 "not populate _tp_full_grad on TP owner"
             )
-            full_grad = dp._tp_full_grad.view(dp._tp_full_grad.shape[0], -1)
+            full_grad_tensor = dp._tp_full_grad
+            full_grad_tensor.record_stream(current_stream)
+            full_grad = full_grad_tensor.view(full_grad_tensor.shape[0], -1)
             if "momentum_buffer" not in state:
                 state["momentum_buffer"] = full_grad.clone()
             else:
@@ -1259,7 +1264,7 @@ class Muon(Optimizer):
         self._apply_tp_distributed_gram_descriptor(desc)
 
     def consume_last_step_profile(self) -> dict[str, object]:
-        """Return the last step's CUDA event timings after the caller synced."""
+        """Return the last step's CUDA event timings, synchronizing if needed."""
 
         profile = dict(self._last_step_profile)
         if not profile:
@@ -1269,6 +1274,10 @@ class Muon(Optimizer):
             return profile
         event_totals: dict[str, float] = {}
         for name, start, end in self._last_step_profile_events:
+            if isinstance(start, torch.cuda.Event) and not start.query():
+                start.synchronize()
+            if isinstance(end, torch.cuda.Event) and not end.query():
+                end.synchronize()
             event_totals[name] = event_totals.get(name, 0.0) + float(
                 start.elapsed_time(end)
             )
@@ -1586,6 +1595,7 @@ class Muon(Optimizer):
                 for desc in tp_gram_descriptors:
                     self._apply_tp_distributed_gram_descriptor(desc)
 
+        current_stream = torch.cuda.current_stream()
         for dp in dedicated_params:
             if dp._reduced_grad is None:
                 continue
@@ -1620,9 +1630,13 @@ class Muon(Optimizer):
                     f"{getattr(dp, 'param_name', '?')}: tp_gather_grads did "
                     "not populate _tp_full_grad on TP owner"
                 )
-                grad = dp._tp_full_grad.view(dp._tp_full_grad.shape[0], -1)
+                grad_tensor = dp._tp_full_grad
+                grad_tensor.record_stream(current_stream)
+                grad = grad_tensor.view(grad_tensor.shape[0], -1)
             else:
-                grad = dp._reduced_grad.view(dp._reduced_grad.shape[0], -1)
+                grad_tensor = dp._reduced_grad
+                grad_tensor.record_stream(current_stream)
+                grad = grad_tensor.view(grad_tensor.shape[0], -1)
 
             # Momentum accumulation: buf = μ * buf + grad.  For TP-sharded
             # params the buf lives only on the TP owner and is sized to
