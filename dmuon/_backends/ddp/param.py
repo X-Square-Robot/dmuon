@@ -31,6 +31,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from dmuon._core.owner_rank import OwnerCoord, OwnerRankLike, normalize_owner_rank
+from dmuon.policy import normalize_route
 
 try:
     from torch.distributed.tensor import DTensor
@@ -93,7 +94,15 @@ class DedicatedParamDDP:
         dp_group: dist.ProcessGroup,
         device: torch.device,
         compute_dtype: Optional[torch.dtype] = None,
+        param_dtype: Optional[torch.dtype] = None,
+        grad_dtype: Optional[torch.dtype] = None,
+        output_dtype: Optional[torch.dtype] = None,
+        cast_forward_inputs: bool = True,
+        master_dtype: Optional[torch.dtype] = torch.float32,
+        optim_dtype: Optional[torch.dtype] = torch.float32,
+        route_hint: Optional[str] = None,
         tp_owner_local_rank: int = 0,
+        tp_group: Optional[dist.ProcessGroup] = None,
     ):
         self.module = module
         self.param_name = param_name
@@ -120,8 +129,18 @@ class DedicatedParamDDP:
 
         self._orig_size: torch.Size = local_data.size()
         self._orig_dtype: torch.dtype = local_data.dtype
-        self._compute_dtype: Optional[torch.dtype] = compute_dtype
+        if param_dtype is None:
+            param_dtype = compute_dtype
+        self._param_dtype: Optional[torch.dtype] = param_dtype
+        self._grad_dtype: Optional[torch.dtype] = grad_dtype
+        self._output_dtype: Optional[torch.dtype] = output_dtype
+        self._cast_forward_inputs: bool = bool(cast_forward_inputs)
+        self._master_dtype: Optional[torch.dtype] = master_dtype
+        self._optim_dtype: Optional[torch.dtype] = optim_dtype
+        self._compute_dtype: Optional[torch.dtype] = self._param_dtype  # legacy alias
+        self._dmuon_route: str = normalize_route(route_hint) or "muon"
         self._requires_grad: bool = param.requires_grad
+        self._tp_group_override = tp_group
 
         self.numel: int = self._orig_size.numel()
         self.shard_dim: Optional[int] = self._compute_shard_dim()
@@ -150,12 +169,19 @@ class DedicatedParamDDP:
         # redundant replica, but it keeps the broadcast/read interface
         # uniform with the FSDP2 path (which also keeps ``_owned_data`` on
         # every shard-peer of the owner, see DedicatedParam.__init__).
-        self._owned_data: torch.Tensor = local_data.detach().clone()
+        master_dtype = self._master_dtype or self._orig_dtype
+        self._owned_data: torch.Tensor = local_data.detach().to(
+            device=device,
+            dtype=master_dtype,
+        ).clone()
 
         # Keep a stable reference to the live module parameter. Used by
         # ``reduce_grad`` to read ``.grad`` after backward, and by
         # ``sync_from_owner`` to ``copy_`` updated data back.
         self._orig_param: nn.Parameter = param
+        live_dtype = self._param_dtype or self._orig_dtype
+        if live_dtype != local_data.dtype:
+            self._cast_live_param_(live_dtype)
 
         # Reduced gradient (on owner, after backward)
         self._reduced_grad: Optional[torch.Tensor] = None
@@ -172,6 +198,8 @@ class DedicatedParamDDP:
     # ---- cached-attr helpers ----------------------------------------------
 
     def _compute_tp_group(self) -> Optional[dist.ProcessGroup]:
+        if self._tp_group_override is not None:
+            return self._tp_group_override
         if self.is_dtensor and self._tp_spec is not None:
             return self._tp_spec.mesh.get_group(mesh_dim=0)
         return None
@@ -232,12 +260,26 @@ class DedicatedParamDDP:
     def clear_live_grad(self) -> None:
         self._orig_param.grad = None
 
+    def _live_tensor(self) -> torch.Tensor:
+        return self._orig_param._local_tensor if self.is_dtensor else self._orig_param.data
+
+    def _cast_live_param_(self, dtype: torch.dtype) -> None:
+        """Materialize the DDP live parameter in the requested compute dtype."""
+        if self.is_dtensor:
+            self._orig_param._local_tensor.data = self._orig_param._local_tensor.data.to(
+                device=self.device,
+                dtype=dtype,
+            )
+        else:
+            self._orig_param.data = self._orig_param.data.to(
+                device=self.device,
+                dtype=dtype,
+            )
+
     def copy_owned_to_live(self) -> None:
         """Copy ``_owned_data`` into the live Tensor or DTensor local shard."""
-        if self.is_dtensor:
-            self._orig_param._local_tensor.copy_(self._owned_data)
-        else:
-            self._orig_param.data.copy_(self._owned_data)
+        live = self._live_tensor()
+        live.copy_(self._owned_data.to(device=live.device, dtype=live.dtype))
 
     def set_live_grad_from_local(self, grad: torch.Tensor) -> None:
         """Install a local accumulated grad back onto the live parameter."""

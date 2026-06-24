@@ -3,7 +3,7 @@
 import logging
 import os
 from collections import defaultdict
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -19,8 +19,13 @@ from ._core.comm import DedicatedCommContext
 from ._core.internal_utils import unsafe_setattr_param
 from ._core.owner_rank import normalize_owner_rank
 from ._core.partition import _extract_layer_id, compute_balanced_assignment
+from ._core.process_groups import (
+    maybe_isolate_process_group,
+    resolve_process_group_policy,
+)
 from ._core.state import DedicatedState
 from ._core.tp import is_tp_sharded
+from .policy import ParamPolicyFn, resolve_param_policies
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +94,88 @@ def _link_forward_prefetch_states(
             later_state.group for later_state in ordered[idx + 1 :]
         ]
     comm_ctx.all_states[:] = ordered
+
+
+def _attach_dedicated_state(module: nn.Module, state: DedicatedState) -> None:
+    states = list(getattr(module, "_dedicated_states", ()))
+    states.append(state)
+    module._dedicated_states = states
+    if not hasattr(module, "_dedicated_state"):
+        module._dedicated_state = state
+
+
+def _policy_group_key(d_param) -> tuple[object, ...]:
+    return (
+        getattr(d_param, "_param_dtype", None),
+        getattr(d_param, "_grad_dtype", None),
+        getattr(d_param, "_output_dtype", None),
+        bool(getattr(d_param, "_cast_forward_inputs", True)),
+        getattr(d_param, "_muon_forward_unshard", None),
+    )
+
+
+def _dtype_label(dtype: object) -> str:
+    if isinstance(dtype, torch.dtype):
+        return str(dtype).replace("torch.", "")
+    return str(dtype)
+
+
+def _effective_param_dtype(d_param) -> Optional[torch.dtype]:
+    return getattr(d_param, "_param_dtype", None) or getattr(d_param, "_orig_dtype", None)
+
+
+def _validate_policy_hook_boundaries(
+    layer_to_dparams: Mapping[tuple[nn.Module, tuple[object, ...]], list[object]],
+    module_fqns: Mapping[int, str],
+) -> None:
+    """Reject activation-cast policies that are ambiguous at one hook site.
+
+    ``param_policy`` is per parameter, but input/output activation casts are
+    attached to the module hook boundary.  A single module forward has one set of
+    inputs and outputs, so multiple dtype targets at that same boundary would
+    make hook order decide semantics.
+    """
+
+    module_to_dparams: dict[nn.Module, list[object]] = defaultdict(list)
+    for (layer_module, _policy_key), d_params in layer_to_dparams.items():
+        module_to_dparams[layer_module].extend(d_params)
+
+    for module, d_params in module_to_dparams.items():
+        cast_input_targets = {
+            _effective_param_dtype(dp)
+            for dp in d_params
+            if getattr(dp, "_cast_forward_inputs", True)
+            and _effective_param_dtype(dp) is not None
+        }
+        effective_param_dtypes = {
+            _effective_param_dtype(dp)
+            for dp in d_params
+            if _effective_param_dtype(dp) is not None
+        }
+        if cast_input_targets and len(effective_param_dtypes) > 1:
+            name = module_fqns.get(id(module), "<unknown>")
+            dtypes = ", ".join(sorted(_dtype_label(dtype) for dtype in effective_param_dtypes))
+            raise ValueError(
+                f"DMuon param_policy attaches mixed param dtypes ({dtypes}) to "
+                f"one hook boundary {name!r} while cast_forward_inputs is enabled. "
+                "Use a narrower hook_boundary_predicate/hook_boundary_resolver, "
+                "or disable cast_forward_inputs and handle activation casts in "
+                "the module."
+            )
+
+        output_dtypes = {
+            getattr(dp, "_output_dtype", None)
+            for dp in d_params
+            if getattr(dp, "_output_dtype", None) is not None
+        }
+        if len(output_dtypes) > 1:
+            name = module_fqns.get(id(module), "<unknown>")
+            dtypes = ", ".join(sorted(_dtype_label(dtype) for dtype in output_dtypes))
+            raise ValueError(
+                f"DMuon param_policy attaches mixed output_dtype values ({dtypes}) "
+                f"to one hook boundary {name!r}. Use a narrower hook boundary "
+                "or make the module own output casting explicitly."
+            )
 
 
 def _lowest_common_ancestor_module(
@@ -260,6 +347,14 @@ def _resolve_owner_pack_small_params(pack_small_params: Optional[bool]) -> bool:
     return bool(pack_small_params)
 
 
+def _param_tp_group(param: nn.Parameter) -> Optional[object]:
+    spec = getattr(param, "_spec", None)
+    mesh = getattr(spec, "mesh", None)
+    if mesh is None:
+        return None
+    return mesh.get_group(mesh_dim=0)
+
+
 def _resolve_hook_module(
     model: nn.Module,
     target_param: nn.Parameter,
@@ -315,6 +410,9 @@ def dedicate_params(
     replicate_broadcast_bucket_mb: float = 0.0,
     muon_forward_unshard: str = "broadcast",
     delay_stage2_to_optimizer: bool = True,
+    param_policy: Optional[Mapping[str, object]] = None,
+    param_policy_fn: Optional[ParamPolicyFn] = None,
+    process_group_policy: Optional[str] = None,
 ) -> dict[nn.Parameter, int]:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -426,6 +524,21 @@ def dedicate_params(
             waited by per-group optimizer preparation.  This is the default
             because it preserves overlap between late reduce tails and earlier
             optimizer/publish work.
+        param_policy: Optional structured per-parameter policy. The policy starts
+            from ``defaults`` and applies ordered ``overrides`` whose
+            ``name`` tokens match the full parameter name. Supported fields
+            include ``route``, ``param_dtype``, ``grad_dtype``, ``output_dtype``,
+            ``cast_forward_inputs``, ``master_dtype``, ``optim_dtype``, and
+            ``muon_forward_unshard``. Prefer this over ``route_hint_fn`` for pure
+            DMuon integrations that need mixed precision policy.
+        param_policy_fn: Optional ``(param_fqn, param) -> policy`` callable for
+            dynamic policy decisions. Mutually exclusive with ``param_policy``.
+        process_group_policy: DMuon process group ownership policy.
+            ``"isolated"`` (default, or ``DMUON_PROCESS_GROUP_POLICY``) clones
+            DMuon's DP/HSDP/TP process groups so external trainer collectives
+            cannot interleave with DMuon async communication on the same NCCL
+            communicator. ``"shared"`` preserves historical behavior and uses
+            the caller-provided mesh groups directly.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its DP owner
@@ -440,6 +553,7 @@ def dedicate_params(
     #    subset of params that are TP-sharded DTensors).
     owner_strategy = _resolve_owner_strategy(owner_strategy)
     owner_cost_model = _resolve_owner_cost_model(owner_cost_model)
+    process_group_policy = resolve_process_group_policy(process_group_policy)
     hsdp_column_balance = (
         _env_flag("DMUON_HSDP_COLUMN_BALANCE", True)
         if hsdp_column_balance is None
@@ -500,6 +614,7 @@ def dedicate_params(
         f"dedicate_params[{mode}]: {len(normalized)} params over {total_slots} "
         f"owner slots (shard={shard_size}, replicate={replicate_size}), "
         f"owner_strategy={owner_strategy}, owner_cost_model={owner_cost_model}, "
+        f"process_group_policy={process_group_policy}, "
         f"pack_small_params={pack_small_params}, "
         f"allocation_units={result.allocation_unit_count}, "
         f"packed_units={result.packed_allocation_unit_count}, "
@@ -511,8 +626,16 @@ def dedicate_params(
         param._dedicated_owner_rank = coord
 
     # 3. Create shared communication context
-    dp_group = mesh.get_group()
-    replicate_group = replicate_mesh.get_group() if replicate_mesh is not None else None
+    dp_group = maybe_isolate_process_group(
+        mesh.get_group(),
+        policy=process_group_policy,
+        role="fsdp2.dp",
+    )
+    replicate_group = maybe_isolate_process_group(
+        replicate_mesh.get_group() if replicate_mesh is not None else None,
+        policy=process_group_policy,
+        role="fsdp2.replicate",
+    )
     device_type = mesh.device_type
     device = torch.device(device_type, torch.cuda.current_device())
     comm_ctx = DedicatedCommContext(
@@ -523,10 +646,22 @@ def dedicate_params(
     )
 
     # 4. Group by layer module and create DedicatedParam + DedicatedState
-    layer_to_dparams: dict[nn.Module, list[DedicatedParam]] = defaultdict(list)
+    layer_to_dparams: dict[
+        tuple[nn.Module, tuple[object, ...]], list[DedicatedParam]
+    ] = defaultdict(list)
     param_to_fqn = {param: name for name, param in model.named_parameters()}
+    policies = resolve_param_policies(
+        params=normalized.keys(),
+        param_to_fqn=param_to_fqn,
+        compute_dtype=compute_dtype,
+        route_hint_fn=route_hint_fn,
+        param_policy=param_policy,
+        param_policy_fn=param_policy_fn,
+        default_muon_forward_unshard=muon_forward_unshard,
+    )
 
     for param, coord in normalized.items():
+        policy = policies[param]
         parent_modules = _find_parent_modules(model, param)
         parent_module, param_name = parent_modules[0]
         if len(parent_modules) > 1 and reshard_after_forward:
@@ -547,6 +682,19 @@ def dedicate_params(
                 f"{param_name}: TP-sharded dedicated parameter is missing "
                 "from AssignmentResult.tp_owners"
             )
+        tp_group = None
+        if is_tp_sharded(param, dp_mesh_dim_names):
+            source_tp_group = _param_tp_group(param)
+            if source_tp_group is None:
+                raise RuntimeError(
+                    f"{param_to_fqn[param]}: TP-sharded dedicated parameter "
+                    "has no DTensor TP process group"
+                )
+            tp_group = maybe_isolate_process_group(
+                source_tp_group,
+                policy=process_group_policy,
+                role="fsdp2.tp",
+            )
         d_param = DedicatedParam(
             param=param,
             module=parent_module,
@@ -554,30 +702,35 @@ def dedicate_params(
             owner_rank=coord,
             dp_group=dp_group,
             device=device,
-            compute_dtype=compute_dtype,
+            compute_dtype=policy.param_dtype,
+            param_dtype=policy.param_dtype,
+            grad_dtype=policy.grad_dtype,
+            output_dtype=policy.output_dtype,
+            cast_forward_inputs=policy.cast_forward_inputs,
+            master_dtype=policy.master_dtype,
+            optim_dtype=policy.optim_dtype,
             replicate_group=replicate_group,
             tp_owner_local_rank=(
                 result.tp_owners[param] if param in result.tp_owners else 0
             ),
-            route_hint=(
-                route_hint_fn(param_to_fqn[param], param)
-                if route_hint_fn is not None
-                else getattr(param, "_dmuon_route_hint", None)
-            ),
-            muon_forward_unshard=muon_forward_unshard,
+            tp_group=tp_group,
+            route_hint=policy.route,
+            muon_forward_unshard=policy.muon_forward_unshard or muon_forward_unshard,
         )
+        d_param._dmuon_policy = policy
         aliases = [(module, name) for module, name in parent_modules[1:]]
         if aliases:
             d_param._alias_modules = aliases
             for alias_module, alias_name in aliases:
                 unsafe_setattr_param(alias_module, alias_name, d_param._placeholder)
-        layer_to_dparams[layer_module].append(d_param)
+        layer_to_dparams[(layer_module, _policy_group_key(d_param))].append(d_param)
 
     all_states: list[DedicatedState] = []
     module_fqns = {
         id(module): name or "<root>" for name, module in model.named_modules()
     }
-    for layer_module, d_params in layer_to_dparams.items():
+    _validate_policy_hook_boundaries(layer_to_dparams, module_fqns)
+    for (layer_module, _policy_key), d_params in layer_to_dparams.items():
         group = DedicatedParamGroup(
             d_params,
             comm_ctx,
@@ -585,7 +738,7 @@ def dedicate_params(
         )
         group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         state = DedicatedState(layer_module, group, comm_ctx, reshard_after_forward)
-        layer_module._dedicated_state = state
+        _attach_dedicated_state(layer_module, state)
         all_states.append(state)
 
     # Link states for forward prefetch in actual module order, not owner
@@ -611,6 +764,9 @@ def dedicate_params_ddp(
     owner_strategy: Optional[str] = None,
     owner_cost_model: Optional[str] = None,
     pack_small_params: Optional[bool] = None,
+    param_policy: Optional[Mapping[str, object]] = None,
+    param_policy_fn: Optional[ParamPolicyFn] = None,
+    process_group_policy: Optional[str] = None,
 ) -> dict[nn.Parameter, int]:
     """DDP-path variant of :func:`dedicate_params`.
 
@@ -647,6 +803,10 @@ def dedicate_params_ddp(
         owner_strategy: Same as :func:`dedicate_params`.
         owner_cost_model: Same as :func:`dedicate_params`.
         pack_small_params: Same as :func:`dedicate_params`.
+        param_policy: Same structured policy surface as :func:`dedicate_params`.
+        param_policy_fn: Same dynamic policy surface as :func:`dedicate_params`.
+        process_group_policy: Same process-group ownership policy as
+            :func:`dedicate_params`.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its owner
@@ -660,6 +820,7 @@ def dedicate_params_ddp(
 
     owner_strategy = _resolve_owner_strategy(owner_strategy)
     owner_cost_model = _resolve_owner_cost_model(owner_cost_model)
+    process_group_policy = resolve_process_group_policy(process_group_policy)
     pack_small_params = _resolve_owner_pack_small_params(pack_small_params)
     result = compute_balanced_assignment(
         model,
@@ -698,6 +859,7 @@ def dedicate_params_ddp(
     logger.info(
         f"dedicate_params_ddp: {len(normalized)} params over {shard_size} ranks, "
         f"owner_strategy={owner_strategy}, owner_cost_model={owner_cost_model}, "
+        f"process_group_policy={process_group_policy}, "
         f"pack_small_params={pack_small_params}, "
         f"allocation_units={result.allocation_unit_count}, "
         f"packed_units={result.packed_allocation_unit_count}, "
@@ -711,15 +873,29 @@ def dedicate_params_ddp(
         param._dedicated_owner_rank = coord
         param._dedicated_mode = "ddp"
 
-    dp_group = mesh.get_group()
+    dp_group = maybe_isolate_process_group(
+        mesh.get_group(),
+        policy=process_group_policy,
+        role="ddp.dp",
+    )
     device_type = mesh.device_type
     device = torch.device(device_type, torch.cuda.current_device())
     comm_ctx = DedicatedCommContext(device, replicate_group=None)
 
-    layer_to_dparams: dict[nn.Module, list[DedicatedParamDDP]] = defaultdict(list)
+    layer_to_dparams: dict[
+        tuple[nn.Module, tuple[object, ...]], list[DedicatedParamDDP]
+    ] = defaultdict(list)
     param_to_fqn = {param: name for name, param in model.named_parameters()}
+    policies = resolve_param_policies(
+        params=normalized.keys(),
+        param_to_fqn=param_to_fqn,
+        compute_dtype=compute_dtype,
+        param_policy=param_policy,
+        param_policy_fn=param_policy_fn,
+    )
 
     for param, coord in normalized.items():
+        policy = policies[param]
         parent_module, param_name = _find_parent_module(model, param)
         layer_module = _resolve_hook_module(
             model,
@@ -737,15 +913,24 @@ def dedicate_params_ddp(
             owner_rank=coord,
             dp_group=dp_group,
             device=device,
-            compute_dtype=compute_dtype,
+            compute_dtype=policy.param_dtype,
+            param_dtype=policy.param_dtype,
+            grad_dtype=policy.grad_dtype,
+            output_dtype=policy.output_dtype,
+            cast_forward_inputs=policy.cast_forward_inputs,
+            master_dtype=policy.master_dtype,
+            optim_dtype=policy.optim_dtype,
+            route_hint=policy.route,
         )
-        layer_to_dparams[layer_module].append(d_param)
+        d_param._dmuon_policy = policy
+        layer_to_dparams[(layer_module, _policy_group_key(d_param))].append(d_param)
 
     all_states: list[DedicatedState] = []
     module_fqns = {
         id(module): name or "<root>" for name, module in model.named_modules()
     }
-    for layer_module, d_params in layer_to_dparams.items():
+    _validate_policy_hook_boundaries(layer_to_dparams, module_fqns)
+    for (layer_module, _policy_key), d_params in layer_to_dparams.items():
         group = DedicatedParamGroupDDP(d_params, comm_ctx)
         group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         # ``reshard_after_forward`` is meaningless on the DDP path (no
@@ -756,7 +941,7 @@ def dedicate_params_ddp(
         state = DedicatedState(
             layer_module, group, comm_ctx, reshard_after_forward=False
         )
-        layer_module._dedicated_state = state
+        _attach_dedicated_state(layer_module, state)
         all_states.append(state)
 
     _link_forward_prefetch_states(model, all_states, comm_ctx)
@@ -779,6 +964,9 @@ def dedicate_params_ddp_tp(
     owner_cost_model: Optional[str] = None,
     pack_small_params: Optional[bool] = None,
     tp_buffer_reuse: bool | str = False,
+    param_policy: Optional[Mapping[str, object]] = None,
+    param_policy_fn: Optional[ParamPolicyFn] = None,
+    process_group_policy: Optional[str] = None,
 ) -> dict[nn.Parameter, int]:
     """DDP-path variant that allows TP-sharded DTensor dedicated params.
 
@@ -794,6 +982,10 @@ def dedicate_params_ddp_tp(
     in that DP-owner replica gather their local reduced grads to a TP owner
     for full-matrix Newton-Schulz, scatter update shards back, then DDP
     broadcasts those updated shards across the DP mesh.
+
+    ``process_group_policy`` has the same semantics as :func:`dedicate_params`:
+    ``"isolated"`` (default) makes DMuon clone its DP/TP process groups, while
+    ``"shared"`` reuses the caller-provided mesh groups.
     """
     if mesh.ndim != 1:
         raise ValueError(
@@ -802,6 +994,7 @@ def dedicate_params_ddp_tp(
 
     owner_strategy = _resolve_owner_strategy(owner_strategy)
     owner_cost_model = _resolve_owner_cost_model(owner_cost_model)
+    process_group_policy = resolve_process_group_policy(process_group_policy)
     pack_small_params = _resolve_owner_pack_small_params(pack_small_params)
     result = compute_balanced_assignment(
         model,
@@ -836,6 +1029,7 @@ def dedicate_params_ddp_tp(
         f"dedicate_params_ddp_tp: {len(normalized)} params over {shard_size} "
         f"DP ranks, TP-sharded={len(result.tp_owners)}, "
         f"owner_strategy={owner_strategy}, owner_cost_model={owner_cost_model}, "
+        f"process_group_policy={process_group_policy}, "
         f"pack_small_params={pack_small_params}, "
         f"allocation_units={result.allocation_unit_count}, "
         f"packed_units={result.packed_allocation_unit_count}, "
@@ -846,7 +1040,11 @@ def dedicate_params_ddp_tp(
         param._dedicated_owner_rank = coord
         param._dedicated_mode = "ddp_tp"
 
-    dp_group = mesh.get_group()
+    dp_group = maybe_isolate_process_group(
+        mesh.get_group(),
+        policy=process_group_policy,
+        role="ddp_tp.dp",
+    )
     device_type = mesh.device_type
     device = torch.device(device_type, torch.cuda.current_device())
     comm_ctx = DedicatedCommContext(
@@ -855,10 +1053,20 @@ def dedicate_params_ddp_tp(
         tp_buffer_reuse=tp_buffer_reuse,
     )
 
-    layer_to_dparams: dict[nn.Module, list[DedicatedParamDDP]] = defaultdict(list)
+    layer_to_dparams: dict[
+        tuple[nn.Module, tuple[object, ...]], list[DedicatedParamDDP]
+    ] = defaultdict(list)
     param_to_fqn = {param: name for name, param in model.named_parameters()}
+    policies = resolve_param_policies(
+        params=normalized.keys(),
+        param_to_fqn=param_to_fqn,
+        compute_dtype=compute_dtype,
+        param_policy=param_policy,
+        param_policy_fn=param_policy_fn,
+    )
 
     for param, coord in normalized.items():
+        policy = policies[param]
         parent_module, param_name = _find_parent_module(model, param)
         layer_module = _resolve_hook_module(
             model,
@@ -873,6 +1081,19 @@ def dedicate_params_ddp_tp(
                 f"{param_name}: TP-sharded DDP+TP dedicated parameter is "
                 "missing from AssignmentResult.tp_owners"
             )
+        tp_group = None
+        if is_tp_sharded(param, dp_mesh_dim_names):
+            source_tp_group = _param_tp_group(param)
+            if source_tp_group is None:
+                raise RuntimeError(
+                    f"{param_to_fqn[param]}: TP-sharded DDP+TP dedicated "
+                    "parameter has no DTensor TP process group"
+                )
+            tp_group = maybe_isolate_process_group(
+                source_tp_group,
+                policy=process_group_policy,
+                role="ddp_tp.tp",
+            )
         d_param = DedicatedParamDDP(
             param=param,
             module=parent_module,
@@ -880,24 +1101,34 @@ def dedicate_params_ddp_tp(
             owner_rank=coord,
             dp_group=dp_group,
             device=device,
-            compute_dtype=compute_dtype,
+            compute_dtype=policy.param_dtype,
+            param_dtype=policy.param_dtype,
+            grad_dtype=policy.grad_dtype,
+            output_dtype=policy.output_dtype,
+            cast_forward_inputs=policy.cast_forward_inputs,
+            master_dtype=policy.master_dtype,
+            optim_dtype=policy.optim_dtype,
+            route_hint=policy.route,
             tp_owner_local_rank=(
                 result.tp_owners[param] if param in result.tp_owners else 0
             ),
+            tp_group=tp_group,
         )
-        layer_to_dparams[layer_module].append(d_param)
+        d_param._dmuon_policy = policy
+        layer_to_dparams[(layer_module, _policy_group_key(d_param))].append(d_param)
 
     all_states: list[DedicatedState] = []
     module_fqns = {
         id(module): name or "<root>" for name, module in model.named_modules()
     }
-    for layer_module, d_params in layer_to_dparams.items():
+    _validate_policy_hook_boundaries(layer_to_dparams, module_fqns)
+    for (layer_module, _policy_key), d_params in layer_to_dparams.items():
         group = DedicatedParamGroupDDP(d_params, comm_ctx)
         group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
         state = DedicatedState(
             layer_module, group, comm_ctx, reshard_after_forward=False
         )
-        layer_module._dedicated_state = state
+        _attach_dedicated_state(layer_module, state)
         all_states.append(state)
 
     _link_forward_prefetch_states(model, all_states, comm_ctx)

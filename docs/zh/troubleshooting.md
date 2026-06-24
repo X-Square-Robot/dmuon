@@ -112,8 +112,8 @@
     也出现同样的 NaN。若是，问题在于数据加载、模型架构或 dtype 不匹配。
 
     **若 NaN 仅在 DMuon 下出现：** 检查混合精度不匹配。确保
-    `dedicate_params` 中的 `compute_dtype` 与模型的 autocast dtype 一致，
-    或留为 `None` 以继承参数 dtype。
+    `param_policy.defaults.param_dtype` 与模块预期的 compute dtype 一致。
+    旧版 `compute_dtype` 参数会映射到 `param_dtype`；留为 `None` 时继承参数 dtype。
 
     **Gram NS 中的持续 NaN：** 若 NaN 仅在 `"gram"` 后端出现，切到 cuBLAS
     参考内核排查是不是快路径 SYRK 的问题：

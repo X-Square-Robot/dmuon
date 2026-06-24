@@ -1,23 +1,50 @@
 """Utility functions."""
 
 from contextlib import contextmanager, nullcontext
+import os
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from ._backends.ddp import DedicatedParamGroupDDP
 from ._backends.fsdp2 import DedicatedParam
 from ._core.comm import DedicatedCommContext
 from ._core.owner_rank import OwnerRankLike, normalize_owner_rank
+from ._core.process_groups import is_isolated_process_group
+
+
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _isolated_pg_barrier_enabled() -> bool:
+    return (
+        os.environ.get("DMUON_ISOLATED_PG_BARRIER", "0").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def iter_dedicated_states(model: nn.Module):
+    """Yield every DedicatedState attached to ``model`` once."""
+    seen: set[int] = set()
+    for module in model.modules():
+        states = getattr(module, "_dedicated_states", None)
+        if states is None:
+            state = getattr(module, "_dedicated_state", None)
+            states = () if state is None else (state,)
+        for state in states:
+            if state is None or id(state) in seen:
+                continue
+            seen.add(id(state))
+            yield state
 
 
 def get_dedicated_params(model: nn.Module) -> list[DedicatedParam]:
     """Collect all DedicatedParam instances from a model."""
     result = []
-    for module in model.modules():
-        if hasattr(module, "_dedicated_state"):
-            result.extend(module._dedicated_state.group.params)
+    for state in iter_dedicated_states(model):
+        result.extend(state.group.params)
     return result
 
 
@@ -139,9 +166,13 @@ def wait_all_reduces(model: nn.Module) -> None:
 
 def _iter_groups(model: nn.Module):
     """Yield every DedicatedParamGroup attached to ``model`` once."""
-    for module in model.modules():
-        if hasattr(module, "_dedicated_state"):
-            yield module._dedicated_state.group
+    seen: set[int] = set()
+    for state in iter_dedicated_states(model):
+        group = state.group
+        if id(group) in seen:
+            continue
+        seen.add(id(group))
+        yield group
 
 
 @contextmanager
@@ -357,6 +388,52 @@ def wait_all_replicate_broadcasts(model: nn.Module) -> None:
         g._pre_forward_wait()
 
 
+def fence_isolated_process_groups(model: nn.Module) -> None:
+    """Optionally drain DMuon-owned NCCL groups after an optimizer step.
+
+    ``process_group_policy="isolated"`` clones DMuon's process groups but still
+    allows cross-step overlap by default.  Set ``DMUON_ISOLATED_PG_BARRIER=1``
+    only when debugging suspected process-group ordering issues.  The strict
+    fence drains pending DMuon publish events, synchronizes the current CUDA
+    stream, and barriers every DMuon-owned process group, so it is intentionally
+    off for normal performance runs.
+    """
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if not _isolated_pg_barrier_enabled():
+        return
+
+    seen: set[int] = set()
+    process_groups = []
+    for group in _ordered_post_step_groups(model):
+        comm_ctx = getattr(group, "comm_ctx", None)
+        candidates = [
+            getattr(group, "_dp_group", None),
+            getattr(comm_ctx, "replicate_group", None),
+        ]
+        for param in getattr(group, "params", ()):
+            candidates.append(getattr(param, "tp_group", None))
+        for process_group in candidates:
+            if not is_isolated_process_group(process_group):
+                continue
+            group_id = id(process_group)
+            if group_id in seen:
+                continue
+            seen.add(group_id)
+            process_groups.append(process_group)
+
+    if not process_groups:
+        return
+
+    wait_all_replicate_broadcasts(model)
+    if torch.cuda.is_available():
+        torch.cuda.current_stream().synchronize()
+
+    for process_group in process_groups:
+        dist.barrier(group=process_group)
+
+
 @contextmanager
 def no_sync(model: nn.Module):
     """Context manager to disable gradient reduction for gradient accumulation.
@@ -380,11 +457,9 @@ def no_sync(model: nn.Module):
     """
     # Disable reduce for dedicated params (both FSDP2 and DDP paths)
     groups = []
-    for module in model.modules():
-        if hasattr(module, "_dedicated_state"):
-            group = module._dedicated_state.group
-            groups.append(group)
-            group.reduce_grads_enabled = False
+    for group in _iter_groups(model):
+        groups.append(group)
+        group.reduce_grads_enabled = False
     # Disable reduce-scatter for FSDP2 symmetric params
     if hasattr(model, "set_requires_gradient_sync"):
         model.set_requires_gradient_sync(False)

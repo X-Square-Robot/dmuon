@@ -41,6 +41,13 @@ class FakeDedicatedParam:
         self.numel = param.numel()
         self.full_shape = tuple(param.shape)
         self._owned_data = torch.zeros_like(param)
+        self._param_dtype = torch.bfloat16
+        self._grad_dtype = torch.float32 if route == "muon" else None
+        self._output_dtype = None
+        self._master_dtype = torch.float32
+        self._optim_dtype = torch.float32
+        self._cast_forward_inputs = True
+        self._dmuon_policy = SimpleNamespace(matched_overrides=(0,))
         self._owner_global_rank = owner_rank[0]
         self._owner_replicate_global_rank = owner_rank[1]
         self.replicate_group = replicate_group
@@ -118,6 +125,13 @@ def test_summarize_param_groups_counts_dmuon_type_split_routes() -> None:
         "muon",
         "sharded_adamw",
     }
+    matrix_row = next(row for row in summary["parameters"] if row["route"] == "muon")
+    assert matrix_row["param_dtype"] == "bfloat16"
+    assert matrix_row["grad_dtype"] == "float32"
+    assert matrix_row["master_dtype"] == "float32"
+    assert matrix_row["optim_dtype"] == "float32"
+    assert matrix_row["cast_forward_inputs"] is True
+    assert matrix_row["matched_policy_overrides"] == [0]
 
 
 def test_summarize_comm_plan_reports_forward_and_stage2_roots() -> None:
@@ -157,4 +171,6 @@ def test_summarize_comm_plan_reports_forward_and_stage2_roots() -> None:
     assert plan["groups"][0]["owner_bucket_count"] == 1
     assert plan["totals"]["stage1_shard_reduce_tensor_bytes"] > 0
     assert plan["totals"]["stage2_replicate_reduce_tensor_bytes_this_rank"] > 0
+    assert plan["groups"][0]["param_collectives"][0]["param_dtype"] == "bfloat16"
+    assert plan["groups"][0]["param_collectives"][0]["grad_dtype"] == "float32"
     assert plan["groups"][0]["param_collectives"][0]["stage2_replicate_axis_active_on_this_rank"]

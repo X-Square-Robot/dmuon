@@ -18,12 +18,16 @@ def _iter_dedicated_groups(model: nn.Module) -> list[Any]:
     groups: list[Any] = []
     seen: set[int] = set()
     for module in model.modules():
-        state = getattr(module, "_dedicated_state", None)
-        group = getattr(state, "group", None)
-        if group is None or id(group) in seen:
-            continue
-        seen.add(id(group))
-        groups.append(group)
+        states = getattr(module, "_dedicated_states", None)
+        if states is None:
+            state = getattr(module, "_dedicated_state", None)
+            states = () if state is None else (state,)
+        for state in states:
+            group = getattr(state, "group", None)
+            if group is None or id(group) in seen:
+                continue
+            seen.add(id(group))
+            groups.append(group)
     return groups
 
 
@@ -84,6 +88,14 @@ def _owner_coord(value: Any) -> list[int] | str:
         return str(value)
 
 
+def _dtype_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.dtype):
+        return str(value).replace("torch.", "")
+    return str(value)
+
+
 def _param_element_size(dp: Any) -> int:
     for attr in ("_owned_data", "_sharded_adamw_data", "_orig_param", "_placeholder"):
         tensor = getattr(dp, attr, None)
@@ -92,7 +104,11 @@ def _param_element_size(dp: Any) -> int:
                 return int(tensor.element_size())
             except Exception:
                 pass
-    dtype = getattr(dp, "_compute_dtype", None) or getattr(dp, "_orig_dtype", None)
+    dtype = (
+        getattr(dp, "_param_dtype", None)
+        or getattr(dp, "_compute_dtype", None)
+        or getattr(dp, "_orig_dtype", None)
+    )
     if isinstance(dtype, torch.dtype):
         return int(torch.empty((), dtype=dtype).element_size())
     return 2
@@ -194,6 +210,17 @@ def summarize_param_groups(
                 "name": _dp_display_name(dp, name_by_id),
                 "param_name": str(getattr(dp, "param_name", "<unknown>")),
                 "route": str(getattr(dp, "_dmuon_route", "muon")),
+                "param_dtype": _dtype_name(getattr(dp, "_param_dtype", None)),
+                "grad_dtype": _dtype_name(getattr(dp, "_grad_dtype", None)),
+                "output_dtype": _dtype_name(getattr(dp, "_output_dtype", None)),
+                "master_dtype": _dtype_name(getattr(dp, "_master_dtype", None)),
+                "optim_dtype": _dtype_name(getattr(dp, "_optim_dtype", None)),
+                "cast_forward_inputs": bool(
+                    getattr(dp, "_cast_forward_inputs", True)
+                ),
+                "matched_policy_overrides": list(
+                    getattr(getattr(dp, "_dmuon_policy", None), "matched_overrides", ())
+                ),
                 "group_index": int(group_index) if group_index is not None else None,
                 "group_name": str(group_name) if group_name is not None else None,
                 "owner_rank": _owner_coord(getattr(dp, "owner_rank", None)),
@@ -305,6 +332,8 @@ def summarize_comm_plan(
                         "owner_coord": _owner_coord(owner_coord),
                         "bytes": param_bytes,
                         "route": str(getattr(dp, "_dmuon_route", "muon")),
+                        "param_dtype": _dtype_name(getattr(dp, "_param_dtype", None)),
+                        "grad_dtype": _dtype_name(getattr(dp, "_grad_dtype", None)),
                         "stage1_shard_reduce_root_global_rank": getattr(
                             dp, "_owner_global_rank", None
                         ),

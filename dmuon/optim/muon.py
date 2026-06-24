@@ -21,6 +21,8 @@ from ..utils import (
     _dispatch_post_step_async,
     _ordered_post_step_groups,
     broadcast_all_updates,
+    fence_isolated_process_groups,
+    iter_dedicated_states,
     prepare_group_muon_grads,
     prepare_muon_grads,
     wait_group_muon_grads,
@@ -196,15 +198,14 @@ class Muon(Optimizer):
         self._all_dedicated_params = []
         self._dedicated_params = []
         seen_dps: set[int] = set()
-        for module in model.modules():
-            if hasattr(module, "_dedicated_state"):
-                for dp in module._dedicated_state.group.params:
-                    if id(dp) in seen_dps:
-                        continue
-                    seen_dps.add(id(dp))
-                    self._all_dedicated_params.append(dp)
-                    if dp.is_owner:
-                        self._dedicated_params.append(dp)
+        for state in iter_dedicated_states(model):
+            for dp in state.group.params:
+                if id(dp) in seen_dps:
+                    continue
+                seen_dps.add(id(dp))
+                self._all_dedicated_params.append(dp)
+                if dp.is_owner:
+                    self._dedicated_params.append(dp)
         self._dedicated_param_fqns_by_id = self._compute_dedicated_param_fqns(
             model, self._all_dedicated_params
         )
@@ -1396,6 +1397,20 @@ class Muon(Optimizer):
                     broadcast_all_updates(self.model)
                 finally:
                     self._profile_event_end(profile_token)
+
+            profile_token = self._profile_event_start("isolated_process_group_fence")
+            try:
+                if self._optimizer_step_index == 0 and self._first_step_progress_log:
+                    self._first_step_log(
+                        "first optimizer step entering isolated_process_group_fence"
+                    )
+                fence_isolated_process_groups(self.model)
+                if self._optimizer_step_index == 0 and self._first_step_progress_log:
+                    self._first_step_log(
+                        "first optimizer step finished isolated_process_group_fence"
+                    )
+            finally:
+                self._profile_event_end(profile_token)
 
             self._grads_ready = False
         except Exception:

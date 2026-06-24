@@ -54,6 +54,25 @@ def _group_has_sharded_adamw(group: object) -> bool:
     )
 
 
+def _cast_fp_tensor(dtype: torch.dtype, obj):
+    if isinstance(obj, torch.Tensor) and torch.is_floating_point(obj):
+        if obj.dtype != dtype:
+            return obj.to(dtype)
+    return obj
+
+
+def _apply_to_tensors(fn, obj):
+    if isinstance(obj, torch.Tensor):
+        return fn(obj)
+    if isinstance(obj, tuple):
+        return tuple(_apply_to_tensors(fn, item) for item in obj)
+    if isinstance(obj, list):
+        return [_apply_to_tensors(fn, item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _apply_to_tensors(fn, value) for key, value in obj.items()}
+    return obj
+
+
 class _DedicatedPreBackward(torch.autograd.Function):
     """Autograd function that triggers parameter unshard before backward."""
 
@@ -156,6 +175,10 @@ class DedicatedState:
         self.group._pre_forward_wait()
         self.group.unshard()  # no-op if already unsharded or prefetched
         self.group.wait_for_unshard()  # no-op if already unsharded
+        param_dtype = getattr(self.group, "_param_dtype", None)
+        if getattr(self.group, "_cast_forward_inputs", True) and param_dtype is not None:
+            args = _apply_to_tensors(lambda x: _cast_fp_tensor(param_dtype, x), args)
+            kwargs = _apply_to_tensors(lambda x: _cast_fp_tensor(param_dtype, x), kwargs)
         # Forward prefetch: dispatch next layer's unshard (no wait).
         # During activation-checkpoint recompute this hook runs inside backward;
         # the next forward layer is not the next layer consumed by backward.
@@ -190,6 +213,12 @@ class DedicatedState:
         # Register pre-backward hook via autograd Function
         if torch.is_grad_enabled():
             output = self._register_pre_backward(output)
+        output_dtype = getattr(self.group, "_output_dtype", None)
+        if output_dtype is not None:
+            output = _apply_to_tensors(
+                lambda x: _cast_fp_tensor(output_dtype, x),
+                output,
+            )
         return output
 
     # ---- post-backward fast path + root callback -------------------------

@@ -159,6 +159,13 @@ def _owner_broadcast_enabled(p: DedicatedParam) -> bool:
     return not _sharded_adamw_enabled(p) and not _sharded_muon_forward_enabled(p)
 
 
+def _uniform_param_attr(params: list[DedicatedParam], attr: str):
+    values = {getattr(p, attr, None) for p in params}
+    if len(values) > 1:
+        raise ValueError(f"DedicatedParamGroup expects uniform {attr}, got {values}")
+    return next(iter(values)) if values else None
+
+
 def _needs_post_step_replicate_broadcast(p: DedicatedParam) -> bool:
     # Production type-split AdamW uses DMuon owner update + post-step publish,
     # matching Muon tensors.  Replicate-all-reduce mode lets every shard-owner
@@ -400,8 +407,20 @@ class DedicatedParamGroup:
         self._dp_group: Optional[dist.ProcessGroup] = (
             params[0].dp_group if params else None
         )
+        self._param_dtype: Optional[torch.dtype] = _uniform_param_attr(
+            params, "_param_dtype"
+        )
+        self._grad_dtype: Optional[torch.dtype] = _uniform_param_attr(
+            params, "_grad_dtype"
+        )
+        self._output_dtype: Optional[torch.dtype] = _uniform_param_attr(
+            params, "_output_dtype"
+        )
+        self._cast_forward_inputs: bool = bool(
+            _uniform_param_attr(params, "_cast_forward_inputs")
+        ) if params else True
         self._comm_dtype: Optional[torch.dtype] = (
-            (params[0]._compute_dtype or params[0]._orig_dtype) if params else None
+            (self._param_dtype or params[0]._orig_dtype) if params else None
         )
         # Map {owner_coord → global rank} for all owners represented in params.
         # ``dist.get_global_rank`` is always called with the shard coordinate:
@@ -1065,27 +1084,33 @@ class DedicatedParamGroup:
         # dangle the post-reduce view.
         with _profile_range(f"dmuon.stage1_shard_reduce.{group_name}"):
             with torch.cuda.stream(reduce_stream):
-                with dist._coalescing_manager(group=dp_group, device=self.device):
-                    for p in self.params:
-                        if _sharded_adamw_enabled(p):
-                            continue
-                        if not p._is_unsharded or p._unsharded_param.grad is None:
-                            continue
-                        grad = p._unsharded_param.grad.data
-                        grad = p.local_grad_for_reduce(grad)
-                        grad = grad.contiguous()
-                        dist.reduce(
-                            grad,
-                            dst=self._global_owner_ranks[p.owner_rank],
-                            op=dist.ReduceOp.AVG,
-                            group=dp_group,
-                        )
-                        p._unsharded_param.grad = None
-                        self._pending_reduce.append((grad.view(-1), [p]))
-                        # Only the shard-owner rank holds the post-Stage-1 grad
-                        # and therefore participates in Stage-2.
-                        if has_replicate and my_shard_rank == p.owner_shard:
-                            stage2_pending.append((grad, p))
+                normal_work = [
+                    p
+                    for p in self.params
+                    if not _sharded_adamw_enabled(p)
+                    and p._is_unsharded
+                    and p._unsharded_param.grad is not None
+                ]
+                if normal_work:
+                    with dist._coalescing_manager(group=dp_group, device=self.device):
+                        for p in normal_work:
+                            grad = p._unsharded_param.grad.data
+                            grad = p.local_grad_for_reduce(grad)
+                            grad = grad.contiguous()
+                            if p._grad_dtype is not None and grad.dtype != p._grad_dtype:
+                                grad = grad.to(p._grad_dtype)
+                            dist.reduce(
+                                grad,
+                                dst=self._global_owner_ranks[p.owner_rank],
+                                op=dist.ReduceOp.AVG,
+                                group=dp_group,
+                            )
+                            p._unsharded_param.grad = None
+                            self._pending_reduce.append((grad.view(-1), [p]))
+                            # Only the shard-owner rank holds the post-Stage-1 grad
+                            # and therefore participates in Stage-2.
+                            if has_replicate and my_shard_rank == p.owner_shard:
+                                stage2_pending.append((grad, p))
 
                 sharded_work = [
                     p
@@ -1105,8 +1130,10 @@ class DedicatedParamGroup:
                             reduce_input = p._sharded_adamw_reduce_input
                             reduce_input.zero_()
                             reduce_input[: flat_grad.numel()].copy_(flat_grad)
-                            p._sharded_adamw_grad = torch.empty_like(
-                                p._sharded_adamw_comm_shard
+                            p._sharded_adamw_grad = torch.empty(
+                                p._sharded_adamw_chunk_numel,
+                                dtype=reduce_input.dtype,
+                                device=reduce_input.device,
                             )
                             dist.reduce_scatter_tensor(
                                 p._sharded_adamw_grad,
