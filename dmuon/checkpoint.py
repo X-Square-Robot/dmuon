@@ -458,17 +458,23 @@ def get_model_state_dict(
     # 1. Dedicated params.
     #    FSDP2 path: broadcast from owner (every shard-peer holds _owned_data;
     #    non-shard-peers need the bytes).
-    #    DDP path: every rank already has the live ``nn.Parameter`` in sync
-    #    (post-step broadcast was drained above), so read .data directly.
+    #    DDP/DDP_TP path: every rank keeps a local ``_owned_data`` master copy
+    #    for optimizer updates, while the live ``nn.Parameter`` may be cast to
+    #    the policy's forward dtype.  Save the master copy when available and
+    #    only fall back to the live parameter for legacy objects.
     for dp, fqn in dp_fqns.items():
         mode = getattr(
             dp._orig_param if hasattr(dp, "_orig_param") else None,
             "_dedicated_mode",
             None,
         )
-        if mode == "ddp":
+        if mode in {"ddp", "ddp_tp"}:
             if keep:
-                t = dp._orig_param.data
+                owned = getattr(dp, "_owned_data", None)
+                if owned is not None:
+                    t = owned.to(dp._orig_dtype)
+                else:
+                    t = dp._orig_param.data.to(dp._orig_dtype)
                 sd[fqn] = t.cpu() if cpu_offload else t.clone()
         elif getattr(dp, "_dmuon_route", None) == "sharded_adamw":
             t = _all_gather_sharded_adamw_tensor(
@@ -542,12 +548,14 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
                 )
             continue
         if dp._owned_data is not None:
-            dp._owned_data.copy_(state_dict[fqn].to(dp._orig_dtype).to(dp.device))
+            dp._owned_data.copy_(
+                state_dict[fqn].to(device=dp.device, dtype=dp._owned_data.dtype)
+            )
         # DDP path: sync the live parameter too.
         orig_param = getattr(dp, "_orig_param", None)
         if (
             orig_param is not None
-            and getattr(orig_param, "_dedicated_mode", None) == "ddp"
+            and getattr(orig_param, "_dedicated_mode", None) in {"ddp", "ddp_tp"}
         ):
             orig_param.data.copy_(
                 state_dict[fqn].to(orig_param.dtype).to(orig_param.device)
@@ -771,7 +779,8 @@ def set_optimizer_state_dict(
             dp = fqn_to_dp[fqn]
             if "momentum_buffer" in state:
                 target_dtype = (
-                    getattr(dp, "_compute_dtype", None)
+                    getattr(dp, "_optim_dtype", None)
+                    or getattr(dp, "_compute_dtype", None)
                     or getattr(dp, "_orig_dtype", None)
                     or state["momentum_buffer"].dtype
                 )

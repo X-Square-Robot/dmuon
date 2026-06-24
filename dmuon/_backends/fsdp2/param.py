@@ -132,8 +132,15 @@ class DedicatedParam:
         dp_group: dist.ProcessGroup,
         device: torch.device,
         compute_dtype: torch.dtype = None,
+        param_dtype: torch.dtype = None,
+        grad_dtype: torch.dtype = None,
+        output_dtype: torch.dtype = None,
+        cast_forward_inputs: bool = True,
+        master_dtype: torch.dtype = torch.float32,
+        optim_dtype: torch.dtype = torch.float32,
         replicate_group: Optional[dist.ProcessGroup] = None,
         tp_owner_local_rank: int = 0,
+        tp_group: Optional[dist.ProcessGroup] = None,
         route_hint: Optional[str] = None,
         muon_forward_unshard: str = "broadcast",
     ):
@@ -186,12 +193,21 @@ class DedicatedParam:
 
         self._orig_size = local_data.size()
         self._orig_dtype = local_data.dtype
-        self._compute_dtype = compute_dtype  # e.g. bf16 for mixed precision
+        if param_dtype is None:
+            param_dtype = compute_dtype
+        self._param_dtype = param_dtype  # materialized forward/backward param dtype
+        self._grad_dtype = grad_dtype  # optional gradient reduction/buffer dtype
+        self._output_dtype = output_dtype
+        self._cast_forward_inputs = bool(cast_forward_inputs)
+        self._master_dtype = master_dtype
+        self._optim_dtype = optim_dtype
+        self._compute_dtype = self._param_dtype  # legacy alias
         self._requires_grad = param.requires_grad
         self._dmuon_route: str = _normalize_dmuon_route_hint(route_hint)
         self._muon_forward_unshard: str = _normalize_muon_forward_unshard(
             muon_forward_unshard
         )
+        self._tp_group_override = tp_group
 
         # Cached attrs (were @property, now computed once).
         # Dependencies: is_dtensor, _tp_spec, _orig_size — all set above.
@@ -242,7 +258,11 @@ class DedicatedParam:
         # Ranks outside the owner's shard column never need this buffer.
         is_in_owner_shard_column = dp_group.rank() == self.owner_shard
         if is_in_owner_shard_column:
-            self._owned_data = local_data.detach().clone().to(device=device)
+            master_dtype = self._master_dtype or self._orig_dtype
+            self._owned_data = local_data.detach().to(
+                device=device,
+                dtype=master_dtype,
+            ).clone()
         else:
             self._owned_data = None
 
@@ -347,6 +367,7 @@ class DedicatedParam:
         local_data: torch.Tensor,
         *,
         allow_meta_source: bool = False,
+        scratch_dtype: torch.dtype = None,
     ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.tp_group is not None:
             raise NotImplementedError(
@@ -361,9 +382,12 @@ class DedicatedParam:
         stop = min(start + chunk, numel)
         valid = max(0, stop - start)
 
-        data_shard = torch.zeros(chunk, dtype=self._orig_dtype, device=self.device)
+        master_dtype = self._master_dtype or self._orig_dtype
+        data_shard = torch.zeros(chunk, dtype=master_dtype, device=self.device)
         if valid and not bool(getattr(local_data, "is_meta", False)):
-            data_shard[:valid].copy_(local_data.detach().reshape(-1)[start:stop])
+            data_shard[:valid].copy_(
+                local_data.detach().reshape(-1)[start:stop].to(dtype=master_dtype)
+            )
         elif valid and not allow_meta_source:
             raise NotImplementedError(
                 f"{self.param_name}: cannot initialize sharded storage from a "
@@ -371,12 +395,17 @@ class DedicatedParam:
             )
 
         full_padded_numel = chunk * shard_world
-        comm_dtype = self._compute_dtype or self._orig_dtype
+        comm_dtype = self._param_dtype or self._orig_dtype
+        scratch_dtype = scratch_dtype or comm_dtype
         full_padded = torch.empty(
             full_padded_numel, dtype=comm_dtype, device=self.device
         )
         comm_shard = torch.empty(chunk, dtype=comm_dtype, device=self.device)
-        full_comm = torch.empty(full_padded_numel, dtype=comm_dtype, device=self.device)
+        full_comm = torch.empty(
+            full_padded_numel,
+            dtype=scratch_dtype,
+            device=self.device,
+        )
         return chunk, valid, data_shard, full_padded, comm_shard, full_comm
 
     def _init_sharded_adamw_storage(self, local_data: torch.Tensor) -> None:
@@ -389,7 +418,10 @@ class DedicatedParam:
             full_padded,
             comm_shard,
             reduce_input,
-        ) = self._init_sharded_storage_common(local_data)
+        ) = self._init_sharded_storage_common(
+            local_data,
+            scratch_dtype=self._grad_dtype or self._param_dtype or self._orig_dtype,
+        )
         self._sharded_adamw_chunk_numel = int(chunk)
         self._sharded_adamw_valid_numel = int(valid)
         self._sharded_adamw_data = shard
@@ -484,6 +516,8 @@ class DedicatedParam:
     # ---- cached-attr helpers (called once from __init__) ----
 
     def _compute_tp_group(self) -> Optional[dist.ProcessGroup]:
+        if self._tp_group_override is not None:
+            return self._tp_group_override
         if self.is_dtensor and self._tp_spec is not None:
             return self._tp_spec.mesh.get_group(mesh_dim=0)
         return None

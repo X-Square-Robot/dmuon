@@ -102,35 +102,53 @@ def predicate(name: str, param: nn.Parameter) -> bool:
 ### Advanced: Type-Split Routing
 
 For large scaling runs where DMuon should own communication for all trainable
-parameters, pass a broader `predicate` and a `route_hint_fn`.  Route
+parameters, pass a broader `predicate` and a `param_policy`.  Route
 `"muon"` keeps large matrix parameters on the matrix-optimizer path; route
 `"adamw"` keeps small AdamW parameters on DMuon's owner broadcast/reduce path;
 route `"sharded_adamw"` is reserved for very large AdamW tensors such as
 embeddings and `lm_head`, where all ranks should share the communication.
 
 ```python
-SHARDED_ADAMW_NAME_PARTS = ("embed_tokens", "lm_head")
-
-
-def route_hint(name, param):
-    if param.ndim == 2 and "proj" in name:
-        return "muon"
-    if param.ndim == 2 and any(part in name for part in SHARDED_ADAMW_NAME_PARTS):
-        return "sharded_adamw"
-    return "adamw"
-
 dmuon.dedicate_params(
     model,
     mesh,
     predicate=lambda n, p: p.requires_grad,
-    route_hint_fn=route_hint,
+    param_policy={
+        "defaults": {"route": "adamw", "param_dtype": torch.bfloat16},
+        "overrides": [
+            {
+                "name": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                "set": {"route": "muon"},
+            },
+            {
+                "name": ["embed_tokens", "lm_head"],
+                "set": {"route": "sharded_adamw"},
+            },
+        ],
+    },
 )
 ```
 
 The default `predicate=lambda n, p: "proj" in n and p.ndim == 2` remains the
 simpler integration path.  Use type-split routing only when you want DMuon to
 own placement and collectives for the non-Muon trainable parameters as well.
+`route_hint_fn` remains supported for legacy route-only integrations, but it
+cannot express per-module dtype policy.
 See [Pure DMuon Routing](pure-dmuon-routing.md) for the full route policy.
+
+### Process Group Policy
+
+DMuon uses `process_group_policy="isolated"` by default. In this mode DMuon
+creates its own DP/HSDP/TP process groups from the caller's mesh ranks instead
+of reusing the trainer's group handles. This keeps DMuon's async communication
+sequence separate from trainer logging, metrics, and checkpoint collectives.
+
+`isolated` does not imply a step-end synchronization. DMuon keeps cross-step
+overlap enabled by default. Set `DMUON_ISOLATED_PG_BARRIER=1` only as a
+diagnostic fence when you suspect process-group ordering problems. The fence
+drains DMuon publish work and barriers DMuon-owned process groups at the end of
+`optimizer.step()`, so it should stay disabled for normal throughput and MFU
+measurements.
 
 ### Inspecting the Assignment
 
@@ -218,7 +236,7 @@ raise during optimizer construction.
 
 Semantic `param_groups` are a hyperparameter grouping surface by default; they
 do not choose DMuon routes. For DMuon-managed parameters, the per-parameter
-route written by `dedicate_params(route_hint_fn=...)` is preserved even when a
+route written by `dedicate_params(param_policy=...)` is preserved even when a
 user group contains a mix of `"muon"`, `"adamw"`, and `"sharded_adamw"`
 parameters. A group-level route is applied only when the user group explicitly
 sets `dmuon_route`, `dmuon_optimizer`, or `matrix_optimizer`; use those keys only

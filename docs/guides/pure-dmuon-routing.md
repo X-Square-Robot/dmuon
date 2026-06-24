@@ -2,7 +2,7 @@
 
 Pure DMuon means every trainable parameter can enter DMuon's ownership runtime instead of leaving non-Muon parameters on the ordinary FSDP2/AdamW path. This mode is useful when a training stack wants one runtime to control parameter placement, gradient movement, and optimizer stepping for the whole model. The important point is that optimizer math and communication placement are separate decisions.
 
-`predicate` decides whether a parameter is DMuon-managed. `route_hint_fn` decides what DMuon does with that managed parameter:
+`predicate` decides whether a parameter is DMuon-managed. `param_policy` decides what DMuon does with that managed parameter. The route selects optimizer math and communication placement:
 
 | Route | Optimizer math | Forward parameter movement | Backward gradient movement | Typical parameters |
 |-------|----------------|----------------------------|----------------------------|--------------------|
@@ -16,7 +16,7 @@ Large terminal AdamW parameters are different. Input embeddings are read at the 
 
 ## Control Surface
 
-Route control has two steps. First, `predicate` decides which parameters enter
+Policy control has two steps. First, `predicate` decides which parameters enter
 DMuon's runtime at all. For pure DMuon this predicate is usually broad:
 
 ```python
@@ -25,11 +25,13 @@ predicate=lambda name, param: param.requires_grad
 
 Every trainable parameter that returns `False` stays outside DMuon and must be
 handled by the surrounding FSDP/DDP runtime. Every trainable parameter that
-returns `True` is replaced by a DMuon placeholder and receives a route from
-`route_hint_fn`.
+returns `True` is replaced by a DMuon placeholder and receives a structured
+policy from `param_policy`.
 
-Second, `route_hint_fn(name, param)` returns the communication and optimizer
-route for that DMuon-managed parameter:
+Second, `param_policy` starts from `defaults` and applies ordered `overrides`
+whose `name` tokens match the full parameter name. Each override updates
+only the fields it sets. `contains` is still accepted as a legacy alias for
+`name`, but new integrations should use `name`. The main route choices are:
 
 - Return `"muon"` for projection matrices that should be updated by Muon.
 - Return `"adamw"` for small AdamW parameters such as LayerNorm weights, bias
@@ -38,14 +40,14 @@ route for that DMuon-managed parameter:
 - Return `"sharded_adamw"` only for large AdamW tensors whose communication
   should be split across all ranks, typically input embeddings and `lm_head`.
 
-For any trainable parameter included by `predicate`, return one of these three
-strings explicitly. A `None` route hint is normalized to the default `"muon"`
-route, so accidentally returning `None` for a LayerNorm or bias parameter would
-put that parameter on the wrong optimizer path.
+For any trainable parameter included by `predicate`, make sure the final
+`route` is one of these three strings. A missing route is normalized to the
+default `"muon"` route, so accidentally leaving LayerNorm or bias parameters
+without an AdamW override would put them on the wrong optimizer path.
 
-The returned string is consumed while `dedicate_params()` still has access to
-the original full parameter tensor. This matters for `"sharded_adamw"` because
-DMuon must build per-rank shard storage before the parameter is replaced by its
+The final policy is consumed while `dedicate_params()` still has access to the
+original full parameter tensor. This matters for `"sharded_adamw"` because DMuon
+must build per-rank shard storage before the parameter is replaced by its
 placeholder. Optimizer param groups may later group dedicated parameters for
 hyperparameters, but they cannot create `"sharded_adamw"` storage after
 `dedicate_params()` has finished.
@@ -53,69 +55,68 @@ hyperparameters, but they cannot create `"sharded_adamw"` storage after
 Optimizer `param_groups` also do not override these per-parameter route hints by
 default. A semantic group may contain both Muon matrices and AdamW-routed small
 parameters; DMuon splits that group into route-specific optimizer subgroups while
-keeping the route selected by `route_hint_fn`. Set `dmuon_route`,
+keeping the route selected by `param_policy`. Set `dmuon_route`,
 `dmuon_optimizer`, or `matrix_optimizer` on a user group only when you
 intentionally want a group-level route override.
+
+The dtype fields follow FSDP2 mixed-precision terminology. `param_dtype` is the
+dtype of the materialized parameter used by forward/backward compute and forward
+parameter communication. `grad_dtype` is the dtype for DMuon's gradient buffers
+and gradient reduction. `output_dtype` casts floating-point outputs at the
+module boundary, and `cast_forward_inputs=True` casts floating-point inputs to
+`param_dtype`. `master_dtype` and `optim_dtype` describe DMuon's storage and
+optimizer-update precision and stay separate from forward compute dtype.
 
 ## Routing Policy
 
 A practical LLM policy is:
 
-- Projection matrices that benefit from Muon return `"muon"`.
+- Parameters suitable for matrix optimization use `"muon"` by default.
 - Embedding and `lm_head` weights return `"sharded_adamw"`.
 - LayerNorm, bias, and small AdamW parameters return `"adamw"`.
 
 ```python
-SHARDED_ADAMW_NAME_PARTS = ("embed_tokens", "lm_head")
-BLOCKED_MUON_NAME_PARTS = ("embed", "lm_head", "norm")
-
-
-def is_muon_matrix(name, param):
-    if not param.requires_grad or param.ndim != 2 or not name.endswith(".weight"):
-        return False
-    if any(part in name for part in BLOCKED_MUON_NAME_PARTS):
-        return False
-    return any(
-        part in name
-        for part in (
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        )
-    )
-
-
-def is_large_adamw_terminal_param(name, param):
-    if not param.requires_grad or param.ndim != 2 or not name.endswith(".weight"):
-        return False
-    return any(part in name for part in SHARDED_ADAMW_NAME_PARTS)
-
-
-def route_hint(name, param):
-    if not param.requires_grad:
-        return None
-    if is_muon_matrix(name, param):
-        return "muon"
-    if is_large_adamw_terminal_param(name, param):
-        return "sharded_adamw"
-    return "adamw"
-
-
 dmuon.dedicate_params(
     model,
     mesh,
     predicate=lambda name, param: param.requires_grad,
-    route_hint_fn=route_hint,
+    param_policy={
+        "defaults": {
+            "route": "muon",
+            "param_dtype": torch.bfloat16,
+            "grad_dtype": None,
+            "master_dtype": torch.float32,
+            "optim_dtype": torch.float32,
+        },
+        "overrides": [
+            {
+                "name": ["embed_tokens", "word_embeddings", "wte", "lm_head"],
+                "set": {"route": "sharded_adamw"},
+            },
+            {
+                "name": ["norm", "ln_", ".bias"],
+                "set": {"route": "adamw"},
+            },
+            {
+                "name": ["action_head", "action_decoder"],
+                "set": {
+                    "param_dtype": torch.float32,
+                    "grad_dtype": torch.float32,
+                    "output_dtype": torch.float32,
+                    "cast_forward_inputs": True,
+                },
+            },
+        ],
+    },
 )
 ```
 
 If this policy is active, LayerNorm parameters do not need special-case FSDP
-wrapping to avoid all-gather/reduce-scatter. They match the final `return
-"adamw"` branch and therefore use DMuon's owner broadcast/reduce route.
+wrapping to avoid all-gather/reduce-scatter. They match the `"adamw"` override
+and therefore use DMuon's owner broadcast/reduce path. Projection matrices that
+do not match a special override keep the default `"muon"` route. Parameters
+under `action_head` can keep fp32 forward compute without forcing the rest of
+the model out of bf16 compute.
 
 ## Hook Boundaries
 
@@ -138,7 +139,13 @@ def hook_boundary(module):
     return isinstance(module, TransformerDecoderLayer)
 ```
 
-`hook_boundary_predicate` controls where DMuon communication is attached. `route_hint_fn` controls which communication primitive is used for each parameter at that boundary.
+`hook_boundary_predicate` controls where DMuon communication is attached. `param_policy` controls which communication primitive and dtype policy is used for each parameter at that boundary.
+
+Activation casts are hook-boundary operations. If one hook boundary contains
+parameters with different effective `param_dtype` values and any group enables
+`cast_forward_inputs`, DMuon raises during setup. Split the action head into its
+own hook boundary, or set `cast_forward_inputs=False` and make the module handle
+activation casts explicitly.
 
 ## Validation
 
@@ -149,4 +156,9 @@ summary = dmuon.summarize_param_groups(model, optimizer)
 print(summary)
 ```
 
-The expected pattern is that Muon-owned projection matrices appear under the Muon route, LayerNorm and bias parameters appear under AdamW, and only the large embedding/head tensors appear under sharded AdamW. If hundreds of small AdamW parameters appear under sharded AdamW, the route policy is too broad.
+The expected pattern is that Muon-owned projection matrices appear under the Muon route, LayerNorm and bias parameters appear under AdamW, and only the large embedding/head tensors appear under sharded AdamW. The parameter rows also show `param_dtype`, `grad_dtype`, `output_dtype`, and matched policy override indices. If hundreds of small AdamW parameters appear under sharded AdamW, the route policy is too broad.
+
+`route_hint_fn` remains available for legacy route-only integrations. New pure
+DMuon integrations should prefer `param_policy` because route, parameter dtype,
+gradient dtype, and module-boundary casting are resolved together before DMuon
+replaces the original parameters.

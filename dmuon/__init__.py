@@ -42,6 +42,7 @@ from .grad_clip import (
     register_muon_grad_clip_strategy,
 )
 from .diagnostics import summarize_comm_plan, summarize_param_groups
+from .policy import DMuonParamPolicy
 from .optim import (
     POLAR_EXPRESS_COEFFICIENTS,
     YOU_COEFFICIENTS,
@@ -86,6 +87,7 @@ __all__ = [
     "get_dedicated_params",
     "get_owned_params",
     "DedicatedCommContext",
+    "DMuonParamPolicy",
     "clip_grad_norm_",
     "register_muon_grad_clip_strategy",
     "MuonGradClipStats",

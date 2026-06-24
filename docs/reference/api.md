@@ -22,6 +22,20 @@ a single owner rank and registers the per-layer forward/backward hooks.  See
 [Z2 vs Z3 Modes](../guides/z2-z3-modes.md) for the two most common
 customization points.
 
+By default, `dedicate_params()` uses `process_group_policy="isolated"`.  DMuon
+clones the DP/HSDP/TP mesh process groups for its own collectives, so external
+trainer logging, metrics, and checkpoint collectives cannot enter the same
+NCCL communicator sequence as DMuon's async post-step publish.  Pass
+`process_group_policy="shared"` only when you explicitly want the historical
+behavior of reusing the caller-provided `DeviceMesh` groups.
+
+`isolated` only changes process-group ownership.  It does not add a step-end
+barrier by default, so DMuon's async publish can still overlap with the next
+training step.  For debugging suspected process-group ordering issues, set
+`DMUON_ISOLATED_PG_BARRIER=1` to force a strict post-step fence over DMuon-owned
+groups.  Do not enable that fence for performance measurements unless the
+experiment is explicitly measuring the no-overlap behavior.
+
 ::: dmuon.dedicate_params
 
 ---
@@ -78,7 +92,8 @@ import path.
 The primary optimizer class.  Manages Muon (Newton-Schulz + momentum) on
 matrix-routed dedicated parameters and AdamW on the base path in a single
 object.  The base path can be ordinary FSDP2-managed parameters or
-DMuon-managed sharded AdamW parameters selected via `route_hint_fn`.
+DMuon-managed sharded AdamW parameters selected via `param_policy` or the
+legacy `route_hint_fn`.
 Compatible with `torch.optim.lr_scheduler`.
 
 ::: dmuon.Muon
@@ -283,8 +298,8 @@ logging code.  Dump one summary per rank if you need a global view.
 
 Inspect how `Muon` routed trainable parameters across optimizer groups.  Use
 this after constructing the optimizer to check type-split routing, owner
-counts, and whether a `route_hint_fn` selected `muon`, `adamw`, or
-`sharded_adamw` as expected.
+counts, and whether `param_policy` selected `muon`, `adamw`, or
+`sharded_adamw` plus the expected parameter/gradient dtypes.
 
 ```python
 import json

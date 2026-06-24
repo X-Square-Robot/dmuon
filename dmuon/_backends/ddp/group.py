@@ -61,6 +61,13 @@ class PostStepBroadcastState(NamedTuple):
     event: torch.cuda.Event
 
 
+def _uniform_param_attr(params: list[DedicatedParamDDP], attr: str):
+    values = {getattr(p, attr, None) for p in params}
+    if len(values) > 1:
+        raise ValueError(f"DedicatedParamGroupDDP expects uniform {attr}, got {values}")
+    return next(iter(values)) if values else None
+
+
 class DedicatedParamGroupDDP:
     """Manages communication for DDP-path dedicated parameters in one layer.
 
@@ -122,8 +129,20 @@ class DedicatedParamGroupDDP:
         self._dp_group: Optional[dist.ProcessGroup] = (
             params[0].dp_group if params else None
         )
+        self._param_dtype: Optional[torch.dtype] = _uniform_param_attr(
+            params, "_param_dtype"
+        )
+        self._grad_dtype: Optional[torch.dtype] = _uniform_param_attr(
+            params, "_grad_dtype"
+        )
+        self._output_dtype: Optional[torch.dtype] = _uniform_param_attr(
+            params, "_output_dtype"
+        )
+        self._cast_forward_inputs: bool = bool(
+            _uniform_param_attr(params, "_cast_forward_inputs")
+        ) if params else True
         self._comm_dtype: Optional[torch.dtype] = (
-            (params[0]._compute_dtype or params[0]._orig_dtype) if params else None
+            (self._param_dtype or params[0]._orig_dtype) if params else None
         )
         self._total_numel_by_owner: dict[OwnerCoord, int] = {
             owner: sum(p.numel for p in owner_params)
@@ -140,7 +159,12 @@ class DedicatedParamGroupDDP:
     # ---- interface parity with DedicatedParamGroup (no-ops) -----------------
 
     @dynamo_disable
-    def unshard(self, *, prefetch: bool = False) -> None:
+    def unshard(
+        self,
+        *,
+        prefetch: bool = False,
+        allow_unready_publish_wait: bool = False,
+    ) -> None:
         """DDP path: parameter is always live, nothing to allocate.
 
         ``DedicatedState`` shares the same forward-prefetch call path across
@@ -221,20 +245,23 @@ class DedicatedParamGroupDDP:
         dp_group = self._dp_group
 
         with torch.cuda.stream(reduce_stream):
-            with dist._coalescing_manager(group=dp_group, device=self.device):
-                for p in self.params:
-                    grad = p._orig_param.grad
-                    if grad is None:
-                        continue
-                    gdata = p.local_grad_for_reduce(grad).data.contiguous()
-                    dist.reduce(
-                        gdata,
-                        dst=self._global_owner_ranks[p.owner_rank],
-                        op=dist.ReduceOp.AVG,
-                        group=dp_group,
-                    )
-                    p.clear_live_grad()
-                    self._pending_reduce.append((gdata.view(-1), [p]))
+            work = [p for p in self.params if p._orig_param.grad is not None]
+            if work:
+                with dist._coalescing_manager(group=dp_group, device=self.device):
+                    for p in work:
+                        grad = p._orig_param.grad
+                        assert grad is not None
+                        gdata = p.local_grad_for_reduce(grad).data.contiguous()
+                        if p._grad_dtype is not None and gdata.dtype != p._grad_dtype:
+                            gdata = gdata.to(p._grad_dtype)
+                        dist.reduce(
+                            gdata,
+                            dst=self._global_owner_ranks[p.owner_rank],
+                            op=dist.ReduceOp.AVG,
+                            group=dp_group,
+                        )
+                        p.clear_live_grad()
+                        self._pending_reduce.append((gdata.view(-1), [p]))
 
         self._post_reduce_event = reduce_stream.record_event()
 

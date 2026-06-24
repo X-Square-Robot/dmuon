@@ -120,8 +120,9 @@
     architecture, or dtype mismatch.
 
     **If NaN appears only with DMuon:** check for mixed-precision mismatch.
-    Ensure `compute_dtype` in `dedicate_params` matches the model's autocast
-    dtype, or leave it as `None` to inherit the parameter dtype.
+    Ensure `param_policy.defaults.param_dtype` matches the model's intended
+    module-level compute dtype. The legacy `compute_dtype` argument maps to
+    `param_dtype`; leave it as `None` to inherit the parameter dtype.
 
     **Persistent NaN in Gram NS:** if NaN appears only with the `"gram"`
     backend, switch to the cuBLAS reference kernel to isolate whether the

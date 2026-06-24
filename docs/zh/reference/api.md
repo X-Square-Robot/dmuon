@@ -20,6 +20,19 @@
 [自定义 Hook 边界](../../guides/custom-hook-boundaries.md) 和
 [Z2 与 Z3 模式](../../guides/z2-z3-modes.md)。
 
+默认情况下，`dedicate_params()` 使用 `process_group_policy="isolated"`。
+DMuon 会为自己的 DP/HSDP/TP collective 复制一套 mesh process group，
+避免外部 trainer 的 logging、metrics、checkpoint collective 插入 DMuon
+异步 post-step publish 所在的 NCCL communicator 序列。只有在明确需要复用
+调用方 `DeviceMesh` group 的历史行为时，才传
+`process_group_policy="shared"`。
+
+`isolated` 只改变 process group 的归属关系，默认不会在 step 末尾加 barrier，
+因此 DMuon 的异步 publish 仍然可以和下一步训练 overlap。只有在排查疑似
+process group 顺序问题时，才设置 `DMUON_ISOLATED_PG_BARRIER=1`，强制对
+DMuon-owned groups 做严格的 post-step fence。性能测试默认不要打开这个
+fence，除非实验目标就是测 no-overlap 行为。
+
 ::: dmuon.dedicate_params
 
 ---
@@ -74,8 +87,8 @@ data-parallel group 内部还有 Tensor Parallelism 的场景。
 
 主优化器类。在同一对象中管理 matrix-routed 专属参数上的 Muon
 （Newton-Schulz + 动量）和 base path 上的 AdamW。Base path 可以是普通
-FSDP2-managed 参数，也可以是通过 `route_hint_fn` 选择的 DMuon-managed
-sharded AdamW 参数。兼容 `torch.optim.lr_scheduler`。
+FSDP2-managed 参数，也可以是通过 `param_policy` 或旧版 `route_hint_fn`
+选择的 DMuon-managed sharded AdamW 参数。兼容 `torch.optim.lr_scheduler`。
 
 ::: dmuon.Muon
 
@@ -285,8 +298,8 @@ rank 各自 dump，再由外部脚本汇总。
 ### summarize_param_groups
 
 检查 `Muon` 如何把可训练参数路由到 optimizer groups。构造 optimizer 后调用
-它，可以确认 type-split routing、owner 数量，以及 `route_hint_fn` 是否按预期
-选择了 `muon`、`adamw` 或 `sharded_adamw`。
+它，可以确认 type-split routing、owner 数量，以及 `param_policy` 是否按预期
+选择了 `muon`、`adamw` 或 `sharded_adamw`，同时确认参数和梯度 dtype。
 
 ```python
 import json

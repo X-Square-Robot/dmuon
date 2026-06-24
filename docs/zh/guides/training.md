@@ -101,34 +101,50 @@ def predicate(name: str, param: nn.Parameter) -> bool:
 ### 高级模式：Type-Split Routing
 
 在大规模 scaling run 中，如果希望所有可训练参数的通信都由 DMuon 管理，可以传入
-更宽的 `predicate` 和一个 `route_hint_fn`。`"muon"` route 让大矩阵参数走
+更宽的 `predicate` 和一个 `param_policy`。`"muon"` route 让大矩阵参数走
 矩阵优化器路径；`"adamw"` route 让小 AdamW 参数走 DMuon 的 owner
 broadcast/reduce 路径；`"sharded_adamw"` 只留给 embedding、`lm_head` 这类
 需要所有 rank 分担通信的大 AdamW 张量。
 
 ```python
-SHARDED_ADAMW_NAME_PARTS = ("embed_tokens", "lm_head")
-
-
-def route_hint(name, param):
-    if param.ndim == 2 and "proj" in name:
-        return "muon"
-    if param.ndim == 2 and any(part in name for part in SHARDED_ADAMW_NAME_PARTS):
-        return "sharded_adamw"
-    return "adamw"
-
 dmuon.dedicate_params(
     model,
     mesh,
     predicate=lambda n, p: p.requires_grad,
-    route_hint_fn=route_hint,
+    param_policy={
+        "defaults": {"route": "adamw", "param_dtype": torch.bfloat16},
+        "overrides": [
+            {
+                "name": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                "set": {"route": "muon"},
+            },
+            {
+                "name": ["embed_tokens", "lm_head"],
+                "set": {"route": "sharded_adamw"},
+            },
+        ],
+    },
 )
 ```
 
 默认的 `predicate=lambda n, p: "proj" in n and p.ndim == 2` 仍然是更简单的
 集成路径。只有当你希望 DMuon 同时接管非 Muon 可训练参数的 placement 和
-collectives 时，才需要 type-split routing。完整路由策略见
+collectives 时，才需要 type-split routing。`route_hint_fn` 仍然支持旧的
+route-only 集成，但不能表达 per-module dtype policy。完整路由策略见
 [Pure DMuon 路由](pure-dmuon-routing.md)。
+
+### Process Group Policy
+
+DMuon 默认使用 `process_group_policy="isolated"`。这个模式会根据调用方 mesh
+里的 rank 复制一套 DMuon 自己的 DP/HSDP/TP process groups，而不是复用
+trainer 的 group handle。这样可以把 DMuon 的异步通信序列和 trainer 的
+logging、metrics、checkpoint collectives 分开。
+
+`isolated` 不等于 step 末尾同步。DMuon 默认保留 cross-step overlap。只有在
+排查疑似 process group 顺序问题时，才设置 `DMUON_ISOLATED_PG_BARRIER=1`
+作为诊断 fence。这个 fence 会在 `optimizer.step()` 末尾 drain DMuon publish
+work，并对 DMuon-owned process groups 做 barrier，所以正常吞吐和 MFU 测试
+都应该保持关闭。
 
 ### 查看分配结果
 
@@ -214,7 +230,7 @@ trainable 参数必须且只能出现在一个用户组中；如果传入 wrappi
 重复参数或漏掉参数，优化器构造阶段会直接报错。
 
 默认情况下，语义 `param_groups` 只表达超参数分组，不负责选择 DMuon route。
-对于 DMuon-managed 参数，`dedicate_params(route_hint_fn=...)` 写入的逐参数
+对于 DMuon-managed 参数，`dedicate_params(param_policy=...)` 写入的逐参数
 route 会被保留；即使同一个用户组里同时包含 `"muon"`、`"adamw"` 和
 `"sharded_adamw"` 参数，也不会被整组改路由。只有当用户组显式设置
 `dmuon_route`、`dmuon_optimizer` 或 `matrix_optimizer` 时，DMuon 才会把这个
