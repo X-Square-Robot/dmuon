@@ -41,6 +41,13 @@ from .grad_clip import (
     clip_grad_norm_,
     register_muon_grad_clip_strategy,
 )
+from .fast_clip import (
+    GradClipBucket,
+    GradClipBucketStats,
+    SegmentedGradClipResult,
+    clip_grad_norm_buckets_,
+    try_clip_optimizer_grad_norm_buckets_,
+)
 from .diagnostics import summarize_comm_plan, summarize_param_groups
 from .policy import DMuonParamPolicy
 from .optim import (
@@ -89,8 +96,13 @@ __all__ = [
     "DedicatedCommContext",
     "DMuonParamPolicy",
     "clip_grad_norm_",
+    "clip_grad_norm_buckets_",
+    "try_clip_optimizer_grad_norm_buckets_",
     "register_muon_grad_clip_strategy",
     "MuonGradClipStats",
+    "GradClipBucket",
+    "GradClipBucketStats",
+    "SegmentedGradClipResult",
     "summarize_comm_plan",
     "summarize_param_groups",
     "no_sync",
