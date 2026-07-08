@@ -252,6 +252,48 @@ DMuon 梯度裁剪的返回类型。
 
 ---
 
+### clip_grad_norm_buckets_
+
+以分段局部语义裁剪相互独立的梯度分段；可用时走可选的 CUDA 快速路径，否则回退纯
+Python。扩展的编译见[快速梯度裁剪](../getting-started/installation.md)。
+
+::: dmuon.clip_grad_norm_buckets_
+
+---
+
+### try_clip_optimizer_grad_norm_buckets_
+
+面向 Wall-X 式优化器的 `regular` / `muon` / `adamw` 分段裁剪入口。CUDA 扩展不可用时
+返回 `None`，调用方可在不触碰梯度的情况下回退。
+
+::: dmuon.try_clip_optimizer_grad_norm_buckets_
+
+---
+
+### GradClipBucket
+
+一个可独立裁剪的梯度分段。
+
+::: dmuon.GradClipBucket
+
+---
+
+### GradClipBucketStats
+
+单个分段裁剪前的范数与系数。
+
+::: dmuon.GradClipBucketStats
+
+---
+
+### SegmentedGradClipResult
+
+多分段裁剪调用的聚合结果。
+
+::: dmuon.SegmentedGradClipResult
+
+---
+
 ### get_dedicated_params
 
 枚举模型中所有 `DedicatedParam` 对象。用于检查 ownership 分配、参数数量

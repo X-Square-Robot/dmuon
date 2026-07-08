@@ -9,7 +9,7 @@
 ## 第一步 — 安装
 
 ```bash
-git clone https://github.com/StarrickLiu/dmuon && cd dmuon
+git clone https://github.com/X-Square-Robot/dmuon && cd dmuon
 pip install -e .
 ```
 

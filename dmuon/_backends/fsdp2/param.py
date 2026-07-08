@@ -240,7 +240,7 @@ class DedicatedParam:
             self.is_tp_owner = False
 
         # Storage: every rank in the owner's shard column keeps a populated
-        # ``_owned_data``.
+        # ``_owned_data`` for owner-broadcast placement.
         #
         # Why not just the global owner?  In HSDP mode each replicate row is
         # a full model instance with its own shard_group; the shard-dim
@@ -256,8 +256,12 @@ class DedicatedParam:
         # fans out to the other rows' shard-owner ranks.
         #
         # Ranks outside the owner's shard column never need this buffer.
+        #
+        # Sharded AdamW is different: every shard rank owns its flat shard in
+        # ``_sharded_adamw_data`` and reconstructs the forward view via
+        # all-gather.  It must not also keep a full fp32 owner copy here.
         is_in_owner_shard_column = dp_group.rank() == self.owner_shard
-        if is_in_owner_shard_column:
+        if is_in_owner_shard_column and self._dmuon_route != "sharded_adamw":
             master_dtype = self._master_dtype or self._orig_dtype
             self._owned_data = local_data.detach().to(
                 device=device,

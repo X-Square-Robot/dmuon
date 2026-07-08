@@ -311,6 +311,14 @@ The default strategy is global p-norm clipping over Muon gradients. Custom
 strategies can be registered with `dmuon.register_muon_grad_clip_strategy(...)`
 for future schemes such as MuonClip or projection-specific clipping.
 
+!!! tip "Fused CUDA clip for regular / Muon / AdamW"
+    When you clip all three gradient groups together (the Wall-X pattern),
+    `dmuon.try_clip_optimizer_grad_norm_buckets_(...)` computes the norm, clip
+    coefficient, and in-place scaling for every bucket in a single CUDA pass
+    with the same per-bucket semantics. It uses the optional fast-clip
+    extension (see [Installation](../getting-started/installation.md)) and
+    falls back to pure Python automatically when the extension is unavailable.
+
 ## Logging and Debugging
 
 ### Check NS Backend

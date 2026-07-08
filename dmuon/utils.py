@@ -138,7 +138,49 @@ def wait_group_muon_grads(g) -> None:
         g._muon_grad_ready_refs = []
 
 
-def prepare_muon_grads(model: nn.Module, *, use_reduce_stream: bool = False) -> None:
+def _finish_group_muon_grads_after_coalesced_wait(g) -> None:
+    """Clear one prepared group after a caller waited for the aggregate event."""
+
+    if getattr(g, "_tp_gather_event", None) is not None:
+        materialize = getattr(g, "_materialize_tp_gathered_grads", None)
+        if materialize is None:
+            wait_group_muon_grads(g)
+            return
+        materialize()
+        setattr(g, "_tp_gather_event", None)
+        if hasattr(g, "_tp_gather_refs"):
+            g._tp_gather_refs = []
+    setattr(g, "_muon_grad_ready_event", None)
+    if hasattr(g, "_muon_grad_ready_refs"):
+        g._muon_grad_ready_refs = []
+
+
+def _coalesced_wait_prepared_muon_grads(groups) -> bool:
+    reduce_stream = None
+    for group in groups:
+        group_stream = getattr(getattr(group, "comm_ctx", None), "reduce_stream", None)
+        if group_stream is None:
+            return False
+        if reduce_stream is None:
+            reduce_stream = group_stream
+        elif reduce_stream is not group_stream:
+            return False
+    if reduce_stream is None:
+        return True
+
+    ready_event = reduce_stream.record_event()
+    torch.cuda.current_stream().wait_event(ready_event)
+    for group in groups:
+        _finish_group_muon_grads_after_coalesced_wait(group)
+    return True
+
+
+def prepare_muon_grads(
+    model: nn.Module,
+    *,
+    use_reduce_stream: bool = False,
+    coalesce_wait: bool = False,
+) -> None:
     """Prepare all pending Muon gradients after backward.
 
     Gradient reduces are dispatched asynchronously during backward.  This
@@ -146,10 +188,18 @@ def prepare_muon_grads(model: nn.Module, *, use_reduce_stream: bool = False) -> 
     the TP gather that materializes ``_tp_full_grad`` for the TP owner.  It
     drains all prepared groups before returning so callers can immediately
     run Muon update code.
+
+    When every group shares one reduce stream, ``use_reduce_stream`` combined
+    with ``coalesce_wait`` lets advanced callers (such as the fused fast-clip
+    path) issue a single aggregate stream wait instead of draining each group
+    individually.  Both default to ``False`` and preserve the per-group wait.
     """
     groups = _ordered_post_step_groups(model)
     for g in groups:
         prepare_group_muon_grads(g, use_reduce_stream=use_reduce_stream)
+    if coalesce_wait and use_reduce_stream:
+        if _coalesced_wait_prepared_muon_grads(groups):
+            return
     for g in groups:
         wait_group_muon_grads(g)
 

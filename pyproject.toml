@@ -1,4 +1,10 @@
 [build-system]
+# torch is intentionally NOT listed here: pinning it would force PEP 517 build
+# isolation to download a multi-GB generic torch into a throwaway env and link
+# the CUDA extension against it (ABI-mismatch risk). To compile the optional
+# fast-clip kernel, install with `--no-build-isolation` in an env that already
+# has torch; otherwise setup.py skips the extension and the pure-Python clip is
+# used. See docs/getting-started/installation.md.
 requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
@@ -61,6 +67,9 @@ exclude = [
     "assets*",
     "site*",
 ]
+
+[tool.setuptools.package-data]
+dmuon = ["csrc/*.cu"]
 
 [tool.ruff]
 line-length = 100

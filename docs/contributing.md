@@ -12,7 +12,7 @@
 
 ```bash
 # Clone and install in editable mode
-git clone https://github.com/StarrickLiu/dmuon
+git clone https://github.com/X-Square-Robot/dmuon
 cd dmuon
 
 # Create environment (conda or venv)
@@ -128,8 +128,8 @@ Documentation is deployed automatically to GitHub Pages on every push to
 
 ## Community
 
-- **Bug reports and feature requests:** [GitHub Issues](https://github.com/StarrickLiu/dmuon/issues)
-- **Design discussions:** [GitHub Discussions](https://github.com/StarrickLiu/dmuon/discussions)
+- **Bug reports and feature requests:** [GitHub Issues](https://github.com/X-Square-Robot/dmuon/issues)
+- **Design discussions:** [GitHub Discussions](https://github.com/X-Square-Robot/dmuon/discussions)
 - No Discord at this time
 
 Please search existing issues before opening a new one.

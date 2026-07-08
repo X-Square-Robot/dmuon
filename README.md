@@ -15,8 +15,25 @@
 </p>
 
 <p align="center">
+  <a href="https://x-square-robot.github.io/dmuon/"><img alt="Docs" src="https://img.shields.io/badge/docs-online-4c6ef5"></a>
+  <a href="https://pytorch.org/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-FSDP2-EE4C2C?logo=pytorch&logoColor=white"></a>
+  <a href="https://x-square-robot.github.io/dmuon/guides/hsdp/"><img alt="HSDP" src="https://img.shields.io/badge/HSDP-native-6f42c1"></a>
+  <a href="https://x-square-robot.github.io/dmuon/guides/tp-support/"><img alt="Tensor Parallel" src="https://img.shields.io/badge/Tensor_Parallel-compatible-blue"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-black"></a>
   <img alt="Tech Report" src="https://img.shields.io/badge/Tech%20Report-Coming%20Soon-lightgrey">
-  <img alt="Wiki" src="https://img.shields.io/badge/Wiki-WIP-lightgrey">
+  <img alt="status" src="https://img.shields.io/badge/status-research--preview-orange">
+</p>
+
+<p align="center">
+  📖 <a href="https://x-square-robot.github.io/dmuon/"><strong>Documentation</strong></a>
+  &nbsp;·&nbsp;
+  🚀 <a href="https://x-square-robot.github.io/dmuon/getting-started/quickstart/"><strong>Quick Start</strong></a>
+  &nbsp;·&nbsp;
+  🌐 <a href="https://x-square-robot.github.io/dmuon/guides/hsdp/"><strong>HSDP Guide</strong></a>
+  &nbsp;·&nbsp;
+  🏛️ <a href="https://x-square-robot.github.io/dmuon/design/architecture/"><strong>Architecture</strong></a>
+  &nbsp;·&nbsp;
+  🇨🇳 <a href="https://x-square-robot.github.io/dmuon/zh/"><strong>中文文档</strong></a>
 </p>
 
 **DMuon** is a high-performance distributed implementation of the Muon optimizer that drops

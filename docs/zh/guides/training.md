@@ -304,6 +304,13 @@ for step, batch in enumerate(dataloader):
 MuonClip、QK/投影层专用 clip 等方案，可以通过
 `dmuon.register_muon_grad_clip_strategy(...)` 注册自定义策略。
 
+!!! tip "regular / Muon / AdamW 的融合 CUDA 裁剪"
+    当你需要把三个梯度组一起裁剪（Wall-X 模式）时，
+    `dmuon.try_clip_optimizer_grad_norm_buckets_(...)` 会在一趟 CUDA 计算里
+    完成每个分段的范数、裁剪系数与就地缩放，且保持逐分段语义。它使用可选的快速
+    裁剪扩展（见[安装](../getting-started/installation.md)），扩展不可用时自动
+    回退到纯 Python。
+
 ## 日志与调试
 
 ### 检查 NS 后端

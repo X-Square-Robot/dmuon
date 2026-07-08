@@ -11,7 +11,7 @@
 
 ```bash
 # 克隆并以可编辑模式安装
-git clone https://github.com/StarrickLiu/dmuon
+git clone https://github.com/X-Square-Robot/dmuon
 cd dmuon
 
 # 创建环境（conda 或 venv）
@@ -123,8 +123,8 @@ DMuon 遵循语义化版本：`MAJOR.MINOR.PATCH`。
 
 ## 社区
 
-- **Bug 报告和功能请求：** [GitHub Issues](https://github.com/StarrickLiu/dmuon/issues)
-- **设计讨论：** [GitHub Discussions](https://github.com/StarrickLiu/dmuon/discussions)
+- **Bug 报告和功能请求：** [GitHub Issues](https://github.com/X-Square-Robot/dmuon/issues)
+- **设计讨论：** [GitHub Discussions](https://github.com/X-Square-Robot/dmuon/discussions)
 - 暂无 Discord
 
 提 issue 前请先搜索已有 issue。
