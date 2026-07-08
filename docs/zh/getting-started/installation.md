@@ -30,7 +30,7 @@
 === "从源码安装（推荐）"
 
     ```bash
-    git clone https://github.com/StarrickLiu/dmuon
+    git clone https://github.com/X-Square-Robot/dmuon
     cd dmuon
     pip install -e .
     ```
@@ -51,7 +51,7 @@
 === "开发模式（可编辑 + 测试依赖）"
 
     ```bash
-    git clone https://github.com/StarrickLiu/dmuon
+    git clone https://github.com/X-Square-Robot/dmuon
     cd dmuon
     pip install -e ".[dev]"
     ```
@@ -81,6 +81,47 @@ pip install -e ".[syrk]"
 - `torch-c-dlpack-ext`
 
 首次使用时 JIT 编译通常需要 1–3 分钟，编译产物缓存在 `~/.cache/dmuon/`。
+
+---
+
+## 可选：快速梯度裁剪（CUDA）
+
+DMuon 附带一个可选的 CUDA 内核，把**分段梯度裁剪**——即 `regular` / `muon` /
+`adamw` 三个梯度组各自的范数、裁剪系数与就地缩放——融合到一趟计算里。训练语义与
+纯 Python 路径完全一致：每个分段仍各自计算范数、各自使用独立的裁剪系数，只是把运算
+搬到了 GPU 上。
+
+`torch` **刻意不作为**构建依赖（若固定它，隔离构建会去下载多 GB 的通用 torch 并把
+内核链接到它上——有 ABI 错配风险）。因此要编译内核，需在**已装 torch** 的环境里、
+`PATH` 带上 CUDA 工具链、**关闭构建隔离**安装：
+
+```bash
+# 需要 nvcc / CUDA_HOME 可见，且环境里已装 torch
+pip install -e . --no-build-isolation
+```
+
+- 加了 `--no-build-isolation` 且有 `CUDA_HOME` 时，`dmuon._fast_clip_cuda` 会针对你
+  真实的 torch 编译并自动启用。
+- 普通 `pip install -e .`（隔离构建）的构建环境里没有 torch，`setup.py` 会跳过扩展，
+  运行时使用等价的纯 Python 裁剪。不会报错——只是把裁剪放到主机端计算。
+- 若扩展**编译出来但加载失败**（例如之后升级 torch/CUDA 破坏了 ABI），DMuon 会 warn
+  一次并回退到 Python。设 `DMUON_FAST_CLIP_VERBOSE=1` 可改为直接抛出底层错误。
+
+### 编译与运行时开关
+
+| 变量 | 作用 |
+|------|------|
+| `DMUON_BUILD_FAST_CLIP=0` | 安装时跳过编译该 CUDA 扩展。 |
+| `DMUON_FAST_CLIP=0` | 运行时禁用快速路径（改用纯 Python）。 |
+| `DMUON_FAST_CLIP_CHUNK_SIZE` | 内核的单张量分块大小（默认 `262144`）。 |
+| `DMUON_FAST_CLIP_VERBOSE=1` | 直接抛出导入错误而非静默回退——用于本应编译成功却没生效时排查。 |
+
+运行时路径对于不满足内核契约的输入（非连续、稀疏、不支持的 dtype）或检测到非有限的
+分段范数时，也会自动回退到 Python，因此扩展缺失或过时都不会改变结果。
+
+!!! note "编译需要的是编译器，而非特定 GPU"
+    编译裁剪内核只需要主机端的 CUDA 编译器（`nvcc`），并不要求 SM80+ GPU——这些
+    内核与架构无关。将 CUDA 工具包与你的 PyTorch CUDA 版本对齐即可（11.8 / 12.1 / 12.4）。
 
 ---
 
@@ -131,6 +172,11 @@ NS 后端      : Gram NS · kernel=cublas (SM80, universal fallback)
 : 确认使用了 `[syrk]` 额外依赖：`pip install -e ".[syrk]"`。
   若构建仍失败，编译后备方案会自动启用——
   Newton-Schulz 仍可正确运行，只是稍慢。
+
+**快速裁剪内核未生效（裁剪统计里 `fastpath=False`）**
+: `dmuon._fast_clip_cuda` 扩展没有被编译（安装时无 `CUDA_HOME`），或被
+  `DMUON_FAST_CLIP=0` 禁用了。请在 `PATH` 中带上 CUDA 工具链重新安装，或设置
+  `DMUON_FAST_CLIP_VERBOSE=1` 查看导入错误。其间梯度裁剪仍通过 Python 路径正确执行。
 
 ---
 

@@ -256,6 +256,50 @@ Return type for DMuon gradient clipping.
 
 ---
 
+### clip_grad_norm_buckets_
+
+Clip independent gradient buckets with segment-local semantics, using the
+optional CUDA fast path when available and pure Python otherwise. See
+[Fast Gradient Clipping](../getting-started/installation.md) for the extension.
+
+::: dmuon.clip_grad_norm_buckets_
+
+---
+
+### try_clip_optimizer_grad_norm_buckets_
+
+Segmented `regular` / `muon` / `adamw` clip entry point for Wall-X-style
+optimizers. Returns `None` when the CUDA extension is unavailable so callers
+can fall back without any gradient mutation.
+
+::: dmuon.try_clip_optimizer_grad_norm_buckets_
+
+---
+
+### GradClipBucket
+
+One independently clipped gradient segment.
+
+::: dmuon.GradClipBucket
+
+---
+
+### GradClipBucketStats
+
+Per-segment pre-clip norm and coefficient.
+
+::: dmuon.GradClipBucketStats
+
+---
+
+### SegmentedGradClipResult
+
+Aggregate result of a multi-segment clip call.
+
+::: dmuon.SegmentedGradClipResult
+
+---
+
 ### get_dedicated_params
 
 Enumerate all `DedicatedParam` objects across the model.

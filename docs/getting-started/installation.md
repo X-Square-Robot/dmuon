@@ -30,7 +30,7 @@
 === "From source (recommended)"
 
     ```bash
-    git clone https://github.com/StarrickLiu/dmuon
+    git clone https://github.com/X-Square-Robot/dmuon
     cd dmuon
     pip install -e .
     ```
@@ -51,7 +51,7 @@
 === "Development (editable + test deps)"
 
     ```bash
-    git clone https://github.com/StarrickLiu/dmuon
+    git clone https://github.com/X-Square-Robot/dmuon
     cd dmuon
     pip install -e ".[dev]"
     ```
@@ -83,6 +83,55 @@ This pulls in:
 
 Build time is typically 1–3 minutes on first use (JIT compilation).
 The compiled artifact is cached in `~/.cache/dmuon/`.
+
+---
+
+## Optional: Fast Gradient Clipping (CUDA)
+
+DMuon ships an optional CUDA kernel that fuses **segmented gradient clipping**
+— the per-bucket norm, clip coefficient, and in-place scaling for the
+`regular` / `muon` / `adamw` gradient groups — into a single pass. The
+training semantics are identical to the pure-Python path: each bucket still
+gets its own norm and its own clip coefficient. Only the arithmetic moves to
+the GPU.
+
+`torch` is intentionally **not** a build dependency (pinning it would force an
+isolated build to download a multi-GB generic torch and link the kernel against
+it — an ABI-mismatch risk). So to compile the kernel, build **without isolation**
+in an environment that already has torch, with a CUDA toolchain on `PATH`:
+
+```bash
+# nvcc / CUDA_HOME must be visible; torch must already be installed
+pip install -e . --no-build-isolation
+```
+
+- With `--no-build-isolation` and `CUDA_HOME` present, `dmuon._fast_clip_cuda`
+  is built against your real torch and used automatically.
+- A plain `pip install -e .` (isolated build) has no torch in the build env, so
+  `setup.py` skips the extension and DMuon uses the equivalent pure-Python clip
+  at runtime. Nothing breaks — clipping is just computed on the host side.
+- If the extension is **built but fails to load** (e.g. a later torch/CUDA
+  upgrade breaks its ABI), DMuon warns once and falls back to Python. Set
+  `DMUON_FAST_CLIP_VERBOSE=1` to raise the underlying error instead.
+
+### Build & runtime toggles
+
+| Variable | Effect |
+|----------|--------|
+| `DMUON_BUILD_FAST_CLIP=0` | Skip building the CUDA extension at install time. |
+| `DMUON_FAST_CLIP=0` | Disable the fast path at runtime (use pure Python). |
+| `DMUON_FAST_CLIP_CHUNK_SIZE` | Per-tensor chunk size for the kernel (default `262144`). |
+| `DMUON_FAST_CLIP_VERBOSE=1` | Raise the import error instead of silently falling back — use when a build "should" have worked. |
+
+The runtime path also falls back to Python automatically for inputs outside the
+kernel contract (non-contiguous, sparse, unsupported dtype) or when a
+non-finite bucket norm is detected, so a missing or stale extension never
+changes results.
+
+!!! note "The build needs a compiler, not a specific GPU"
+    Compiling the clip kernels only requires a host CUDA compiler (`nvcc`), not
+    an SM80+ GPU — the kernels are architecture-agnostic. Match the CUDA
+    toolkit to your PyTorch CUDA build (11.8 / 12.1 / 12.4).
 
 ---
 
@@ -135,6 +184,12 @@ NS backend     : Gram NS · kernel=cublas (SM80, universal fallback)
 : Confirm you installed the `[syrk]` extras: `pip install -e ".[syrk]"`.
   If the build still fails, the compiled fallback is used automatically —
   Newton-Schulz will still run correctly, just slightly slower.
+
+**Fast-clip kernel not used (`fastpath=False` in clip stats)**
+: The `dmuon._fast_clip_cuda` extension was not built (no `CUDA_HOME` at install
+  time) or was disabled via `DMUON_FAST_CLIP=0`. Reinstall with a CUDA toolchain
+  on `PATH`, or set `DMUON_FAST_CLIP_VERBOSE=1` to surface the import error.
+  Gradient clipping stays correct via the Python path in the meantime.
 
 ---
 
