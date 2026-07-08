@@ -173,4 +173,4 @@ The 128GPU rows cover FSDP-Z2, FSDP-Z3, HSDP-Z2, and HSDP-Z3.
 
 DMuon builds on dedicated ownership pioneered by ZeRO-1 (Rajbhandari et al., 2020) and Distributed Shampoo (Shi et al., 2023). Gram Newton-Schulz kernel adapted from Dao et al., 2026.
 
-GitHub: [StarrickLiu/dmuon](https://github.com/StarrickLiu/dmuon) &nbsp;·&nbsp; arXiv preprint: [TBD]
+GitHub: [X-Square-Robot/dmuon](https://github.com/X-Square-Robot/dmuon) &nbsp;·&nbsp; arXiv preprint: [TBD]

@@ -1,8 +1,8 @@
 site_name: DMuon
 site_description: Dedicated ownership for Muon optimizer on PyTorch DDP, FSDP2, and HSDP
-site_url: https://starrickliu.github.io/dmuon/
-repo_url: https://github.com/StarrickLiu/dmuon
-repo_name: StarrickLiu/dmuon
+site_url: https://x-square-robot.github.io/dmuon/
+repo_url: https://github.com/X-Square-Robot/dmuon
+repo_name: X-Square-Robot/dmuon
 
 exclude_docs: |
   internal/

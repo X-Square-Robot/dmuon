@@ -14,7 +14,7 @@
 
     **修复：**
     ```bash
-    git clone https://github.com/StarrickLiu/dmuon && cd dmuon
+    git clone https://github.com/X-Square-Robot/dmuon && cd dmuon
     pip install -e .
     ```
     验证：`python -c "import dmuon; print(dmuon.__version__)"`。
