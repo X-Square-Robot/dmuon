@@ -36,11 +36,15 @@ import dmuon._backends.fsdp2.param as param_module
 class _StubGroup:
     """Minimal ProcessGroup stub: just advertises a rank within the group."""
 
-    def __init__(self, rank: int):
+    def __init__(self, rank: int, size: int = 4):
         self._rank = rank
+        self._size = size
 
     def rank(self) -> int:
         return self._rank
+
+    def size(self) -> int:
+        return self._size
 
 
 class _StubDist:
@@ -57,6 +61,7 @@ def _make_dp(
     owner_shard: int,
     owner_replicate: int,
     shape=(8, 4),
+    route_hint: Optional[str] = None,
 ) -> DedicatedParam:
     """Build a DedicatedParam on CPU with stubbed groups.
 
@@ -83,6 +88,7 @@ def _make_dp(
             device=torch.device("cpu"),
             compute_dtype=None,
             replicate_group=replicate_group,
+            route_hint=route_hint,
         )
     finally:
         param_module.dist = orig_dist
@@ -169,6 +175,21 @@ def test_owned_data_none_on_non_owner_in_shard_only_mode():
     dp_owner = _make_dp(shard_rank=3, replicate_rank=None,
                         owner_shard=3, owner_replicate=0)
     assert dp_owner._owned_data is not None
+
+
+def test_sharded_adamw_skips_full_owner_copy():
+    """Sharded AdamW owns a rank-local shard, not a full fp32 owner tensor."""
+    dp = _make_dp(
+        shard_rank=3,
+        replicate_rank=None,
+        owner_shard=3,
+        owner_replicate=0,
+        shape=(8, 4),
+        route_hint="sharded_adamw",
+    )
+    assert dp._owned_data is None
+    assert dp._sharded_adamw_data is not None
+    assert dp._sharded_adamw_data.numel() == 8
 
 
 # --- Cached global rank for Stage-2 reduce ---------------------------------

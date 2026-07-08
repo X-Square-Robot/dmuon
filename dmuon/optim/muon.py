@@ -838,6 +838,26 @@ class Muon(Optimizer):
                             {"dmuon_route": getattr(dp, "_dmuon_route", "muon")}
                         )
                     )
+                    # A param constructed on the sharded_adamw route owns only a
+                    # rank-local shard (``_sharded_adamw_data``) and has no full
+                    # ``_owned_data`` copy.  Moving it to another route here would
+                    # leave later muon/adamw steps dereferencing a ``None``
+                    # ``_owned_data`` (crash) or silently skipping the update.
+                    # The shard storage cannot be rebuilt after dedicate_params,
+                    # so reject the move with a clear error.
+                    if (
+                        getattr(dp, "_sharded_adamw_data", None) is not None
+                        and dedicated_route != "sharded_adamw"
+                    ):
+                        raise RuntimeError(
+                            f"DMuon param {getattr(dp, 'param_name', '<unknown>')} "
+                            f"was constructed on the 'sharded_adamw' route but a "
+                            f"param_group tries to move it to '{dedicated_route}'. "
+                            "A sharded param has no full owner copy and its shard "
+                            "storage is fixed at dedicate_params() time; keep it on "
+                            "'sharded_adamw' or change the route hint before "
+                            "constructing Muon."
+                        )
                     if dedicated_route == "muon":
                         dp._dmuon_route = "muon"
                         dp._dmuon_adamw_replicate_allreduce = False
@@ -1288,12 +1308,16 @@ class Muon(Optimizer):
         self._last_step_profile_events = []
         return profile
 
-    def _ensure_grads_ready(self) -> None:
+    def _ensure_grads_ready(self, *, coalesce_wait: bool = False) -> None:
         """Prepare DMuon Muon grads once before clipping or stepping."""
 
         if self._grads_ready:
             return
-        prepare_muon_grads(self.model)
+        prepare_muon_grads(
+            self.model,
+            use_reduce_stream=coalesce_wait,
+            coalesce_wait=coalesce_wait,
+        )
         self._grads_ready = True
 
     @torch.no_grad()
