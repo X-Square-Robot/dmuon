@@ -144,6 +144,20 @@
 ---
 
 ??? question "需要引用哪些相关工作？"
+    **DMuon**：
+
+    ```bibtex
+    @misc{chen2026dmuonefficientdistributedmuon,
+      title         = {DMuon: Efficient Distributed Muon Training with Near-Adam Overhead},
+      author        = {Vincent Chen and Starrick Liu and Regis Cheng and Dance Yang and Shalfun Li and Ryan Yu and Lucy Liang and Hang Su and Roy Gan and Hao Wang and Qian Wang},
+      year          = {2026},
+      eprint        = {2606.27153},
+      archivePrefix = {arXiv},
+      primaryClass  = {cs.DC},
+      url           = {https://arxiv.org/abs/2606.27153}
+    }
+    ```
+
     **Gram Newton-Schulz**（使用默认 `"gram"` 后端时）：
 
     ```bibtex
