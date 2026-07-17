@@ -1,0 +1,52 @@
+DMuon
+Copyright 2026 X-Square-Robot
+
+This product is licensed under the Apache License, Version 2.0 (see the LICENSE
+file). This NOTICE file records attributions for third-party code that DMuon
+incorporates or adapts, and the projects that DMuon's design draws on.
+
+================================================================================
+Incorporated / adapted code
+================================================================================
+
+1. quack — CuteDSL kernels
+   https://github.com/Dao-AILab/quack
+   Copyright (c) 2025-2026 Wentao Guo, Ted Zadouri, Tri Dao.
+   Licensed under the Apache License, Version 2.0.
+
+   Files under dmuon/kernels/ (cache_utils.py, compile_utils.py,
+   cute_dsl_utils.py, dsl_utils.py, sm80_utils.py, syrk_backends.py,
+   syrk_quack.py, syrk_sm80.py) are vendored from or adapted from quack.
+   The original copyright headers are retained in those files. Files that
+   DMuon has modified from the upstream version are marked accordingly.
+
+2. gram-newton-schulz
+   https://github.com/Dao-AILab/gram-newton-schulz
+   The Gram-space Newton-Schulz iteration in dmuon/optim/newton_schulz.py
+   (per-step coefficients, restart mechanism, and mixed-precision pipeline) is
+   adapted from this project. Refer to the upstream repository for its license
+   terms.
+
+================================================================================
+Design inspiration (no code incorporated)
+================================================================================
+
+3. Muon optimizer — Keller Jordan et al.
+   https://github.com/KellerJordan/Muon
+   The original Muon optimizer (momentum orthogonalization via Newton-Schulz
+   iteration) that DMuon provides a distributed implementation of.
+
+4. Moonlight — "Muon is Scalable for LLM Training", Moonshot AI (Kimi)
+   https://github.com/MoonshotAI/Moonlight
+   Copyright (c) Moonshot AI.
+   DMuon's distributed design, and the weight-decay and update-scale
+   adjustments that make Muon a drop-in AdamW replacement, are inspired by
+   Moonlight's ZeRO-1 Muon implementation.
+
+5. PyTorch — FSDP2 (fully_shard, MixedPrecisionPolicy)
+   https://github.com/pytorch/pytorch
+   Copyright (c) Meta Platforms, Inc. and affiliates, and the PyTorch
+   contributors. Licensed under the BSD-3-Clause license.
+   DMuon composes with PyTorch's FSDP2 and mirrors the semantics and naming of
+   its mixed-precision and sharding APIs (e.g. param_dtype, cast_forward_inputs,
+   reshard_after_forward).
