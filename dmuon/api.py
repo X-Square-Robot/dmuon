@@ -109,7 +109,7 @@ def _policy_group_key(d_param) -> tuple[object, ...]:
         getattr(d_param, "_param_dtype", None),
         getattr(d_param, "_grad_dtype", None),
         getattr(d_param, "_output_dtype", None),
-        bool(getattr(d_param, "_cast_forward_inputs", True)),
+        bool(getattr(d_param, "_cast_forward_inputs", False)),
         getattr(d_param, "_muon_forward_unshard", None),
     )
 
@@ -144,7 +144,7 @@ def _validate_policy_hook_boundaries(
         cast_input_targets = {
             _effective_param_dtype(dp)
             for dp in d_params
-            if getattr(dp, "_cast_forward_inputs", True)
+            if getattr(dp, "_cast_forward_inputs", False)
             and _effective_param_dtype(dp) is not None
         }
         effective_param_dtypes = {

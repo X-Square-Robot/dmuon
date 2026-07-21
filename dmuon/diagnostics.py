@@ -216,7 +216,7 @@ def summarize_param_groups(
                 "master_dtype": _dtype_name(getattr(dp, "_master_dtype", None)),
                 "optim_dtype": _dtype_name(getattr(dp, "_optim_dtype", None)),
                 "cast_forward_inputs": bool(
-                    getattr(dp, "_cast_forward_inputs", True)
+                    getattr(dp, "_cast_forward_inputs", False)
                 ),
                 "matched_policy_overrides": list(
                     getattr(getattr(dp, "_dmuon_policy", None), "matched_overrides", ())

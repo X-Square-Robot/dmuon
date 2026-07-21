@@ -97,7 +97,7 @@ class DedicatedParamDDP:
         param_dtype: Optional[torch.dtype] = None,
         grad_dtype: Optional[torch.dtype] = None,
         output_dtype: Optional[torch.dtype] = None,
-        cast_forward_inputs: bool = True,
+        cast_forward_inputs: bool = False,
         master_dtype: Optional[torch.dtype] = torch.float32,
         optim_dtype: Optional[torch.dtype] = torch.float32,
         route_hint: Optional[str] = None,
