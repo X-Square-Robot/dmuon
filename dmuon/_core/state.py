@@ -176,7 +176,7 @@ class DedicatedState:
         self.group.unshard()  # no-op if already unsharded or prefetched
         self.group.wait_for_unshard()  # no-op if already unsharded
         param_dtype = getattr(self.group, "_param_dtype", None)
-        if getattr(self.group, "_cast_forward_inputs", True) and param_dtype is not None:
+        if getattr(self.group, "_cast_forward_inputs", False) and param_dtype is not None:
             args = _apply_to_tensors(lambda x: _cast_fp_tensor(param_dtype, x), args)
             kwargs = _apply_to_tensors(lambda x: _cast_fp_tensor(param_dtype, x), kwargs)
         # Forward prefetch: dispatch next layer's unshard (no wait).

@@ -135,7 +135,7 @@ class DedicatedParam:
         param_dtype: torch.dtype = None,
         grad_dtype: torch.dtype = None,
         output_dtype: torch.dtype = None,
-        cast_forward_inputs: bool = True,
+        cast_forward_inputs: bool = False,
         master_dtype: torch.dtype = torch.float32,
         optim_dtype: torch.dtype = torch.float32,
         replicate_group: Optional[dist.ProcessGroup] = None,
