@@ -48,15 +48,21 @@ class GradClipBucket:
 
 @dataclass(frozen=True)
 class GradClipBucketStats:
-    """Pre-clip norm and coefficient for one gradient segment."""
+    """Pre-clip norm and coefficient for one gradient segment.
+
+    DEVICE-TENSOR CONTRACT: ``total_norm`` / ``clip_coef`` / ``clipped`` /
+    ``found_inf`` are 0-dim CUDA tensors; the clip path performs no D2H.
+    Consumers materialize them in their own batched readback (the wall-x
+    trainer does one packed copy per logging step).
+    """
 
     name: str
-    total_norm: float
+    total_norm: torch.Tensor
     max_norm: float | None
-    clip_coef: float
-    clipped: bool
+    clip_coef: torch.Tensor
+    clipped: torch.Tensor
     param_count: int
-    found_inf: bool
+    found_inf: torch.Tensor
     fastpath: bool
 
     def as_dict(self) -> dict[str, object]:
@@ -341,35 +347,32 @@ def _build_stats(
     max_norm: float | None,
     fastpath: bool,
 ) -> tuple[GradClipBucketStats, ...]:
-    """Assemble per-bucket stats with a single batched device-to-host copy."""
+    """Assemble per-bucket stats as 0-dim device tensors (no D2H here)."""
 
     if len(buckets) == 0:
         return tuple()
 
-    stacked = torch.stack(
-        [total_norms, coefs, torch.isfinite(total_norms).to(total_norms.dtype)]
-    )
-    host = stacked.detach().to("cpu")
-    total_values = host[0].tolist()
-    coef_values = host[1].tolist()
-    finite_values = host[2].tolist()
+    total_norms = total_norms.detach()
+    coefs = coefs.detach()
+    finite = torch.isfinite(total_norms)
+    if max_norm is not None:
+        clipped_t = finite & (total_norms > float(max_norm))
+    else:
+        clipped_t = torch.zeros_like(finite)
+    found_inf_t = ~finite
 
     stats: list[GradClipBucketStats] = []
     for idx, bucket in enumerate(buckets):
-        total = float(total_values[idx])
-        coef = float(coef_values[idx])
-        finite = bool(finite_values[idx])
-        clipped = bool(max_norm is not None and finite and total > float(max_norm))
         param_count = sum(1 for grad in bucket.grads if grad is not None)
         stats.append(
             GradClipBucketStats(
                 name=bucket.name,
-                total_norm=total,
+                total_norm=total_norms[idx],
                 max_norm=None if max_norm is None else float(max_norm),
-                clip_coef=coef,
-                clipped=clipped,
+                clip_coef=coefs[idx],
+                clipped=clipped_t[idx],
                 param_count=param_count,
-                found_inf=not finite,
+                found_inf=found_inf_t[idx],
                 fastpath=fastpath,
             )
         )

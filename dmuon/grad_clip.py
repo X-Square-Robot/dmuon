@@ -43,15 +43,23 @@ class MuonGradClipStats:
 
     ``total_norm`` is the norm before clipping.  ``max_norm=None`` means the
     call was stats-only and did not scale any gradient.
+
+    DEVICE-TENSOR CONTRACT: ``total_norm`` / ``clip_coef`` / ``clipped`` /
+    ``found_inf`` are 0-dim CUDA tensors, never host scalars. The clip call
+    itself is sync-free; consumers that need python numbers (logging)
+    materialize them in one batched D2H on their own schedule. There is no
+    eager mode: the only reason to read these on the host at clip time would
+    be host-side control flow (inf-skip / dynamic thresholds), which DMuon
+    does not do.
     """
 
-    total_norm: float
+    total_norm: torch.Tensor
     max_norm: float | None
     norm_type: float
-    clip_coef: float
-    clipped: bool
+    clip_coef: torch.Tensor | float
+    clipped: torch.Tensor | bool
     param_count: int
-    found_inf: bool
+    found_inf: torch.Tensor
     strategy: str = "global_norm"
 
     def as_dict(self) -> dict[str, Any]:
@@ -118,11 +126,17 @@ class GlobalNormMuonClipStrategy:
             # coefficient to avoid a device-to-host sync branch.
             clip_coef_clamped = torch.clamp(clip_coef_t, max=1.0)
             _clip_entries_with_norm_(context.entries, clip_coef_clamped, context.foreach)
-            raw_coef = float(clip_coef_t.detach().cpu().item())
-            clip_coef = min(raw_coef, 1.0) if math.isfinite(raw_coef) else raw_coef
-            clipped = math.isfinite(raw_coef) and raw_coef < 1.0
-        total_norm = float(total_norm_t.detach().cpu().item())
-        found_inf = not math.isfinite(total_norm)
+            # Stats stay ON-DEVICE (see MuonGradClipStats contract). ``clipped``
+            # requires finiteness: an inf norm drives coef to ~0 (<1) but that
+            # is a found_inf event, not a clip event.
+            clip_coef = clip_coef_clamped.detach()
+            # Finiteness must be judged on the NORM: an inf norm drives the
+            # coef to 0.0 (finite!), so isfinite(coef) only catches NaN.
+            clipped = torch.isfinite(total_norm_t.detach()) & (
+                clip_coef_t.detach() < 1.0
+            )
+        total_norm = total_norm_t.detach()
+        found_inf = ~torch.isfinite(total_norm)
 
         return MuonGradClipStats(
             total_norm=total_norm,
