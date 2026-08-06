@@ -262,12 +262,49 @@ ns = dmuon.NewtonSchulz(kernel="cute_sm80")
     时自动启用。它由可选后端测试覆盖，主要面向大矩阵场景；在这些场景下
     SM90+ symmetric GEMM kernel 有足够工作量摊薄调度开销。
 
+    当解析出的 kernel 为 `quack` 时，它现在会真正分发到 quack SYRK（早期版本
+    虽然解析出了该选择，却没有接进 `syrk_or_cublas`，导致 quack 实际上从未
+    运行）。每个不同的 SYRK 调用 shape 在首次出现时都会和 cuBLAS 做 autotune：
+    quack 必须先通过数值交叉验证（与 cuBLAS 偏差超阈值即淘汰），再赢下一次
+    纯 GPU 执行段的 benchmark 才会被采用，否则该 shape 回退到 cuBLAS。裁决在
+    内存缓存并按 GPU 持久化，因此每个 shape 只测一次。
+
     运行时 circuit-breaker `dmuon.kernels.syrk_quack.ADAPTER_READY`
     可设为 `False` 紧急禁用 quack 路径（无需卸载包），届时 `kernel="auto"`
     会回退到 `cublas`。
 
     `get_backend_status()["auto_choice"]` 永远反映真正会跑的 kernel，
     一眼看清 ground truth。
+
+---
+
+## CUDA graph 重放
+
+单次 Newton-Schulz 调用会通过 Python 发射约 25-30 个 CUDA kernel（SYRK
+分发、`addmm`、逐元素算子），一个 rank 处理约 50 个 Muon 参数就会产生
+>1000 次发射、且中间夹着 Python——这是 DMuon CPU 串行段的主要来源。由于
+NS 输入 shape 高度重复（每 rank 通常 11-20 个唯一 shape），DMuon 会按输入
+shape 把 NS 计算捕获成一张 CUDA graph 并在后续步复用，把每次调用的发射开销
+压缩成一次 `replay()`。
+
+**默认开启；用 `DMUON_NS_CUDA_GRAPH=0` 关闭。** 重放与 eager 逐位一致
+（相同 kernel 与系数，只是发射方式变了），因此可以放心保持开启。
+
+**Shape 稳定性假设。** 捕获以 `(shape, dtype, device)` 为键。标准训练复用一小
+组稳定的 NS shape，因此每个只捕获一次。若某工作负载每步都在变动 NS 输入
+shape，则会不断重新捕获——这种情况请设 `DMUON_NS_CUDA_GRAPH=0`。
+
+**首步开销。** 每个 shape 的首次调用走 eager（同时充当 warmup，触发 SYRK
+autotune、cuBLAS workspace 分配、quack JIT——这些都不能被捕获）；第二次调用
+执行捕获；之后全部走 replay。预期有一次性捕获开销（约 ~1s 量级），分摊在最初
+几步。学习率、weight decay、momentum 都留在 eager 的前后处理里、不进图，因此
+调度变化无需重新捕获。
+
+**与 TP 的边界。** TP-sharded 参数从不进图：它们的 NS buffer 经过 collective、
+生命周期依赖具体步。TP 参数始终走 eager，只有本地（DP-only）NS 会被捕获。
+
+**故障降级。** 若某 shape 捕获失败，DMuon 会响亮地记录一次，并对该 shape
+永久回退 eager——正确性优先，graph 的加速是纯增量。
 
 ---
 

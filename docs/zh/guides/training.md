@@ -300,6 +300,15 @@ for step, batch in enumerate(dataloader):
     所以这里的 clip 更像异常梯度、momentum buffer 污染和 non-finite
     检查的保护，而不是主要的学习率控制机制。
 
+!!! note "clip 统计量是设备张量"
+    `dmuon.clip_grad_norm_` 返回的 `MuonGradClipStats`，其 `total_norm`、
+    `clip_coef`、`clipped`、`found_inf` 字段都是 0 维 CUDA 张量，而不是 Python
+    的 `float`/`bool`。clip 路径本身不做 device-to-host 同步，因此不会拖住这
+    一步。若要记录这些值，请按自己的节奏物化（例如每个 logging step 做一次
+    批量 `.item()` / `.tolist()`），不要每步都读。`clipped` 带有限性语义：
+    非有限（inf）的梯度范数会被记为 `found_inf=True` 且 `clipped=False`，而不是
+    一次 clip 事件。
+
 默认策略是对 Muon 梯度做 global p-norm clipping。后续如果需要接入
 MuonClip、QK/投影层专用 clip 等方案，可以通过
 `dmuon.register_muon_grad_clip_strategy(...)` 注册自定义策略。
@@ -309,7 +318,9 @@ MuonClip、QK/投影层专用 clip 等方案，可以通过
     `dmuon.try_clip_optimizer_grad_norm_buckets_(...)` 会在一趟 CUDA 计算里
     完成每个分段的范数、裁剪系数与就地缩放，且保持逐分段语义。它使用可选的快速
     裁剪扩展（见[安装](../getting-started/installation.md)），扩展不可用时自动
-    回退到纯 Python。
+    回退到纯 Python。每个 bucket 的 `GradClipBucketStats` 遵循同样的设备张量
+    契约——`total_norm` / `clip_coef` / `clipped` / `found_inf` 都以 0 维张量
+    返回，请在自己的日志路径中物化(参考的 Wall-X 集成是每个 logging step 做一次打包 device-to-host 回读)。
 
 ## 日志与调试
 
