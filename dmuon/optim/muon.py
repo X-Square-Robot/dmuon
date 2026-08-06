@@ -1790,6 +1790,7 @@ class Muon(Optimizer):
             torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
         current_stream = torch.cuda.current_stream()
 
+        entries = []
         for dp in dedicated_params:
             if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
                 grad = getattr(dp, "_sharded_adamw_grad", None)
@@ -1802,12 +1803,7 @@ class Muon(Optimizer):
                 # the CUDA caching allocator cannot recycle the buffer while
                 # those kernels are still pending.
                 grad.record_stream(current_stream)
-                self._adamw_update_tensor(
-                    state_key=id(dp),
-                    param=param,
-                    grad=grad,
-                    group=group,
-                )
+                entries.append((id(dp), param, grad))
                 dp._sharded_adamw_grad = None
                 continue
             if dp._reduced_grad is None:
@@ -1817,65 +1813,87 @@ class Muon(Optimizer):
             if grad is None or param is None:
                 continue
             grad.record_stream(current_stream)
-            self._adamw_update_tensor(
-                state_key=id(dp),
-                param=param,
-                grad=grad,
-                group=group,
-            )
+            entries.append((id(dp), param, grad))
             dp._reduced_grad = None
             dp._tp_full_grad = None
             dp._tp_full_delta = None
             dp._tp_wd_factor = 1.0
+        if entries:
+            self._adamw_update_batch(entries, group)
 
     def _step_adamw_params(self, params, group: dict) -> None:
         """Apply one AdamW subgroup's hyperparameters to managed params."""
+        entries = []
         for p in params:
             if p.grad is None:
                 continue
             grad = p.grad._local_tensor if hasattr(p.grad, "_local_tensor") else p.grad
             param = p._local_tensor if hasattr(p, "_local_tensor") else p.data
-            self._adamw_update_tensor(
-                state_key=p,
-                param=param,
-                grad=grad,
-                group=group,
-            )
+            entries.append((p, param, grad))
             p.grad = None
+        if entries:
+            self._adamw_update_batch(entries, group)
 
-    def _adamw_update_tensor(self, *, state_key, param, grad, group: dict) -> None:
-        """Apply one AdamW update to a concrete local tensor."""
+    def _adamw_update_batch(self, entries, group: dict) -> None:
+        """Foreach-batched AdamW over collected (state_key, param, grad) entries.
+
+        This is THE AdamW implementation (both the dedicated and the FSDP2
+        symmetric paths collect into it; there is no per-tensor variant).
+        Decoupled-AdamW math, per tensor:
+
+            param *= 1 - lr*wd
+            exp_avg    = b1*exp_avg    + (1-b1)*grad
+            exp_avg_sq = b2*exp_avg_sq + (1-b2)*grad^2
+            param     -= lr/bc1 * exp_avg / (sqrt(exp_avg_sq)/sqrt(bc2) + eps)
+
+        Entries are grouped by (post-increment step, param dtype/device, grad
+        dtype): the bias corrections bc1/bc2 are per-STEP scalars, and params
+        that historically skipped steps (grad=None) carry diverged step
+        counters -- bucketing by step keeps their correction exact. A
+        per-tensor loop would launch ~8 kernels per param (~700+/step for ~90
+        owned adamw params); each bucket here is a dozen multi-tensor
+        launches.
+        """
         lr = group["lr"]
         beta1, beta2 = group["betas"]
         wd = group["weight_decay"]
         eps = group["eps"]
 
-        state = self.state[state_key]
-        if len(state) == 0:
-            state["step"] = 0
-            state["exp_avg"] = torch.zeros_like(param)
-            state["exp_avg_sq"] = torch.zeros_like(param)
+        buckets: dict = {}
+        for state_key, param, grad in entries:
+            state = self.state[state_key]
+            if len(state) == 0:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(param)
+                state["exp_avg_sq"] = torch.zeros_like(param)
+            state["step"] += 1
+            key = (state["step"], param.dtype, param.device, grad.dtype)
+            buckets.setdefault(key, []).append(
+                (param, grad, state["exp_avg"], state["exp_avg_sq"])
+            )
 
-        state["step"] += 1
-        exp_avg = state["exp_avg"]
-        exp_avg_sq = state["exp_avg_sq"]
+        for (step, _pdt, _pdev, _gdt), items in buckets.items():
+            params = [it[0] for it in items]
+            grads = [it[1] for it in items]
+            exp_avgs = [it[2] for it in items]
+            exp_avg_sqs = [it[3] for it in items]
 
-        # Decoupled weight decay
-        if wd > 0:
-            param.mul_(1.0 - lr * wd)
+            if wd > 0:
+                torch._foreach_mul_(params, 1.0 - lr * wd)
 
-        # Adam moment updates
-        exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+            torch._foreach_mul_(exp_avgs, beta1)
+            torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
+            torch._foreach_mul_(exp_avg_sqs, beta2)
+            torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
 
-        # Bias correction
-        bc1 = 1.0 - beta1 ** state["step"]
-        bc2 = 1.0 - beta2 ** state["step"]
-        step_size = lr / bc1
+            bc1 = 1.0 - beta1 ** step
+            bc2 = 1.0 - beta2 ** step
+            step_size = lr / bc1
 
-        # Update
-        denom = (exp_avg_sq.sqrt() / (bc2**0.5)).add_(eps)
-        param.addcdiv_(exp_avg, denom, value=-step_size)
+            denom = torch._foreach_sqrt(exp_avg_sqs)
+            torch._foreach_div_(denom, bc2 ** 0.5)
+            torch._foreach_add_(denom, eps)
+            torch._foreach_addcdiv_(params, exp_avgs, denom, value=-step_size)
 
     def zero_grad(self, set_to_none: bool = True):
         """Clear gradients.
