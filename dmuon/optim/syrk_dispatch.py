@@ -110,6 +110,168 @@ _DEFAULT_AUTOTUNE_BACKEND = "cute_sm80"
 # In-memory cache keyed by the full tuple including backend
 _syrk_autotune_cache: dict[tuple, tuple | None] = {}
 
+# ---------------------------------------------------------------------------
+# Active SYRK backend (process-wide), set by NewtonSchulz at construction.
+#
+# Historically ``NewtonSchulz(kernel=...)`` resolved a backend
+# (syrk_backends.SyrkBackend) and even advertised it via get_ns_backend(),
+# but ``syrk_or_cublas`` below never consulted that choice: it always
+# autotuned the SM80 cute kernel against cuBLAS, so on SM90 the advertised
+# "quack" fast path silently never ran (verified 2026-08-05: zero quack
+# frames in a full step trace while the banner claimed ns_kernel=quack).
+# This module-level switch is the missing wire.
+# ---------------------------------------------------------------------------
+_ACTIVE_SYRK_BACKEND = _DEFAULT_AUTOTUNE_BACKEND
+
+
+def set_active_syrk_backend(name: str) -> None:
+    """Select which backend ``syrk_or_cublas`` dispatches to.
+
+    Called by ``NewtonSchulz.__init__`` with the resolved kernel choice
+    ("quack" / "cute_sm80" / "cublas").  Process-wide by design: one NS
+    backend object per training process.
+    """
+    global _ACTIVE_SYRK_BACKEND
+    _ACTIVE_SYRK_BACKEND = str(name)
+
+
+def get_active_syrk_backend() -> str:
+    return _ACTIVE_SYRK_BACKEND
+
+
+# quack-vs-cuBLAS autotune verdicts: key -> bool (True = use quack).
+_quack_autotune_cache: dict[tuple, bool] = {}
+
+
+def _bench_cuda_ms(fn, iters: int = 10, warmup: int = 3) -> float:
+    """GPU-execution-only timing (pre-queue method).
+
+    A blocker kernel (torch.cuda._sleep) keeps the GPU busy while the host
+    queues the start event + all iterations + the stop event; the measured
+    window then contains only back-to-back kernel execution, never host
+    launch gaps.  Rationale: the NS hot path is moving to CUDA-graph
+    replay, where per-call host cost is ~zero -- so backend selection must
+    compare kernels, not python wrappers.  (Measured 2026-08-06: the quack
+    high-level interface costs ~40us host per call, which used to flip the
+    2560x2560 verdict to cuBLAS even though the quack kernel is 1.4x
+    faster.)
+    """
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    stop = torch.cuda.Event(enable_timing=True)
+    # ~30M cycles ~= 15ms at H100 clocks: far longer than queuing
+    # iters * host_cost (~1ms worst case). One-time autotune cost only.
+    # torch.cuda._sleep is a private API: if it disappears in a future
+    # torch, degrade to plain event timing (host launch gaps then count
+    # toward the measurement -- worse fidelity, never wrong results).
+    if hasattr(torch.cuda, '_sleep'):
+        torch.cuda._sleep(30_000_000)
+    start.record()
+    for _ in range(iters):
+        fn()
+    stop.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(stop) / iters
+
+
+def _autotune_quack_vs_cublas(A, D, B, C, alpha, beta, diag_add) -> bool:
+    """Measure quack SYRK against cuBLAS for this call shape; cache verdict.
+
+    Cache key matches the cute_sm80 autotune convention (per M/K/device/
+    dtype/has_C) with backend="quack" tagging both the in-memory and the
+    persistent json entry.  Benchmarks run on scratch outputs so the live
+    ``D`` is never corrupted, and quack must also pass a numerical
+    cross-check against cuBLAS before it may win (defense against silent
+    wrong-output configs; see the non-square cluster-tile incident in
+    CU130_QUACK_REPORT.md).
+    """
+    from dmuon.kernels import syrk_quack
+
+    M, K = A.shape[0], A.shape[1]
+    has_C = C is not None
+    key = (M, K, A.device.index or 0, A.dtype, has_C, "quack")
+    if key in _quack_autotune_cache:
+        return _quack_autotune_cache[key]
+
+    persisted = _load_quack_verdicts(A.device)
+    jkey = _key_to_json((M, K, A.device.index or 0, A.dtype, has_C, "quack"))
+    if jkey in persisted:
+        verdict = bool(persisted[jkey])
+        _quack_autotune_cache[key] = verdict
+        return verdict
+
+    BT = A.T if B is None else B.T
+    D_q = torch.empty_like(D)
+    D_c = torch.empty_like(D)
+
+    def run_quack():
+        syrk_quack.syrk(
+            A, D_q, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add
+        )
+
+    def run_cublas():
+        if has_C:
+            torch.addmm(C, A, BT, alpha=alpha, beta=beta, out=D_c)
+        else:
+            torch.mm(A, BT, out=D_c)
+        if diag_add != 0.0:
+            D_c.diagonal().add_(diag_add)
+
+    verdict = False
+    try:
+        run_quack()
+        run_cublas()
+        err = (D_q.float() - D_c.float()).abs().max().item()
+        scale = max(D_c.float().abs().max().item(), 1e-6)
+        if err > 0.05 * scale:
+            _progress_log(
+                f"SYRK quack autotune REJECT (numerics) shape=({M},{K}) "
+                f"dtype={A.dtype} has_C={has_C}: rel_err={err / scale:.3e}"
+            )
+        else:
+            t_q = _bench_cuda_ms(run_quack)
+            t_c = _bench_cuda_ms(run_cublas)
+            verdict = t_q < t_c
+            _progress_log(
+                f"SYRK quack autotune shape=({M},{K}) dtype={A.dtype} "
+                f"has_C={has_C}: quack={t_q * 1e3:.0f}us cuBLAS={t_c * 1e3:.0f}us "
+                f"-> {'quack' if verdict else 'cuBLAS'} "
+                f"({t_c / max(t_q, 1e-9):.2f}x)"
+            )
+    except Exception as exc:  # noqa: BLE001 -- loud degrade, never crash step
+        _progress_log(
+            f"SYRK quack autotune FAILED shape=({M},{K}): "
+            f"{type(exc).__name__}: {exc}; using cuBLAS"
+        )
+
+    _quack_autotune_cache[key] = verdict
+    persisted[jkey] = verdict
+    _save_quack_verdicts(A.device, persisted)
+    return verdict
+
+
+def _quack_verdict_path() -> Path:
+    return _cache_dir() / f"syrk_autotune_{_gpu_tag()}_quack_v2.json"  # _v2: GPU-only timing era
+
+
+def _load_quack_verdicts(device) -> dict:
+    try:
+        path = _quack_verdict_path()
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _save_quack_verdicts(device, verdicts: dict) -> None:
+    try:
+        _quack_verdict_path().write_text(json.dumps(verdicts, indent=1))
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def _progress_log_enabled() -> bool:
     value = os.environ.get("DMUON_SYRK_AUTOTUNE_LOG", "1").strip().lower()
@@ -155,7 +317,7 @@ def _get_autotune_cache_path(backend: str = _DEFAULT_AUTOTUNE_BACKEND) -> Path:
 
 def _get_legacy_cache_path() -> Path:
     """Pre-B5 single-file path (no backend suffix)."""
-    return _cache_dir() / f"syrk_autotune_{_gpu_tag()}.json"
+    return _cache_dir() / f"syrk_autotune_{_gpu_tag()}_v2.json"  # _v2: GPU-only timing era
 
 
 _DTYPE_TO_STR = {torch.float16: "fp16", torch.bfloat16: "bf16", torch.float32: "fp32"}
@@ -436,6 +598,33 @@ def syrk_or_cublas(
     has_C = C is not None
     BT = A.T if B is None else B.T
     is_true_syrk = B is None or B.data_ptr() == A.data_ptr()
+
+    if _ACTIVE_SYRK_BACKEND == "quack":
+        from dmuon.kernels import syrk_quack
+
+        if _autotune_quack_vs_cublas(A, D, B, C, alpha, beta, diag_add):
+            syrk_quack.syrk(
+                A, D, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add
+            )
+        else:
+            if has_C:
+                torch.addmm(C, A, BT, alpha=alpha, beta=beta, out=D)
+            else:
+                torch.mm(A, BT, out=D)
+            if diag_add != 0.0:
+                D.diagonal().add_(diag_add)
+        return
+    if _ACTIVE_SYRK_BACKEND == "cublas":
+        # bit-exact promise of kernel="cublas"/deterministic=True: no
+        # autotune, no alternative kernels
+        if has_C:
+            torch.addmm(C, A, BT, alpha=alpha, beta=beta, out=D)
+        else:
+            torch.mm(A, BT, out=D)
+        if diag_add != 0.0:
+            D.diagonal().add_(diag_add)
+        return
+
     config = _autotune_syrk(M, K, A.device, A.dtype, has_C)
     if config is not None:
         tile_m, tile_k, num_stages = config

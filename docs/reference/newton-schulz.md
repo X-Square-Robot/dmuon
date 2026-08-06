@@ -276,6 +276,15 @@ ns = dmuon.NewtonSchulz(kernel="cute_sm80")
     useful on large matrices where SM90+ symmetric GEMM kernels have enough
     work to amortize dispatch overhead.
 
+    When `quack` is the resolved kernel it now genuinely dispatches to the
+    quack SYRK (an earlier version resolved the choice but never wired it into
+    `syrk_or_cublas`, so quack silently never ran).  Each distinct SYRK call
+    shape is autotuned against cuBLAS the first time it is seen: quack must
+    pass a numerical cross-check (rejected if it disagrees with cuBLAS beyond
+    tolerance) and then win a GPU-execution-only benchmark before it is used,
+    otherwise that shape falls back to cuBLAS.  Verdicts are cached in memory
+    and persisted per GPU, so the measurement is one-time per shape.
+
     A runtime circuit-breaker
     `dmuon.kernels.syrk_quack.ADAPTER_READY` can be flipped to `False`
     to emergency-disable the quack path without uninstalling the
@@ -283,6 +292,43 @@ ns = dmuon.NewtonSchulz(kernel="cute_sm80")
 
     `get_backend_status()["auto_choice"]` always reports the kernel
     that will actually run, so you can see ground truth at a glance.
+
+---
+
+## CUDA-graph replay
+
+One Newton-Schulz invocation issues ~25-30 CUDA kernels through Python (SYRK
+dispatch, `addmm`, elementwise), and a rank stepping ~50 Muon params drives
+>1000 launches with Python between them -- the bulk of DMuon's CPU-serial
+section.  Because NS input shapes repeat heavily (typically 11-20 unique shapes
+per rank), DMuon captures the NS computation once per input shape into a CUDA
+graph and replays it on later steps, collapsing the per-call launch cost to a
+single `replay()`.
+
+**Default on; opt out with `DMUON_NS_CUDA_GRAPH=0`.**  Replay is numerically
+bit-identical to eager (same kernels and coefficients -- only the launch
+mechanism changes), so it is safe to leave enabled.
+
+**Shape-stability assumption.**  Capture is keyed on `(shape, dtype, device)`.
+Standard training reuses a small stable set of NS shapes, so each is captured
+once.  A workload that churns NS input shapes every step would re-capture
+continually -- set `DMUON_NS_CUDA_GRAPH=0` in that case.
+
+**First-step cost.**  The first call for a shape runs eagerly (it doubles as
+the warmup that triggers SYRK autotune, cuBLAS workspace allocation, and quack
+JIT -- none of which may be captured); the second call captures; all later
+calls replay.  Expect a one-time capture cost (order ~1s) spread across the
+first few steps.  Learning rate, weight decay, and momentum stay in the eager
+pre/post steps and never enter the graph, so schedule changes need no
+re-capture.
+
+**TP boundary.**  TP-sharded parameters are never graphed: their NS buffers
+flow through collectives with step-dependent lifetimes.  TP params always take
+the eager path; only local (DP-only) NS is captured.
+
+**Failure degradation.**  If capture fails for a shape, DMuon logs the failure
+loudly once and permanently falls back to eager for that shape only --
+correctness first, the graph speedup is purely additive.
 
 ---
 

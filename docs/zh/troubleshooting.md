@@ -55,6 +55,12 @@
     benchmark 结果。确认 autotune 正常后，可设置
     `DMUON_SYRK_AUTOTUNE_LOG=0` 关闭。
 
+    在 SM90+ 且 `quack` kernel 生效时，DMuon 还会对每个 shape 做 quack SYRK
+    与 cuBLAS 的 autotune（先数值交叉验证，再做纯 GPU 执行段 benchmark）并持久化
+    裁决。autotune 缓存文件名带 `_v2` 后缀，因此从旧版 DMuon 升级后首次运行会把
+    每个 shape 重新 autotune 一次，而不是复用旧的 wall-clock 口径裁决——会有一次性
+    启动延迟，之后进入稳态。
+
 ---
 
 ## 训练设置

@@ -177,6 +177,13 @@ class NewtonSchulz:
 
         self.backend = backend
         self.kernel = chosen
+        # The missing wire (2026-08-05): syrk_or_cublas historically ignored
+        # the resolved kernel and always autotuned cute_sm80-vs-cuBLAS, so
+        # "quack" never actually ran. Publish the choice to the dispatch
+        # layer (process-wide; one NS backend object per training process).
+        from dmuon.optim.syrk_dispatch import set_active_syrk_backend
+
+        set_active_syrk_backend(chosen.value)
         self.coefficients = coefficients
         self.restart_iterations = restart_iterations
         # deterministic becomes a derived flag: True iff the resolved

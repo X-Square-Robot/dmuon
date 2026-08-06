@@ -307,6 +307,16 @@ for step, batch in enumerate(dataloader):
     momentum-buffer contamination, and non-finite checks rather than the main
     learning-rate control mechanism.
 
+!!! note "Clip stats are on-device tensors"
+    `dmuon.clip_grad_norm_` returns a `MuonGradClipStats` whose `total_norm`,
+    `clip_coef`, `clipped`, and `found_inf` fields are 0-dim CUDA tensors, not
+    Python `float`/`bool`.  The clip path performs no device-to-host sync, so
+    it never stalls the step.  If you log these values, materialize them on
+    your own schedule (e.g. one batched `.item()` / `.tolist()` per logging
+    step) instead of reading them every step.  `clipped` is finiteness-aware:
+    a non-finite (inf) gradient norm is reported as `found_inf=True` with
+    `clipped=False`, not as a clip event.
+
 The default strategy is global p-norm clipping over Muon gradients. Custom
 strategies can be registered with `dmuon.register_muon_grad_clip_strategy(...)`
 for future schemes such as MuonClip or projection-specific clipping.
@@ -318,6 +328,11 @@ for future schemes such as MuonClip or projection-specific clipping.
     with the same per-bucket semantics. It uses the optional fast-clip
     extension (see [Installation](../getting-started/installation.md)) and
     falls back to pure Python automatically when the extension is unavailable.
+    Per-bucket `GradClipBucketStats` follow the same on-device contract --
+    `total_norm` / `clip_coef` / `clipped` / `found_inf` come back as 0-dim
+    tensors; materialize them in your own logging path (the reference Wall-X
+    integration batches them into one packed device-to-host copy per logging
+    step).
 
 ## Logging and Debugging
 

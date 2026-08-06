@@ -60,6 +60,14 @@
     `DMUON_SYRK_AUTOTUNE_LOG=0` to silence them after confirming autotune is
     behaving normally.
 
+    On SM90+ with the `quack` kernel active, DMuon additionally autotunes quack
+    SYRK against cuBLAS per shape (numerical cross-check first, then a
+    GPU-execution-only benchmark) and persists the verdict.  The autotune cache
+    filenames carry a `_v2` suffix, so after upgrading from an older DMuon the
+    first run re-autotunes every shape once instead of reusing stale
+    wall-clock-era verdicts -- expect a one-time startup delay, then steady
+    state.
+
 ---
 
 ## Training setup
