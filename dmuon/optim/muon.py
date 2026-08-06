@@ -1701,7 +1701,7 @@ class Muon(Optimizer):
             )
             profile_token = self._profile_event_start("ns_compute")
             try:
-                update = self._ns.local(ns_input, self._ns_steps)
+                update = self._ns_compute(ns_input, is_tp=is_tp)
             finally:
                 self._profile_event_end(profile_token)
             self._profile_add("ns_matrix_count", 1)
@@ -1745,6 +1745,26 @@ class Muon(Optimizer):
             # per-param work list.
             if not is_tp:
                 dp._reduced_grad = None
+
+    def _ns_compute(self, ns_input, *, is_tp: bool):
+        """NS via per-shape CUDA-graph replay when enabled (DMUON_NS_CUDA_GRAPH=1).
+
+        Graphs skip TP params (their buffers flow through collectives with
+        step-dependent lifetimes).  The graphed result lives in a per-shape
+        persistent buffer that the caller consumes immediately (owned.add_ /
+        _tp path never reaches here), which the sequential per-param loop
+        guarantees.  Eager path is byte-identical (same kernels, see
+        ns_graph.py capture protocol).
+        """
+        from dmuon.optim import ns_graph as _ns_graph
+
+        if not is_tp and _ns_graph.enabled():
+            cache = getattr(self, "_ns_graph_cache", None)
+            if cache is None:
+                cache = self._ns_graph_cache = _ns_graph.NSGraphCache()
+            steps = self._ns_steps
+            return cache.run(lambda t: self._ns.local(t, steps), ns_input)
+        return self._ns.local(ns_input, self._ns_steps)
 
     def _step_adamw(self):
         """AdamW update on FSDP2-managed symmetric params."""
