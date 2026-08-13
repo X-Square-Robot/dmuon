@@ -41,6 +41,24 @@ _TP_GRAM_FACTOR_WIRE_ELEMENT_SIZE = torch.empty(
 ).element_size()
 
 
+def _muon_state_dtype(dp, fallback):
+    """Dtype for a freshly created Muon momentum buffer.
+
+    Mirrors the resolution order in ``checkpoint.set_optimizer_state_dict`` so a
+    buffer created here and one restored from a checkpoint agree. Previously the
+    create path inherited the gradient dtype (bf16 under mixed precision) while
+    the load path cast to ``_optim_dtype`` (fp32), so resuming silently changed
+    the precision of the momentum accumulator and the run diverged from an
+    uninterrupted one.
+    """
+    return (
+        getattr(dp, "_optim_dtype", None)
+        or getattr(dp, "_compute_dtype", None)
+        or getattr(dp, "_orig_dtype", None)
+        or fallback
+    )
+
+
 class Muon(Optimizer):
     """Muon optimizer for DMuon distributed training.
 
@@ -1114,7 +1132,9 @@ class Muon(Optimizer):
         local_grad_tensor.record_stream(current_stream)
         local_grad = local_grad_tensor.view(local_grad_tensor.shape[0], -1)
         if "tp_local_momentum_buffer" not in state:
-            state["tp_local_momentum_buffer"] = local_grad.clone()
+            state["tp_local_momentum_buffer"] = local_grad.to(
+                _muon_state_dtype(dp, local_grad.dtype)
+            ).clone()
         else:
             state["tp_local_momentum_buffer"].mul_(mu).add_(local_grad)
         local_buf = state["tp_local_momentum_buffer"]
@@ -1132,7 +1152,9 @@ class Muon(Optimizer):
             full_grad_tensor.record_stream(current_stream)
             full_grad = full_grad_tensor.view(full_grad_tensor.shape[0], -1)
             if "momentum_buffer" not in state:
-                state["momentum_buffer"] = full_grad.clone()
+                state["momentum_buffer"] = full_grad.to(
+                    _muon_state_dtype(dp, full_grad.dtype)
+                ).clone()
             else:
                 state["momentum_buffer"].mul_(mu).add_(full_grad)
             full_buf = state["momentum_buffer"]
@@ -1685,7 +1707,9 @@ class Muon(Optimizer):
                 self.state[dp_id] = {}
             state = self.state[dp_id]
             if "momentum_buffer" not in state:
-                state["momentum_buffer"] = grad.clone()
+                state["momentum_buffer"] = grad.to(
+                    _muon_state_dtype(dp, grad.dtype)
+                ).clone()
             else:
                 state["momentum_buffer"].mul_(mu).add_(grad)
             buf = state["momentum_buffer"]
