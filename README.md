@@ -49,6 +49,62 @@ git clone git@github.com:X-Square-Robot/dmuon.git && cd dmuon
 pip install -e .
 ```
 
+### CUDA
+
+Install PyTorch for your CUDA toolkit before building optional extensions.
+The existing CUDA APIs and training examples below are unchanged.
+
+```bash
+# Optional fast gradient clipping extension; nvcc and CUDA_HOME must be available.
+pip install -e . --no-build-isolation
+# Optional SM80 SYRK kernels, or quack on SM90+.
+pip install -e ".[syrk]"
+# pip install -e ".[quack]"
+pytest tests/unit/
+torchrun --nproc_per_node=4 tests/distributed/test_ddp_correctness.py
+```
+
+### Ascend 950DT
+
+Use a matching PyTorch, `torch_npu`, and CANN environment. Activate CANN before
+installing DMuon; CUDA dependencies and extensions are not needed.
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation
+```
+
+Import `torch_npu` to register the native device, then use the same DMuon API
+with an NPU device mesh and HCCL. No CUDA-to-NPU transfer shim is required.
+
+```python
+import os
+import torch
+import torch_npu
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
+import dmuon
+
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.npu.set_device(local_rank)
+dist.init_process_group("hccl")
+world_size = dist.get_world_size()
+mesh = init_device_mesh("npu", (world_size,))
+model = MyModel().to(torch.device("npu", local_rank))
+dmuon.dedicate_params(model, mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2)
+for layer in model.layers:
+    fully_shard(layer, mesh=mesh)
+fully_shard(model, mesh=mesh)
+optimizer = dmuon.Muon(model, lr=0.02, ns_steps=5, adamw_lr=1e-3)
+```
+
+On Ascend, DMuon uses the shared eager PyTorch Newton–Schulz path.
+CUDA-specific SYRK kernels, fast-clip extensions, and CUDA graph replay remain CUDA features.
+
+See [installation](docs/getting-started/installation.md) and
+[tests](tests/README.md) for device-specific checks.
+
 ## 3-Line Integration
 
 ```python

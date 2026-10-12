@@ -84,6 +84,29 @@ This pulls in:
 Build time is typically 1–3 minutes on first use (JIT compilation).
 The compiled artifact is cached in `~/.cache/dmuon/`.
 
+## Ascend 950DT
+
+Install the matching PyTorch and `torch_npu` versions for your CANN release,
+then activate CANN and install the core package:
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation
+```
+
+Use `import torch_npu`, `dist.init_process_group("hccl")`, and an
+`init_device_mesh("npu", ...)` mesh. Move the model to its native NPU device
+before calling `dedicate_params`; the DMuon optimizer, parameter policies,
+gradient clipping, and checkpoint APIs use the same interfaces as on CUDA.
+Do not import `torch_npu.contrib.transfer_to_npu` for DMuon.
+
+On Ascend, DMuon uses the shared eager PyTorch Newton–Schulz path.
+CUDA-specific SYRK kernels, fast-clip extensions, and CUDA graph replay remain CUDA features.
+
+The [README example](../../README.md#ascend-950dt) shows the native FSDP2
+integration. See [the test instructions](../../tests/README.md#ascend-tests-single-npu)
+for a single-device regression check.
+
 ---
 
 ## Optional: Fast Gradient Clipping (CUDA)
