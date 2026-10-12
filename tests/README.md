@@ -84,3 +84,21 @@ optimizer state. Use the corresponding DDP snapshots for the DDP check.
 
 Exact comparisons require matching Muon momentum policies. Historical snapshots
 with BF16 momentum are not an exact reference for a package using FP32 momentum.
+
+### Ascend distributed restart tests (four NPUs)
+
+The tiny HCCL regression covers a one-dimensional four-rank mesh and a 2x2
+hybrid mesh. Each topology tests GAS4 with synchronized/default gradients and
+`no_sync` with explicit FP32 gradients, followed by an exact disk restart.
+It performs 28 global optimizer calls in total. The checkpoint retains each
+rank's exported state to preserve replica-local collective rounding:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc_per_node=4 tests/native/ascend_distributed.py \
+    --package-root . --topology all --output-dir /path/to/new-restart-proof
+```
+
+The proof compares live momentum, AdamW moments, master parameters, model
+parameters, scheduler, RNG, and data cursor within each execution path.
+Synchronized and `no_sync` paths are not asserted to share a numerical trajectory.
