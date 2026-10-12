@@ -8,7 +8,6 @@ DMuon-aware clipping entry point.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -98,8 +97,7 @@ class MuonGradClipStrategy(Protocol):
 
     name: str
 
-    def __call__(self, context: MuonGradClipContext) -> MuonGradClipStats:
-        ...
+    def __call__(self, context: MuonGradClipContext) -> MuonGradClipStats: ...
 
 
 class GlobalNormMuonClipStrategy:
@@ -134,9 +132,7 @@ class GlobalNormMuonClipStrategy:
             clip_coef = clip_coef_clamped.detach()
             # Finiteness must be judged on the NORM: an inf norm drives the
             # coef to 0.0 (finite!), so isfinite(coef) only catches NaN.
-            clipped = torch.isfinite(total_norm_t.detach()) & (
-                clip_coef_t.detach() < 1.0
-            )
+            clipped = torch.isfinite(total_norm_t.detach()) & (clip_coef_t.detach() < 1.0)
         total_norm = total_norm_t.detach()
         found_inf = ~torch.isfinite(total_norm)
 

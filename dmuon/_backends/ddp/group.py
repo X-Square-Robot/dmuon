@@ -101,9 +101,7 @@ class DedicatedParamGroupDDP:
         self._post_reduce_event: Optional[torch.cuda.Event] = None
         self._muon_grad_ready_event: Optional[torch.cuda.Event] = None
         self._muon_grad_ready_refs: list[torch.Tensor] = []
-        self._pending_reduce: list[
-            tuple[Optional[torch.Tensor], list[DedicatedParamDDP]]
-        ] = []
+        self._pending_reduce: list[tuple[Optional[torch.Tensor], list[DedicatedParamDDP]]] = []
 
         # Post-step broadcast state
         self._post_step_broadcast_event: Optional[torch.cuda.Event] = None
@@ -128,21 +126,13 @@ class DedicatedParamGroupDDP:
         self._post_backward_fired: bool = False
 
         # Cached metadata
-        self._dp_group: Optional[dist.ProcessGroup] = (
-            params[0].dp_group if params else None
+        self._dp_group: Optional[dist.ProcessGroup] = params[0].dp_group if params else None
+        self._param_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_param_dtype")
+        self._grad_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_grad_dtype")
+        self._output_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_output_dtype")
+        self._cast_forward_inputs: bool = (
+            bool(_uniform_param_attr(params, "_cast_forward_inputs")) if params else True
         )
-        self._param_dtype: Optional[torch.dtype] = _uniform_param_attr(
-            params, "_param_dtype"
-        )
-        self._grad_dtype: Optional[torch.dtype] = _uniform_param_attr(
-            params, "_grad_dtype"
-        )
-        self._output_dtype: Optional[torch.dtype] = _uniform_param_attr(
-            params, "_output_dtype"
-        )
-        self._cast_forward_inputs: bool = bool(
-            _uniform_param_attr(params, "_cast_forward_inputs")
-        ) if params else True
         self._comm_dtype: Optional[torch.dtype] = (
             (self._param_dtype or params[0]._orig_dtype) if params else None
         )
@@ -152,8 +142,7 @@ class DedicatedParamGroupDDP:
         }
         if self._dp_group is not None:
             self._global_owner_ranks: dict[OwnerCoord, int] = {
-                owner: dist.get_global_rank(self._dp_group, owner[0])
-                for owner in self._by_owner
+                owner: dist.get_global_rank(self._dp_group, owner[0]) for owner in self._by_owner
             }
         else:
             self._global_owner_ranks = {}
@@ -311,9 +300,7 @@ class DedicatedParamGroupDDP:
                         p._reduced_grad = new_grad.clone()
 
         self._muon_grad_ready_refs = [
-            grad_buf
-            for grad_buf, _plist in self._pending_reduce
-            if grad_buf is not None
+            grad_buf for grad_buf, _plist in self._pending_reduce if grad_buf is not None
         ]
         self._pending_reduce = []
         self._muon_grad_ready_event = target_stream.record_event()
@@ -331,9 +318,7 @@ class DedicatedParamGroupDDP:
 
     # ---- TP gather/scatter -------------------------------------------------
 
-    def tp_gather_grads(
-        self, *, wait_current_stream: bool = True
-    ) -> Optional[torch.cuda.Event]:
+    def tp_gather_grads(self, *, wait_current_stream: bool = True) -> Optional[torch.cuda.Event]:
         """Gather TP-local reduced grads to each parameter's TP owner.
 
         Only DP-owner ranks have ``_reduced_grad`` populated after the DP
@@ -371,7 +356,9 @@ class DedicatedParamGroupDDP:
         with self._device_module.stream(reduce_stream):
             gather_refs: list[torch.Tensor] = []
             pending_full_grads: list[
-                tuple[DedicatedParamDDP, list[torch.Tensor], torch.Tensor, int, Optional[torch.Tensor]]
+                tuple[
+                    DedicatedParamDDP, list[torch.Tensor], torch.Tensor, int, Optional[torch.Tensor]
+                ]
             ] = []
             reuse_buffers = _tp_gather_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
@@ -397,9 +384,7 @@ class DedicatedParamGroupDDP:
                                     device=local_grad.device,
                                 )
                             else:
-                                recv_bufs = [
-                                    torch.empty_like(local_grad) for _ in range(tp_size)
-                                ]
+                                recv_bufs = [torch.empty_like(local_grad) for _ in range(tp_size)]
                                 full_grad_buf = None
                             gather_refs.extend(recv_bufs)
                             gather_refs.append(local_grad)
@@ -453,9 +438,7 @@ class DedicatedParamGroupDDP:
 
     def _tp_scatter_dispatch(self) -> Optional[list[torch.Tensor]]:
         work: list[DedicatedParamDDP] = [
-            p
-            for p in self.params
-            if p.tp_group is not None and p._reduced_grad is not None
+            p for p in self.params if p.tp_group is not None and p._reduced_grad is not None
         ]
         if not work:
             return None

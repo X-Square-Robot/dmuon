@@ -156,8 +156,7 @@ class NewtonSchulz:
         except ValueError:
             valid = ", ".join(b.value for b in SyrkBackend)
             raise ValueError(
-                f"kernel={kernel!r} is not a valid SYRK backend; "
-                f"choose one of: {valid}"
+                f"kernel={kernel!r} is not a valid SYRK backend; choose one of: {valid}"
             )
         if chosen == SyrkBackend.AUTO:
             env_choice = resolve_env_kernel()
@@ -203,13 +202,16 @@ class NewtonSchulz:
         """
         if self.backend == "gram":
             return gram_newton_schulz(
-                G, steps=steps,
+                G,
+                steps=steps,
                 coefficients=self.coefficients,
                 restart_iterations=self.restart_iterations,
                 deterministic=self.deterministic,
             )
         return direct_newton_schulz(
-            G, steps=steps, coefficients=self.coefficients,
+            G,
+            steps=steps,
+            coefficients=self.coefficients,
         )
 
     def __repr__(self) -> str:
@@ -325,7 +327,9 @@ def newton_schulz(
         Orthogonalized update.
     """
     return gram_newton_schulz(
-        G, steps=steps, eps=eps,
+        G,
+        steps=steps,
+        eps=eps,
         coefficients=coefficients,
         restart_iterations=restart_iterations,
     )
@@ -523,13 +527,9 @@ def gram_newton_schulz_factors(
             _syrk_or_cublas(R, Z, C=R, alpha=c, beta=b)
 
             if factor is None:
-                need_R_evolve = (
-                    i < len(coefficients) - 1 and (i + 1) not in restart_iterations
-                )
+                need_R_evolve = i < len(coefficients) - 1 and (i + 1) not in restart_iterations
                 if not need_R_evolve:
-                    _syrk_or_cublas(
-                        R, factor_bufs[factor_idx], C=R, alpha=c, beta=b, diag_add=a
-                    )
+                    _syrk_or_cublas(R, factor_bufs[factor_idx], C=R, alpha=c, beta=b, diag_add=a)
                 else:
                     factor_bufs[factor_idx].copy_(Z)
                     factor_bufs[factor_idx].diagonal().add_(a)
@@ -745,10 +745,7 @@ def gram_newton_schulz_distributed_local_batched(
             Q = Z + a * eye
         else:
             Q = torch.stack(
-                [
-                    torch.addmm(q_i, z_i, q_i, beta=a)
-                    for q_i, z_i in zip(Q, Z)
-                ],
+                [torch.addmm(q_i, z_i, q_i, beta=a) for q_i, z_i in zip(Q, Z)],
                 dim=0,
             )
         if i < len(coefficients) - 1 and (i + 1) not in restart_iterations:

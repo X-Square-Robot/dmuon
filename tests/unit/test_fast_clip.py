@@ -106,9 +106,7 @@ def test_noncontiguous_tensor_is_clipped_not_skipped() -> None:
     assert not grad.is_contiguous()
     reference = grad.clone().contiguous()
 
-    result = clip_grad_norm_buckets_(
-        (GradClipBucket("muon", [grad], reduce=True),), 0.5
-    )
+    result = clip_grad_norm_buckets_((GradClipBucket("muon", [grad], reduce=True),), 0.5)
 
     norm = reference.float().pow(2).sum().sqrt()
     coef = min(0.5 / (float(norm) + 1e-6), 1.0)

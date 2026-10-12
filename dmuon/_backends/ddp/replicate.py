@@ -36,6 +36,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 
 from dmuon._core.device import current_device
+
 try:
     from torch.distributed import DeviceMesh
 except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
@@ -169,9 +170,7 @@ class _ReplicatedGroup:
         semantics for gradient averaging.
         """
         try:
-            buckets: dict[tuple[torch.dtype, torch.device], list[nn.Parameter]] = (
-                defaultdict(list)
-            )
+            buckets: dict[tuple[torch.dtype, torch.device], list[nn.Parameter]] = defaultdict(list)
             for p in self._pending:
                 if p.grad is None:
                     continue
@@ -186,9 +185,7 @@ class _ReplicatedGroup:
                             if hasattr(p.grad, "_local_tensor")
                             else p.grad.data
                         )
-                        dist.all_reduce(
-                            grad, op=dist.ReduceOp.AVG, group=self._group
-                        )
+                        dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self._group)
         finally:
             self._pending.clear()
             self._final_cb_queued = False

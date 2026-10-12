@@ -67,9 +67,7 @@ def _tp_scatter_buffer_reuse_enabled(comm_ctx: DedicatedCommContext) -> bool:
     return comm_ctx.tp_scatter_buffer_reuse_enabled()
 
 
-def _tensor_payload_bytes(
-    shape: torch.Size | tuple[int, ...], dtype: torch.dtype
-) -> int:
+def _tensor_payload_bytes(shape: torch.Size | tuple[int, ...], dtype: torch.dtype) -> int:
     numel = 1
     for dim in shape:
         numel *= int(dim)
@@ -123,9 +121,7 @@ def _cached_tensor_list(
         )
     )
     if not valid:
-        cached = [
-            torch.empty(tuple(shape), dtype=dtype, device=device) for _ in range(count)
-        ]
+        cached = [torch.empty(tuple(shape), dtype=dtype, device=device) for _ in range(count)]
         setattr(owner, attr, cached)
     return cached
 
@@ -212,9 +208,7 @@ def _should_skip_unready_publish_prefetch(
         return should_skip, tp_pending, replicate_pending, sharded_muon_pending
 
     tp_not_ready = tp_event is not None and not _event_is_ready(tp_event)
-    replicate_not_ready = replicate_event is not None and not _event_is_ready(
-        replicate_event
-    )
+    replicate_not_ready = replicate_event is not None and not _event_is_ready(replicate_event)
     sharded_muon_not_ready = sharded_muon_event is not None and not _event_is_ready(
         sharded_muon_event
     )
@@ -401,9 +395,7 @@ class DedicatedParamGroup:
         self._partial_reduce_by_param: dict[int, torch.Tensor] = {}
 
         # Deferred reduce unpack (fixes data race in old _packed_reduce)
-        self._pending_reduce: list[
-            tuple[Optional[torch.Tensor], list[DedicatedParam]]
-        ] = []
+        self._pending_reduce: list[tuple[Optional[torch.Tensor], list[DedicatedParam]]] = []
 
         # Prefetch tracking (mirrors FSDPParamGroup._post_forward_indices)
         self._post_forward_indices: list[int] = []
@@ -426,21 +418,13 @@ class DedicatedParamGroup:
 
         # Cached per-group metadata (FSDP2 alignment phase 1 — previously
         # recomputed in every unshard / reduce_grads call).
-        self._dp_group: Optional[dist.ProcessGroup] = (
-            params[0].dp_group if params else None
+        self._dp_group: Optional[dist.ProcessGroup] = params[0].dp_group if params else None
+        self._param_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_param_dtype")
+        self._grad_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_grad_dtype")
+        self._output_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_output_dtype")
+        self._cast_forward_inputs: bool = (
+            bool(_uniform_param_attr(params, "_cast_forward_inputs")) if params else True
         )
-        self._param_dtype: Optional[torch.dtype] = _uniform_param_attr(
-            params, "_param_dtype"
-        )
-        self._grad_dtype: Optional[torch.dtype] = _uniform_param_attr(
-            params, "_grad_dtype"
-        )
-        self._output_dtype: Optional[torch.dtype] = _uniform_param_attr(
-            params, "_output_dtype"
-        )
-        self._cast_forward_inputs: bool = bool(
-            _uniform_param_attr(params, "_cast_forward_inputs")
-        ) if params else True
         self._comm_dtype: Optional[torch.dtype] = (
             (self._param_dtype or params[0]._orig_dtype) if params else None
         )
@@ -455,8 +439,7 @@ class DedicatedParamGroup:
         }
         if self._dp_group is not None:
             self._global_owner_ranks: dict[OwnerCoord, int] = {
-                owner: dist.get_global_rank(self._dp_group, owner[0])
-                for owner in self._by_owner
+                owner: dist.get_global_rank(self._dp_group, owner[0]) for owner in self._by_owner
             }
         else:
             self._global_owner_ranks = {}
@@ -480,9 +463,7 @@ class DedicatedParamGroup:
         self._copy_in_dsts_by_owner: dict[OwnerCoord, list[torch.Tensor]] = {}
         if self._comm_dtype is not None:
             for owner, total_numel in self._total_numel_by_owner.items():
-                packed = torch.empty(
-                    total_numel, dtype=self._comm_dtype, device=self.device
-                )
+                packed = torch.empty(total_numel, dtype=self._comm_dtype, device=self.device)
                 self._packed_buf_by_owner[owner] = packed
                 # Bind each param to a view of its owner's packed buf and
                 # cache a 1-D dst slice for foreach copy-in.
@@ -527,15 +508,9 @@ class DedicatedParamGroup:
         pending_replicate_publish = self._replicate_broadcast_state is not None
         pending_sharded_muon_publish = self._sharded_muon_publish_state is not None
         if prefetch and (
-            pending_tp_publish
-            or pending_replicate_publish
-            or pending_sharded_muon_publish
+            pending_tp_publish or pending_replicate_publish or pending_sharded_muon_publish
         ):
-            tp_event = (
-                self._tp_scatter_state.event
-                if self._tp_scatter_state is not None
-                else None
-            )
+            tp_event = self._tp_scatter_state.event if self._tp_scatter_state is not None else None
             replicate_event = (
                 self._replicate_broadcast_state.event
                 if self._replicate_broadcast_state is not None
@@ -569,9 +544,7 @@ class DedicatedParamGroup:
                     group_name,
                     prefetch_publish_not_ready_skips=1,
                     prefetch_tp_publish_not_ready_skips=1 if tp_not_ready else 0,
-                    prefetch_replicate_publish_not_ready_skips=(
-                        1 if replicate_not_ready else 0
-                    ),
+                    prefetch_replicate_publish_not_ready_skips=(1 if replicate_not_ready else 0),
                     prefetch_sharded_muon_publish_not_ready_skips=(
                         1 if sharded_muon_not_ready else 0
                     ),
@@ -610,35 +583,23 @@ class DedicatedParamGroup:
             publish_wait_end.record(publish_wait_stream)
             self.comm_ctx.record_forward_unshard_event(
                 group_name=group_name,
-                phase=(
-                    "prefetch_publish_wait" if prefetch else "pre_forward_publish_wait"
-                ),
+                phase=("prefetch_publish_wait" if prefetch else "pre_forward_publish_wait"),
                 start=publish_wait_start,
                 end=publish_wait_end,
                 bytes=0,
                 prefetch=prefetch,
             )
         if self._is_unsharded:
-            self.comm_ctx.record_forward_unshard_counter(
-                group_name, already_unsharded=1
-            )
+            self.comm_ctx.record_forward_unshard_counter(group_name, already_unsharded=1)
             return  # still unsharded from forward (reshard_after_forward=False)
-        if (
-            self._broadcast_event is not None
-            or self._sharded_adamw_unshard_event is not None
-        ):
+        if self._broadcast_event is not None or self._sharded_adamw_unshard_event is not None:
             if not prefetch:
-                self.comm_ctx.record_forward_unshard_counter(
-                    group_name, prefetch_hits=1
-                )
+                self.comm_ctx.record_forward_unshard_counter(group_name, prefetch_hits=1)
             return  # already dispatched, pending wait_for_unshard
 
-        sharded_muon_params = [
-            p for p in self.params if _sharded_muon_forward_enabled(p)
-        ]
+        sharded_muon_params = [p for p in self.params if _sharded_muon_forward_enabled(p)]
         if sharded_muon_params and any(
-            not bool(getattr(p, "_sharded_muon_initialized", False))
-            for p in sharded_muon_params
+            not bool(getattr(p, "_sharded_muon_initialized", False)) for p in sharded_muon_params
         ):
             if prefetch:
                 # First-use sharded Muon publish is a collective over the shard
@@ -697,10 +658,7 @@ class DedicatedParamGroup:
             sharded_wait_current_start.record(sharded_adamw_stream)
         if sharded_adamw_separate_stream:
             sharded_adamw_stream.wait_stream(self._device_module.current_stream())
-        if (
-            sharded_wait_current_start is not None
-            and sharded_wait_current_end is not None
-        ):
+        if sharded_wait_current_start is not None and sharded_wait_current_end is not None:
             sharded_wait_current_end.record(sharded_adamw_stream)
             self.comm_ctx.record_forward_unshard_event(
                 group_name=group_name,
@@ -728,25 +686,17 @@ class DedicatedParamGroup:
             default=0,
         )
         sharded_adamw_all_gather_bytes = sum(
-            int(
-                p._sharded_adamw_full_padded.numel()
-                * p._sharded_adamw_full_padded.element_size()
-            )
+            int(p._sharded_adamw_full_padded.numel() * p._sharded_adamw_full_padded.element_size())
             for p in sharded_adamw_params
             if p._sharded_adamw_full_padded is not None
         )
         sharded_muon_all_gather_bytes = sum(
-            int(
-                p._sharded_muon_full_padded.numel()
-                * p._sharded_muon_full_padded.element_size()
-            )
+            int(p._sharded_muon_full_padded.numel() * p._sharded_muon_full_padded.element_size())
             for p in sharded_muon_params
             if p._sharded_muon_full_padded is not None
         )
         total_unshard_bytes = (
-            owner_broadcast_bytes
-            + sharded_adamw_all_gather_bytes
-            + sharded_muon_all_gather_bytes
+            owner_broadcast_bytes + sharded_adamw_all_gather_bytes + sharded_muon_all_gather_bytes
         )
         self._last_unshard_total_bytes = total_unshard_bytes
         self._last_unshard_prefetch = bool(prefetch)
@@ -910,10 +860,7 @@ class DedicatedParamGroup:
                         phase="sharded_param_all_gather_dispatch",
                         start=gather_start,
                         end=gather_end,
-                        bytes=(
-                            sharded_adamw_all_gather_bytes
-                            + sharded_muon_all_gather_bytes
-                        ),
+                        bytes=(sharded_adamw_all_gather_bytes + sharded_muon_all_gather_bytes),
                         prefetch=prefetch,
                     )
             self._sharded_adamw_unshard_event = sharded_adamw_stream.record_event()
@@ -1062,10 +1009,7 @@ class DedicatedParamGroup:
         # without optimizer.step). This ensures _reduced_grad is accumulated before
         # we dispatch a new reduce that would overwrite _pending_reduce/
         # _post_reduce_event.
-        if (
-            self._post_reduce_event is not None
-            or self._replicate_reduce_state is not None
-        ):
+        if self._post_reduce_event is not None or self._replicate_reduce_state is not None:
             self.wait_for_reduce()
 
         reduce_stream = self.comm_ctx.reduce_stream
@@ -1258,9 +1202,7 @@ class DedicatedParamGroup:
                     group=replicate_group, device=self.device
                 ):
                     for grad, p in stage2_pending:
-                        if _adamw_replicate_allreduce_enabled(
-                            p
-                        ) or _sharded_adamw_enabled(p):
+                        if _adamw_replicate_allreduce_enabled(p) or _sharded_adamw_enabled(p):
                             dist.all_reduce(
                                 grad,
                                 op=dist.ReduceOp.AVG,
@@ -1298,9 +1240,7 @@ class DedicatedParamGroup:
         """
         if _sharded_adamw_enabled(p):
             return True
-        local_adamw_owner = (
-            _adamw_replicate_allreduce_enabled(p) and p._owned_data is not None
-        )
+        local_adamw_owner = _adamw_replicate_allreduce_enabled(p) and p._owned_data is not None
         if p.is_owner or local_adamw_owner:
             return True
         replicate_group = self.comm_ctx.replicate_group
@@ -1314,9 +1254,7 @@ class DedicatedParamGroup:
         self._pending_reduce = [
             (grad_buf, plist)
             for grad_buf, plist in self._pending_reduce
-            if grad_buf is not None
-            and plist
-            and self._retain_pending_reduce_after_stage1(plist[0])
+            if grad_buf is not None and plist and self._retain_pending_reduce_after_stage1(plist[0])
         ]
 
     @dynamo_disable
@@ -1411,9 +1349,7 @@ class DedicatedParamGroup:
         self._stage1_reduce_event = None
         self._replicate_reduce_state = None
         self._muon_grad_ready_refs = [
-            grad_buf
-            for grad_buf, _plist in self._pending_reduce
-            if grad_buf is not None
+            grad_buf for grad_buf, _plist in self._pending_reduce if grad_buf is not None
         ]
         if replicate_state is not None:
             self._muon_grad_ready_refs.append(replicate_state.replicate_input)
@@ -1423,9 +1359,7 @@ class DedicatedParamGroup:
 
     # ---- TP gather (T2a) -------------------------------------------------
 
-    def tp_gather_grads(
-        self, *, wait_current_stream: bool = True
-    ) -> Optional[torch.cuda.Event]:
+    def tp_gather_grads(self, *, wait_current_stream: bool = True) -> Optional[torch.cuda.Event]:
         """Reassemble the full (M, N) gradient on the TP owner for every
         TP-sharded parameter in this group.
 
@@ -1525,9 +1459,7 @@ class DedicatedParamGroup:
                                     device=local_grad.device,
                                 )
                             else:
-                                recv_bufs = [
-                                    torch.empty_like(local_grad) for _ in range(tp_size)
-                                ]
+                                recv_bufs = [torch.empty_like(local_grad) for _ in range(tp_size)]
                                 full_grad_buf = None
                             gather_refs.extend(recv_bufs)
                             gather_refs.append(local_grad)
@@ -1596,9 +1528,7 @@ class DedicatedParamGroup:
         pending updates (no dispatch happened).
         """
         work: list[DedicatedParam] = [
-            p
-            for p in self.params
-            if p.tp_group is not None and p._reduced_grad is not None
+            p for p in self.params if p.tp_group is not None and p._reduced_grad is not None
         ]
         if not work:
             return None
@@ -1854,8 +1784,7 @@ class DedicatedParamGroup:
         eligible_params = [
             p
             for p in self.params
-            if my_shard_rank == p.owner_shard
-            and _needs_post_step_replicate_broadcast(p)
+            if my_shard_rank == p.owner_shard and _needs_post_step_replicate_broadcast(p)
         ]
         if not eligible_params:
             return
@@ -1902,9 +1831,7 @@ class DedicatedParamGroup:
                     f"idx{bucket_idx}.bytes{bucket_bytes}."
                     f"params{len(bucket)}.{group_name}"
                 ):
-                    with dist._coalescing_manager(
-                        group=replicate_group, device=self.device
-                    ):
+                    with dist._coalescing_manager(group=replicate_group, device=self.device):
                         for p in bucket:
                             dist.broadcast(
                                 p._owned_data,
@@ -1963,9 +1890,7 @@ class DedicatedParamGroup:
         group_name = _group_profile_name(self)
         with self._device_module.stream(publish_stream):
             if replicate_group is None:
-                with _profile_range(
-                    f"dmuon.sharded_muon_publish.reduce_scatter.{group_name}"
-                ):
+                with _profile_range(f"dmuon.sharded_muon_publish.reduce_scatter.{group_name}"):
                     with dist._coalescing_manager(group=dp_group, device=self.device):
                         for p in work:
                             assert p._sharded_muon_comm_shard is not None
@@ -1975,9 +1900,7 @@ class DedicatedParamGroup:
                             scatter_input.zero_()
                             if local_shard_rank == p.owner_shard:
                                 assert p._owned_data is not None
-                                scatter_input[: p.numel].copy_(
-                                    p._owned_data.reshape(-1)
-                                )
+                                scatter_input[: p.numel].copy_(p._owned_data.reshape(-1))
                             dist.reduce_scatter_tensor(
                                 p._sharded_muon_comm_shard,
                                 scatter_input,
@@ -2000,13 +1923,9 @@ class DedicatedParamGroup:
                 with _profile_range(
                     f"dmuon.sharded_muon_publish.owner_row_reduce_scatter.{group_name}"
                 ):
-                    row_work = [
-                        p for p in work if local_replicate_rank == p.owner_replicate
-                    ]
+                    row_work = [p for p in work if local_replicate_rank == p.owner_replicate]
                     if row_work:
-                        with dist._coalescing_manager(
-                            group=dp_group, device=self.device
-                        ):
+                        with dist._coalescing_manager(group=dp_group, device=self.device):
                             for p in row_work:
                                 assert p._sharded_muon_comm_shard is not None
                                 assert p._sharded_muon_data is not None
@@ -2015,9 +1934,7 @@ class DedicatedParamGroup:
                                 scatter_input.zero_()
                                 if local_shard_rank == p.owner_shard:
                                     assert p._owned_data is not None
-                                    scatter_input[: p.numel].copy_(
-                                        p._owned_data.reshape(-1)
-                                    )
+                                    scatter_input[: p.numel].copy_(p._owned_data.reshape(-1))
                                 dist.reduce_scatter_tensor(
                                     p._sharded_muon_comm_shard,
                                     scatter_input,
@@ -2033,15 +1950,11 @@ class DedicatedParamGroup:
                 with _profile_range(
                     f"dmuon.sharded_muon_publish.shard_column_broadcast.{group_name}"
                 ):
-                    with dist._coalescing_manager(
-                        group=replicate_group, device=self.device
-                    ):
+                    with dist._coalescing_manager(group=replicate_group, device=self.device):
                         for p in work:
                             assert p._sharded_muon_comm_shard is not None
                             assert p._sharded_muon_data is not None
-                            src_rank = dist.get_global_rank(
-                                replicate_group, p.owner_replicate
-                            )
+                            src_rank = dist.get_global_rank(replicate_group, p.owner_replicate)
                             dist.broadcast(
                                 p._sharded_muon_comm_shard,
                                 src=src_rank,
@@ -2133,9 +2046,7 @@ class DedicatedParamGroup:
             current_stream.wait_event(tp_state.event)
             if start is not None and end is not None:
                 end.record(current_stream)
-                self.comm_ctx.record_forward_unshard_counter(
-                    group_name, tp_publish_waits=1
-                )
+                self.comm_ctx.record_forward_unshard_counter(group_name, tp_publish_waits=1)
                 self.comm_ctx.record_forward_unshard_event(
                     group_name=group_name,
                     phase="pre_forward_tp_publish_wait_direct",
@@ -2156,9 +2067,7 @@ class DedicatedParamGroup:
             current_stream.wait_event(state.event)
             if start is not None and end is not None:
                 end.record(current_stream)
-                self.comm_ctx.record_forward_unshard_counter(
-                    group_name, replicate_publish_waits=1
-                )
+                self.comm_ctx.record_forward_unshard_counter(group_name, replicate_publish_waits=1)
                 self.comm_ctx.record_forward_unshard_event(
                     group_name=group_name,
                     phase="pre_forward_replicate_publish_wait_direct",
@@ -2181,9 +2090,7 @@ class DedicatedParamGroup:
         current_stream.wait_event(sharded_state.event)
         if start is not None and end is not None:
             end.record(current_stream)
-            self.comm_ctx.record_forward_unshard_counter(
-                group_name, sharded_muon_publish_waits=1
-            )
+            self.comm_ctx.record_forward_unshard_counter(group_name, sharded_muon_publish_waits=1)
             self.comm_ctx.record_forward_unshard_event(
                 group_name=group_name,
                 phase="pre_forward_sharded_muon_publish_wait_direct",

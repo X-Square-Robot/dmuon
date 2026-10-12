@@ -200,9 +200,7 @@ def _build_metadata(
         "numels": numels,
         "dtypes": dtypes,
         "segments": tensor_segments,
-        "job_tensor_ids": torch.tensor(
-            job_tensor_ids, device=device, dtype=torch.int32
-        ),
+        "job_tensor_ids": torch.tensor(job_tensor_ids, device=device, dtype=torch.int32),
         "job_offsets": torch.tensor(job_offsets, device=device, dtype=torch.int64),
     }
 
@@ -323,9 +321,7 @@ def _apply_segment_reductions(
     """
 
     if not (
-        dist.is_available()
-        and dist.is_initialized()
-        and any(bool(flag) for flag in reduce_flags)
+        dist.is_available() and dist.is_initialized() and any(bool(flag) for flag in reduce_flags)
     ):
         return local_sq
 
@@ -403,9 +399,7 @@ def clip_grad_norm_buckets_(
     reduce_flags = [1 if bucket.reduce else 0 for bucket in buckets]
 
     # Stage 1 -- local per-bucket squared norm (no collective).
-    local_sq = _segmented_local_sq(
-        buckets, device=device, ext=ext, chunk_size=resolved_chunk_size
-    )
+    local_sq = _segmented_local_sq(buckets, device=device, ext=ext, chunk_size=resolved_chunk_size)
 
     # Stage 2 -- the single, rank-uniform collective.
     global_sq = _apply_segment_reductions(local_sq, reduce_flags, process_group)
@@ -419,14 +413,10 @@ def clip_grad_norm_buckets_(
 
     # Stage 4 -- scale in place (no collective). found_inf never gates this.
     if max_norm is not None:
-        _segmented_scale(
-            buckets, coefs, device=device, ext=ext, chunk_size=resolved_chunk_size
-        )
+        _segmented_scale(buckets, coefs, device=device, ext=ext, chunk_size=resolved_chunk_size)
 
     # Stage 5 -- stats (single batched D2H).
-    stats = _build_stats(
-        buckets, total_norms, coefs, max_norm=max_norm, fastpath=ext is not None
-    )
+    stats = _build_stats(buckets, total_norms, coefs, max_norm=max_norm, fastpath=ext is not None)
     combined_total = torch.linalg.vector_norm(total_norms, 2.0)
     return SegmentedGradClipResult(
         combined_total,

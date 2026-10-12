@@ -9,11 +9,20 @@ from dmuon import GradClipBucket, clip_grad_norm_, clip_grad_norm_buckets_
 
 
 def optimizer_for(grad):
-    params = [] if grad is None else [SimpleNamespace(
-        param_name="proj", _reduced_grad=grad, is_dtensor=False,
-    )]
+    params = (
+        []
+        if grad is None
+        else [
+            SimpleNamespace(
+                param_name="proj",
+                _reduced_grad=grad,
+                is_dtensor=False,
+            )
+        ]
+    )
     return SimpleNamespace(
-        _dedicated_params=params, _comm_ctx=SimpleNamespace(device=torch.device("cpu")),
+        _dedicated_params=params,
+        _comm_ctx=SimpleNamespace(device=torch.device("cpu")),
         _ensure_grads_ready=lambda: None,
     )
 
@@ -43,8 +52,9 @@ def test_muon_clip_result_contract(value, max_norm):
 @pytest.mark.parametrize("value", [float("inf"), float("nan")])
 def test_nonfinite_muon_clip_raises_when_requested(value):
     with pytest.raises(RuntimeError, match="non-finite"):
-        clip_grad_norm_(optimizer_for(torch.tensor([value])), 1.0,
-                        foreach=False, error_if_nonfinite=True)
+        clip_grad_norm_(
+            optimizer_for(torch.tensor([value])), 1.0, foreach=False, error_if_nonfinite=True
+        )
 
 
 def test_empty_muon_clip_stats_only():
@@ -58,8 +68,8 @@ def test_empty_muon_clip_stats_only():
 def test_segmented_clip_keeps_tensor_fields_and_empty_bucket(max_norm):
     grad = torch.tensor([3.0, 4.0])
     result = clip_grad_norm_buckets_(
-        [GradClipBucket("muon", [grad], reduce=False),
-         GradClipBucket("empty", [], reduce=False)], max_norm,
+        [GradClipBucket("muon", [grad], reduce=False), GradClipBucket("empty", [], reduce=False)],
+        max_norm,
     )
     assert not result.fastpath
     assert set(result.stats_by_name) == {"muon", "empty"}

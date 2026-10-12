@@ -57,20 +57,36 @@ class Runtime:
             self.active = previous
 
 
-def make_group(monkeypatch, *, dtype=torch.float32, grad_dtype=None,
-               replicate=False, sharded=True, shard_rank=0, shard_size=1, numel=4):
+def make_group(
+    monkeypatch,
+    *,
+    dtype=torch.float32,
+    grad_dtype=None,
+    replicate=False,
+    sharded=True,
+    shard_rank=0,
+    shard_size=1,
+    numel=4,
+):
     runtime = Runtime()
     trace, outputs, local_calls = [], [], []
     chunk = (numel + shard_size - 1) // shard_size
     parameter = nn.Parameter(torch.zeros(numel, dtype=dtype))
     param = SimpleNamespace(
-        _unsharded_param=parameter, _is_unsharded=True,
-        _accumulated_grad=None, _reduced_grad=None, _sharded_adamw_grad=None,
-        _grad_dtype=grad_dtype, _orig_size=parameter.shape,
+        _unsharded_param=parameter,
+        _is_unsharded=True,
+        _accumulated_grad=None,
+        _reduced_grad=None,
+        _sharded_adamw_grad=None,
+        _grad_dtype=grad_dtype,
+        _orig_size=parameter.shape,
         _sharded_adamw_reduce_input=torch.zeros(chunk * shard_size, dtype=grad_dtype or dtype),
         _sharded_adamw_comm_shard=torch.zeros(chunk, dtype=grad_dtype or dtype),
-        _sharded_adamw_chunk_numel=chunk, _owned_data=None,
-        owner_rank=(0, 0), owner_shard=0, is_owner=shard_rank == 0,
+        _sharded_adamw_chunk_numel=chunk,
+        _owned_data=None,
+        owner_rank=(0, 0),
+        owner_shard=0,
+        is_owner=shard_rank == 0,
         uses_sharded_adamw=lambda: sharded,
         _dmuon_route="sharded_adamw" if sharded else "muon",
     )
@@ -89,8 +105,10 @@ def make_group(monkeypatch, *, dtype=torch.float32, grad_dtype=None,
     group._global_owner_ranks = {(0, 0): 0}
     group._debug_name = "accumulation"
     group.comm_ctx = SimpleNamespace(
-        reduce_stream=runtime.reduce, replicate_reduce_stream=runtime.replicate,
-        replicate_group=object() if replicate else None, record_post_step_profile=False,
+        reduce_stream=runtime.reduce,
+        replicate_reduce_stream=runtime.replicate,
+        replicate_group=object() if replicate else None,
+        record_post_step_profile=False,
     )
     group.reduce_grads_enabled = True
     group.replicate_grads_enabled = True
@@ -108,7 +126,7 @@ def make_group(monkeypatch, *, dtype=torch.float32, grad_dtype=None,
 
         def finish():
             start = shard_rank * output.numel()
-            output.copy_(input[start:start + output.numel()])
+            output.copy_(input[start : start + output.numel()])
             trace.append(("stage1", output.data_ptr()))
 
         runtime.active.callbacks.append(finish)
@@ -139,8 +157,13 @@ def make_group(monkeypatch, *, dtype=torch.float32, grad_dtype=None,
 
 
 def backward(group, param, values, *, synchronize=True):
-    param._unsharded_param.grad = None if values is None else torch.tensor(
-        values, dtype=param._unsharded_param.dtype,
+    param._unsharded_param.grad = (
+        None
+        if values is None
+        else torch.tensor(
+            values,
+            dtype=param._unsharded_param.dtype,
+        )
     )
     group.reduce_grads_enabled = synchronize
     group.reduce_grads()
@@ -183,7 +206,7 @@ def test_gas1_reuses_collective_output_and_tracks_consumer_stream(monkeypatch):
     group.wait_for_reduce(stream=consumer)
     assert param._sharded_adamw_grad is outputs[0]
     assert ("record", outputs[0].data_ptr(), "consumer") in trace
-    torch.testing.assert_close(result(param), torch.tensor([1., 2., 3., 4.]), rtol=0, atol=0)
+    torch.testing.assert_close(result(param), torch.tensor([1.0, 2.0, 3.0, 4.0]), rtol=0, atol=0)
 
 
 def test_nonowner_padded_shard_survives_stage1_compaction(monkeypatch):
@@ -193,7 +216,7 @@ def test_nonowner_padded_shard_survives_stage1_compaction(monkeypatch):
         group.wait_for_stage1_reduce()
         assert group._pending_reduce[0][0] is outputs[-1]
     group.wait_for_reduce()
-    torch.testing.assert_close(result(param), torch.tensor([6., 6., 0.]), rtol=0, atol=0)
+    torch.testing.assert_close(result(param), torch.tensor([6.0, 6.0, 0.0]), rtol=0, atol=0)
 
 
 def test_missing_grad_and_zero_grad_do_not_reuse_previous_microbatches(monkeypatch):
@@ -202,23 +225,28 @@ def test_missing_grad_and_zero_grad_do_not_reuse_previous_microbatches(monkeypat
     backward(group, param, None)
     backward(group, param, [4, 3, 2, 1])
     group.wait_for_reduce()
-    torch.testing.assert_close(result(param), torch.full((4,), 5.), rtol=0, atol=0)
+    torch.testing.assert_close(result(param), torch.full((4,), 5.0), rtol=0, atol=0)
     optimizer = SimpleNamespace(_fsdp_params=[], _all_dedicated_params=[param])
     Muon.zero_grad(optimizer)
     assert result(param) is None and param._accumulated_grad is None
     backward(group, param, [7, 8, 9, 10])
     group.wait_for_reduce()
-    torch.testing.assert_close(result(param), torch.tensor([7., 8., 9., 10.]), rtol=0, atol=0)
+    torch.testing.assert_close(result(param), torch.tensor([7.0, 8.0, 9.0, 10.0]), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("sharded", [False, True])
-def test_explicit_fp32_accumulation_matches_sync_without_low_precision_roundtrip(monkeypatch, dtype, sharded):
+def test_explicit_fp32_accumulation_matches_sync_without_low_precision_roundtrip(
+    monkeypatch, dtype, sharded
+):
     micros = ([2048] * 4, [1] * 4, [1] * 4, [-2048] * 4)
     outcomes = []
     for no_sync in (False, True):
         group, param, _, _, _, calls = make_group(
-            monkeypatch, dtype=dtype, grad_dtype=torch.float32, sharded=sharded,
+            monkeypatch,
+            dtype=dtype,
+            grad_dtype=torch.float32,
+            sharded=sharded,
         )
         for index, micro in enumerate(micros):
             backward(group, param, micro, synchronize=not no_sync or index == 3)
@@ -228,7 +256,7 @@ def test_explicit_fp32_accumulation_matches_sync_without_low_precision_roundtrip
         assert result(param, sharded).dtype == torch.float32
         outcomes.append(result(param, sharded).clone())
         assert len(calls) == 4
-    torch.testing.assert_close(outcomes[0], torch.full((4,), 2.), rtol=0, atol=0)
+    torch.testing.assert_close(outcomes[0], torch.full((4,), 2.0), rtol=0, atol=0)
     torch.testing.assert_close(outcomes[1], outcomes[0], rtol=0, atol=0)
 
 
@@ -251,9 +279,14 @@ def test_unspecified_grad_dtype_preserves_raw_no_sync_precision(monkeypatch, dty
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("sharded", [False, True])
-def test_fp32_stash_without_final_raw_grad_does_not_assign_parameter_grad(monkeypatch, dtype, sharded):
+def test_fp32_stash_without_final_raw_grad_does_not_assign_parameter_grad(
+    monkeypatch, dtype, sharded
+):
     group, param, _, _, _, _ = make_group(
-        monkeypatch, dtype=dtype, grad_dtype=torch.float32, sharded=sharded,
+        monkeypatch,
+        dtype=dtype,
+        grad_dtype=torch.float32,
+        sharded=sharded,
     )
     backward(group, param, [2048] * 4, synchronize=False)
     backward(group, param, [1] * 4, synchronize=False)
@@ -261,4 +294,4 @@ def test_fp32_stash_without_final_raw_grad_does_not_assign_parameter_grad(monkey
     group.wait_for_reduce()
     assert param._unsharded_param.grad is None
     assert result(param, sharded).dtype == torch.float32
-    torch.testing.assert_close(result(param, sharded), torch.full((4,), 2049.), rtol=0, atol=0)
+    torch.testing.assert_close(result(param, sharded), torch.full((4,), 2049.0), rtol=0, atol=0)

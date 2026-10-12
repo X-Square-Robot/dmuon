@@ -21,10 +21,17 @@ def test_plain_adamw_export_honors_offload_and_rank_filter(monkeypatch, cpu_offl
     dp = FakeDedicatedParam()
     dp.module, dp.param_name, dp.device = model.proj, "weight", torch.device("cpu")
     model.proj._dedicated_state = SimpleNamespace(group=SimpleNamespace(params=[dp]))
-    state = {"exp_avg": torch.ones(2, 2), "exp_avg_sq": torch.full((2, 2), 0.25),
-             "step": 3, "metadata": "unchanged"}
-    optimizer = SimpleNamespace(state={model.weight: state}, _fsdp_params=[model.weight],
-                                param_groups=[{"params": [model.weight], "lr": 0.001}])
+    state = {
+        "exp_avg": torch.ones(2, 2),
+        "exp_avg_sq": torch.full((2, 2), 0.25),
+        "step": 3,
+        "metadata": "unchanged",
+    }
+    optimizer = SimpleNamespace(
+        state={model.weight: state},
+        _fsdp_params=[model.weight],
+        param_groups=[{"params": [model.weight], "lr": 0.001}],
+    )
     calls = []
     original_cpu = torch.Tensor.cpu
 
@@ -38,7 +45,9 @@ def test_plain_adamw_export_honors_offload_and_rank_filter(monkeypatch, cpu_offl
     monkeypatch.setattr(torch.Tensor, "cpu", observed_cpu)
     saved = get_optimizer_state_dict(model, optimizer, cpu_offload=cpu_offload)
 
-    assert calls == ([id(state["exp_avg"]), id(state["exp_avg_sq"])] if keep and cpu_offload else [])
+    assert calls == (
+        [id(state["exp_avg"]), id(state["exp_avg_sq"])] if keep and cpu_offload else []
+    )
     if not keep:
         assert saved["fsdp"] == {} and saved["param_groups"] == []
         return
@@ -65,9 +74,7 @@ def test_set_optimizer_state_dict_restores_muon_momentum_to_compute_dtype():
     model.proj._dedicated_state = SimpleNamespace(group=SimpleNamespace(params=[dp]))
     optimizer = SimpleNamespace(state={})
     state_dict = {
-        "dedicated": {
-            "proj.weight": {"momentum_buffer": torch.ones(2, 2, dtype=torch.float32)}
-        }
+        "dedicated": {"proj.weight": {"momentum_buffer": torch.ones(2, 2, dtype=torch.float32)}}
     }
 
     set_optimizer_state_dict(model, optimizer, state_dict)
@@ -89,7 +96,11 @@ def test_set_optimizer_state_dict_restores_muon_momentum_to_compute_dtype():
     ],
 )
 def test_restored_muon_momentum_matches_fresh_optimizer_state(
-    optim_dtype, grad_dtype, compute_dtype, orig_dtype, expected_dtype,
+    optim_dtype,
+    grad_dtype,
+    compute_dtype,
+    orig_dtype,
+    expected_dtype,
 ):
     from dmuon.optim.muon import _muon_state_dtype
 
@@ -125,7 +136,9 @@ def test_restored_muon_momentum_matches_fresh_optimizer_state(
     torch.testing.assert_close(restored, fresh, rtol=0, atol=0)
     torch.testing.assert_close(
         next_grad.add(restored, alpha=0.95),
-        next_grad.add(fresh, alpha=0.95), rtol=0, atol=0,
+        next_grad.add(fresh, alpha=0.95),
+        rtol=0,
+        atol=0,
     )
 
 

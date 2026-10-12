@@ -14,10 +14,14 @@ def signature_tree(value):
     if value is Ellipsis:
         return {"constant": "Ellipsis"}
     if isinstance(value, ast.AST):
-        return {"node": type(value).__name__, **{
-            name: signature_tree(item) for name, item in ast.iter_fields(value)
-            if item is not None and item != []
-        }}
+        return {
+            "node": type(value).__name__,
+            **{
+                name: signature_tree(item)
+                for name, item in ast.iter_fields(value)
+                if item is not None and item != []
+            },
+        }
     if isinstance(value, list):
         return [signature_tree(item) for item in value]
     return value
@@ -31,7 +35,8 @@ def signature_hash(value):
 def test_public_exports_and_signatures_are_unchanged():
     tree = ast.parse(ROOT.joinpath("dmuon/__init__.py").read_text(encoding="utf-8"))
     exports = next(
-        ast.literal_eval(node.value) for node in tree.body
+        ast.literal_eval(node.value)
+        for node in tree.body
         if isinstance(node, ast.Assign)
         and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
     )
@@ -39,19 +44,35 @@ def test_public_exports_and_signatures_are_unchanged():
     for name, contract in CONTRACT["entries"].items():
         tree = ast.parse(ROOT.joinpath(contract["path"]).read_text(encoding="utf-8"))
         if contract["kind"] == "constant":
-            node = next(node for node in tree.body if isinstance(node, ast.Assign)
-                        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets))
+            node = next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == name for target in node.targets
+                )
+            )
             assert signature_hash(node.value) == contract["value"], name
             continue
-        node = next(node for node in tree.body
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                    and node.name == contract.get("name", name))
+        node = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == contract.get("name", name)
+        )
         if contract["kind"] == "class":
-            constructor = next((method for method in node.body
-                                if isinstance(method, ast.FunctionDef) and method.name == "__init__"), None)
+            constructor = next(
+                (
+                    method
+                    for method in node.body
+                    if isinstance(method, ast.FunctionDef) and method.name == "__init__"
+                ),
+                None,
+            )
             actual = signature_hash(constructor.args) if constructor else None
-            fields = [signature_hash(field)
-                      for field in node.body if isinstance(field, ast.AnnAssign)]
+            fields = [
+                signature_hash(field) for field in node.body if isinstance(field, ast.AnnAssign)
+            ]
             assert fields == contract["fields"], name
         else:
             actual = signature_hash(node.args)

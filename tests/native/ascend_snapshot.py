@@ -17,8 +17,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--package-root", type=Path)
     parser.add_argument("--legacy-bootstrap", type=Path)
-    parser.add_argument("--no-verify-restore", dest="verify_restore", action="store_false",
-                        help="Skip only the frozen legacy package's known broken restore path")
+    parser.add_argument(
+        "--no-verify-restore",
+        dest="verify_restore",
+        action="store_false",
+        help="Skip only the frozen legacy package's known broken restore path",
+    )
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--pathway", choices=("ddp", "fsdp2"), default="fsdp2")
     args = parser.parse_args()
@@ -38,8 +42,13 @@ def main():
     import dmuon
 
     from ascend_cases import (
-        ns_cases, run_clip, run_empty_clip, run_nonfinite_clip_error, run_ns,
-        run_stream_lifetime, run_training,
+        ns_cases,
+        run_clip,
+        run_empty_clip,
+        run_nonfinite_clip_error,
+        run_ns,
+        run_stream_lifetime,
+        run_training,
     )
 
     if args.legacy_bootstrap is None:
@@ -47,11 +56,17 @@ def main():
     package_path = Path(dmuon.__file__).resolve()
     if args.package_root is not None:
         assert package_path.is_relative_to(args.package_root.resolve())
-    metadata = {"momentum_policy": "optim_dtype", "package": str(package_path), "pathway": args.pathway,
-                "torch": torch.__version__, "torch_npu": torch_npu.__version__,
-                "legacy_bootstrap": str(args.legacy_bootstrap),
-                "verify_restore_requested": args.verify_restore, "restore_verified": False,
-                "legacy_restore_verified": False}
+    metadata = {
+        "momentum_policy": "optim_dtype",
+        "package": str(package_path),
+        "pathway": args.pathway,
+        "torch": torch.__version__,
+        "torch_npu": torch_npu.__version__,
+        "legacy_bootstrap": str(args.legacy_bootstrap),
+        "verify_restore_requested": args.verify_restore,
+        "restore_verified": False,
+        "legacy_restore_verified": False,
+    }
     torch.npu.set_device(args.device_index)
     device = torch.device("npu", args.device_index)
     result = {"ns": {}, "clip": {}, "training": {}}
@@ -64,7 +79,12 @@ def main():
                 for max_norm in (None, 2.5):
                     key = f"{dtype}:{segmented}:{value}:{max_norm}"
                     result["clip"][key] = run_clip(
-                        dmuon, device, value, max_norm, segmented=segmented, dtype=dtype,
+                        dmuon,
+                        device,
+                        value,
+                        max_norm,
+                        segmented=segmented,
+                        dtype=dtype,
                     )
     result["empty_clip"] = run_empty_clip(dmuon, device)
     result["nonfinite_errors"] = {
@@ -76,7 +96,10 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="dmuon-npu-test-") as directory:
         dist.init_process_group(
-            "hccl", init_method=Path(directory, "rendezvous").as_uri(), rank=0, world_size=1,
+            "hccl",
+            init_method=Path(directory, "rendezvous").as_uri(),
+            rank=0,
+            world_size=1,
         )
         try:
             mesh = init_device_mesh("npu", (1,))
@@ -90,8 +113,14 @@ def main():
                 key = f"{dtype}:{cast}:{asynchronous}:{no_sync}"
                 try:
                     result["training"][key] = run_training(
-                        dmuon, mesh, device, dtype=dtype, cast=cast,
-                        pathway=args.pathway, asynchronous=asynchronous, no_sync=no_sync,
+                        dmuon,
+                        mesh,
+                        device,
+                        dtype=dtype,
+                        cast=cast,
+                        pathway=args.pathway,
+                        asynchronous=asynchronous,
+                        no_sync=no_sync,
                         verify_restore=args.verify_restore,
                     )
                 except AssertionError as error:
@@ -100,7 +129,9 @@ def main():
                         failure["training_case"] = key
                         failed_path = args.output.with_name(args.output.stem + "-failure.pt")
                         with failed_path.open("xb") as handle:
-                            torch.save({"metadata": metadata, "cases": result, "failure": failure}, handle)
+                            torch.save(
+                                {"metadata": metadata, "cases": result, "failure": failure}, handle
+                            )
                         raise AssertionError(f"{error}; failure snapshot: {failed_path}") from error
                     raise
             default = result["training"]["torch.float32:False:False:False"][0]["gradients"]
@@ -111,21 +142,32 @@ def main():
                 # accumulation order may differ from reducing every microbatch.
                 try:
                     torch.testing.assert_close(
-                        default[name], accumulated[name], rtol=1e-5, atol=1e-6,
+                        default[name],
+                        accumulated[name],
+                        rtol=1e-5,
+                        atol=1e-6,
                         msg=f"default versus no_sync gradient: {name}",
                     )
                 except AssertionError as error:
                     delta = default[name].float() - accumulated[name].float()
-                    failure = {"stage": "default_vs_no_sync", "parameter": name,
-                               "shape": list(default[name].shape),
-                               "dtype": str(default[name].dtype),
-                               "max_abs_diff": float(delta.abs().max()),
-                               "relative_l2_diff": float(delta.norm() / accumulated[name].float().norm().clamp_min(1e-30)),
-                               "default_gradient": default[name],
-                               "no_sync_gradient": accumulated[name], "error": str(error)}
+                    failure = {
+                        "stage": "default_vs_no_sync",
+                        "parameter": name,
+                        "shape": list(default[name].shape),
+                        "dtype": str(default[name].dtype),
+                        "max_abs_diff": float(delta.abs().max()),
+                        "relative_l2_diff": float(
+                            delta.norm() / accumulated[name].float().norm().clamp_min(1e-30)
+                        ),
+                        "default_gradient": default[name],
+                        "no_sync_gradient": accumulated[name],
+                        "error": str(error),
+                    }
                     failed_path = args.output.with_name(args.output.stem + "-failure.pt")
                     with failed_path.open("xb") as handle:
-                        torch.save({"metadata": metadata, "cases": result, "failure": failure}, handle)
+                        torch.save(
+                            {"metadata": metadata, "cases": result, "failure": failure}, handle
+                        )
                     raise AssertionError(f"{error}; failure snapshot: {failed_path}") from error
         finally:
             torch.npu.synchronize()
@@ -133,8 +175,10 @@ def main():
     metadata["restore_verified"] = args.verify_restore
     metadata["legacy_restore_verified"] = args.legacy_bootstrap is not None and args.verify_restore
     torch.save({"metadata": metadata, "cases": result}, args.output)
-    print(f"Saved {len(result['ns'])} NS, {len(result['clip'])} clip and "
-          f"{len(result['training'])} training cases to {args.output}")
+    print(
+        f"Saved {len(result['ns'])} NS, {len(result['clip'])} clip and "
+        f"{len(result['training'])} training cases to {args.output}"
+    )
 
 
 if __name__ == "__main__":

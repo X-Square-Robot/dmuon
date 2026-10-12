@@ -23,5 +23,9 @@ def test_ascend_migration_snapshot():
     assert reference["metadata"]["torch"] == actual["metadata"]["torch"]
     assert reference["metadata"]["torch_npu"] == actual["metadata"]["torch_npu"]
     assert reference["metadata"]["package"] != actual["metadata"]["package"]
-    assert reference["metadata"]["momentum_policy"] == actual["metadata"]["momentum_policy"] == "optim_dtype"
+    assert (
+        reference["metadata"]["momentum_policy"]
+        == actual["metadata"]["momentum_policy"]
+        == "optim_dtype"
+    )
     assert_tree_equal(actual["cases"], reference["cases"])

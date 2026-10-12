@@ -243,9 +243,7 @@ def syrk_dispatch(
 
     if resolved == SyrkBackend.QUACK:
         assert syrk_quack is not None  # validated by resolve_backend
-        syrk_quack.syrk(
-            A, D, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add
-        )
+        syrk_quack.syrk(A, D, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add)
         return
 
     raise RuntimeError(f"Unreachable backend: {resolved!r}")
@@ -265,6 +263,5 @@ def resolve_env_kernel() -> Optional[SyrkBackend]:
     except ValueError as exc:  # pragma: no cover — user error path
         valid = ", ".join(b.value for b in SyrkBackend)
         raise ValueError(
-            f"DMUON_NS_KERNEL={raw!r} is not a valid backend; "
-            f"choose one of: {valid}"
+            f"DMUON_NS_KERNEL={raw!r} is not a valid backend; choose one of: {valid}"
         ) from exc

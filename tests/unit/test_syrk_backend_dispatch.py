@@ -26,6 +26,7 @@ def quack_adapter_for_mocked_hardware(monkeypatch):
     # These tests emulate CUDA hardware; production CPU/NPU imports stay lazy.
     if syrk_backends.syrk_quack is None:
         from dmuon.kernels import syrk_quack
+
         monkeypatch.setattr(syrk_backends, "syrk_quack", syrk_quack)
 
 
@@ -33,8 +34,10 @@ def quack_adapter_for_mocked_hardware(monkeypatch):
 # detect_best_backend — per-SM-version decision table
 # ---------------------------------------------------------------------------
 def test_detect_sm80_with_cute_picks_cute():
-    with mock.patch.object(syrk_backends, "_HAS_CUTE_SM80", True), \
-         mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", False):
+    with (
+        mock.patch.object(syrk_backends, "_HAS_CUTE_SM80", True),
+        mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", False),
+    ):
         assert syrk_backends.detect_best_backend(80) == SyrkBackend.CUTE_SM80
 
 
@@ -45,16 +48,20 @@ def test_detect_sm80_no_cute_falls_back_to_cublas():
 
 def test_detect_sm90_with_quack_picks_quack():
     """Only when ADAPTER_READY is flipped (Phase B-H) does auto land on quack."""
-    with mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", True), \
-         mock.patch.object(syrk_backends.syrk_quack, "ADAPTER_READY", True):
+    with (
+        mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", True),
+        mock.patch.object(syrk_backends.syrk_quack, "ADAPTER_READY", True),
+    ):
         assert syrk_backends.detect_best_backend(90) == SyrkBackend.QUACK
 
 
 def test_detect_sm90_quack_installed_but_adapter_not_ready_falls_back():
     """Phase B-A reality: quack pip-installed on H100 but adapter stub — we
     MUST fall back to cublas, not route to the shell's NotImplementedError."""
-    with mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", True), \
-         mock.patch.object(syrk_backends.syrk_quack, "ADAPTER_READY", False):
+    with (
+        mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", True),
+        mock.patch.object(syrk_backends.syrk_quack, "ADAPTER_READY", False),
+    ):
         assert syrk_backends.detect_best_backend(90) == SyrkBackend.CUBLAS
 
 
@@ -79,16 +86,20 @@ def test_resolve_auto_returns_concrete():
 
 def test_resolve_quack_raises_on_sm80_with_sm_hint():
     """On SM80 the hint should point the user to cute_sm80 / auto."""
-    with mock.patch.object(syrk_backends, "_SM_VERSION", 80), \
-         mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", False):
+    with (
+        mock.patch.object(syrk_backends, "_SM_VERSION", 80),
+        mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", False),
+    ):
         with pytest.raises(RuntimeError, match="SM90\\+"):
             syrk_backends.resolve_backend(SyrkBackend.QUACK)
 
 
 def test_resolve_quack_raises_when_quack_not_installed():
     """On SM90 without quack, the hint should point at pip install."""
-    with mock.patch.object(syrk_backends, "_SM_VERSION", 90), \
-         mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", False):
+    with (
+        mock.patch.object(syrk_backends, "_SM_VERSION", 90),
+        mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", False),
+    ):
         with pytest.raises(RuntimeError, match="pip install dmuon\\[quack\\]"):
             syrk_backends.resolve_backend(SyrkBackend.QUACK)
 
@@ -97,9 +108,11 @@ def test_resolve_quack_raises_when_circuit_breaker_tripped():
     """When ``ADAPTER_READY=False`` (circuit breaker, e.g. emergency
     disable of a quack-kernels regression), the error message must
     point at the flag so operators know how to re-enable."""
-    with mock.patch.object(syrk_backends, "_SM_VERSION", 90), \
-         mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", True), \
-         mock.patch.object(syrk_backends.syrk_quack, "ADAPTER_READY", False):
+    with (
+        mock.patch.object(syrk_backends, "_SM_VERSION", 90),
+        mock.patch.object(syrk_backends.syrk_quack, "HAS_QUACK", True),
+        mock.patch.object(syrk_backends.syrk_quack, "ADAPTER_READY", False),
+    ):
         with pytest.raises(RuntimeError, match="ADAPTER_READY"):
             syrk_backends.resolve_backend(SyrkBackend.QUACK)
 
@@ -146,9 +159,7 @@ def test_dispatch_cublas_true_syrk_matches_manual():
     torch.manual_seed(0)
     A = torch.randn(32, 16, device="cuda", dtype=torch.float32)
     D = torch.empty(32, 32, device="cuda", dtype=torch.float32)
-    syrk_backends.syrk_dispatch(
-        A, D, alpha=0.5, beta=0.0, backend=SyrkBackend.CUBLAS
-    )
+    syrk_backends.syrk_dispatch(A, D, alpha=0.5, beta=0.0, backend=SyrkBackend.CUBLAS)
     torch.cuda.synchronize()
     expected = 0.5 * (A @ A.T)
     torch.testing.assert_close(D, expected, atol=1e-5, rtol=1e-5)
@@ -162,7 +173,12 @@ def test_dispatch_cublas_with_C_and_diag_add():
     C = torch.randn(16, 16, device="cuda", dtype=torch.float32)
     D = torch.empty_like(C)
     syrk_backends.syrk_dispatch(
-        A, D, C=C, alpha=1.0, beta=2.0, diag_add=3.0,
+        A,
+        D,
+        C=C,
+        alpha=1.0,
+        beta=2.0,
+        diag_add=3.0,
         backend=SyrkBackend.CUBLAS,
     )
     torch.cuda.synchronize()

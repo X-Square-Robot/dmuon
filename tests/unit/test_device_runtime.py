@@ -44,7 +44,9 @@ def test_default_device_keeps_cuda_precedence(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
     monkeypatch.setattr(
-        torch, "npu", SimpleNamespace(is_available=lambda: True, current_device=lambda: 2),
+        torch,
+        "npu",
+        SimpleNamespace(is_available=lambda: True, current_device=lambda: 2),
         raising=False,
     )
     assert default_device() == torch.device("cuda", 3)
@@ -53,11 +55,15 @@ def test_default_device_keeps_cuda_precedence(monkeypatch):
 def test_default_device_can_select_npu_without_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(
-        torch, "npu", SimpleNamespace(is_available=lambda: True, current_device=lambda: 2),
+        torch,
+        "npu",
+        SimpleNamespace(is_available=lambda: True, current_device=lambda: 2),
         raising=False,
     )
     selected = torch.device("privateuseone", 2)
-    monkeypatch.setattr(device_runtime, "current_device", lambda kind: selected if kind == "npu" else None)
+    monkeypatch.setattr(
+        device_runtime, "current_device", lambda kind: selected if kind == "npu" else None
+    )
     assert default_device() == selected
 
 

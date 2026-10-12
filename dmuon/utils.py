@@ -20,10 +20,7 @@ _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def _isolated_pg_barrier_enabled() -> bool:
-    return (
-        os.environ.get("DMUON_ISOLATED_PG_BARRIER", "0").strip().lower()
-        in _TRUE_ENV_VALUES
-    )
+    return os.environ.get("DMUON_ISOLATED_PG_BARRIER", "0").strip().lower() in _TRUE_ENV_VALUES
 
 
 def iter_dedicated_states(model: nn.Module):
@@ -120,9 +117,7 @@ def prepare_group_muon_grads(g, *, use_reduce_stream: bool = False) -> None:
         gather = getattr(g, "tp_gather_grads", None)
         if gather is not None:
             with _profile_range(f"dmuon.tp_gather_grads.{group_name}"):
-                gather_event = (
-                    gather(wait_current_stream=False) if use_reduce_stream else gather()
-                )
+                gather_event = gather(wait_current_stream=False) if use_reduce_stream else gather()
             if gather_event is None:
                 gather_event = getattr(g, "_tp_gather_event", None)
             if gather_event is not None:
@@ -317,6 +312,7 @@ def _dispatch_post_step_async(g, phase_recorder=None) -> None:
     the optimizer can distinguish TP scatter, true replicate broadcast, and
     DDP publish time without coupling this utility to the optimizer class.
     """
+
     def _phase(name: str):
         return nullcontext() if phase_recorder is None else phase_recorder(name)
 
@@ -351,6 +347,7 @@ def _dispatch_post_step_async(g, phase_recorder=None) -> None:
                 with _profile_range("dmuon.sharded_muon_publish.async"):
                     with _phase("sharded_muon_publish"):
                         publish_async()
+
 
 def _wait_post_step(g) -> None:
     if isinstance(g, DedicatedParamGroupDDP):

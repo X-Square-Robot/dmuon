@@ -43,7 +43,9 @@ class PolicyGroup:
 def test_nested_policy_casts_only_floating_tensors(cast):
     module = CaptureNestedInputs()
     context = SimpleNamespace(
-        all_states=[], post_forward_order=[], reset_post_forward_order=lambda: None,
+        all_states=[],
+        post_forward_order=[],
+        reset_post_forward_order=lambda: None,
         forward_prefetch_depth=0,
     )
     DedicatedState(module, PolicyGroup(cast), context, reshard_after_forward=False)

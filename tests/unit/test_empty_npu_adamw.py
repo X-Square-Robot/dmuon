@@ -1,4 +1,5 @@
 """Empty shard bookkeeping without initializing an NPU in CPU unit tests."""
+
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -24,8 +25,14 @@ def test_empty_npu_adamw_shard_advances_state_without_foreach(monkeypatch, dtype
     def unexpected_foreach(*_args, **_kwargs):
         raise AssertionError("Empty NPU shards must not launch foreach kernels")
 
-    for name in ("_foreach_mul_", "_foreach_add_", "_foreach_addcmul_", "_foreach_sqrt",
-                 "_foreach_div_", "_foreach_addcdiv_"):
+    for name in (
+        "_foreach_mul_",
+        "_foreach_add_",
+        "_foreach_addcmul_",
+        "_foreach_sqrt",
+        "_foreach_div_",
+        "_foreach_addcdiv_",
+    ):
         monkeypatch.setattr(torch, name, unexpected_foreach)
     for step in (1, 2):
         Muon._adamw_update_batch(optimizer, [("empty", parameter, gradient)], group)
