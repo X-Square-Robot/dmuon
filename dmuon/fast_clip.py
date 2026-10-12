@@ -26,6 +26,8 @@ from typing import Sequence
 import torch
 import torch.distributed as dist
 
+from ._core.device import default_device
+
 from .grad_clip import MuonGradClipStats, _iter_muon_grad_entries
 
 
@@ -146,9 +148,7 @@ def _resolve_device(buckets: Sequence[GradClipBucket]) -> torch.device:
         for grad in bucket.grads:
             if grad is not None:
                 return grad.device
-    if torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device("cpu")
+    return default_device()
 
 
 def _tensor_kernel_eligible(grad: torch.Tensor, device: torch.device) -> bool:
@@ -398,7 +398,7 @@ def clip_grad_norm_buckets_(
     """
 
     device = _resolve_device(buckets)
-    ext = _load_fast_clip_extension()
+    ext = _load_fast_clip_extension() if device.type == "cuda" else None
     resolved_chunk_size = _resolve_chunk_size(chunk_size)
     reduce_flags = [1 if bucket.reduce else 0 for bucket in buckets]
 
@@ -455,6 +455,9 @@ def try_clip_optimizer_grad_norm_buckets_(
     :func:`clip_grad_norm_buckets_`.
     """
 
+    device = getattr(getattr(optimizer, "_comm_ctx", None), "device", None)
+    if device is not None and torch.device(device).type != "cuda":
+        return None
     if _load_fast_clip_extension() is None:
         return None
 

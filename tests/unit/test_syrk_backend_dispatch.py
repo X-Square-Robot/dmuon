@@ -21,6 +21,14 @@ from dmuon.kernels import syrk_backends
 from dmuon.kernels.syrk_backends import SyrkBackend
 
 
+@pytest.fixture(autouse=True)
+def quack_adapter_for_mocked_hardware(monkeypatch):
+    # These tests emulate CUDA hardware; production CPU/NPU imports stay lazy.
+    if syrk_backends.syrk_quack is None:
+        from dmuon.kernels import syrk_quack
+        monkeypatch.setattr(syrk_backends, "syrk_quack", syrk_quack)
+
+
 # ---------------------------------------------------------------------------
 # detect_best_backend — per-SM-version decision table
 # ---------------------------------------------------------------------------

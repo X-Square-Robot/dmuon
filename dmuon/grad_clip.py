@@ -15,6 +15,8 @@ from typing import Any, Protocol
 import torch
 import torch.distributed as dist
 
+from ._core.device import default_device
+
 try:
     from torch.utils._foreach_utils import (
         _device_has_foreach_support,
@@ -384,9 +386,7 @@ def _accumulator_device(
     device = getattr(comm_ctx, "device", None)
     if device is not None:
         return torch.device(device)
-    if torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device("cpu")
+    return default_device()
 
 
 def _all_reduce_if_needed(tensor: torch.Tensor, *, op: dist.ReduceOp) -> None:

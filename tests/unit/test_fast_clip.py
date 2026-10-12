@@ -95,8 +95,8 @@ def test_collective_count_is_invariant_to_local_conditions(monkeypatch) -> None:
     assert len(calls) == 1  # exactly one fused collective
     assert calls[0].shape == (3,)  # one entry per bucket, not per-bucket scalars
     stats = _bucket_stats(result)
-    assert stats["regular"].found_inf is True  # reported, not acted on via control flow
-    assert stats["muon"].found_inf is False
+    assert bool(stats["regular"].found_inf) is True  # reported, not acted on via control flow
+    assert bool(stats["muon"].found_inf) is False
 
 
 def test_noncontiguous_tensor_is_clipped_not_skipped() -> None:

@@ -11,6 +11,7 @@ import torch.nn as nn
 from ._backends.ddp import DedicatedParamGroupDDP
 from ._backends.fsdp2 import DedicatedParam
 from ._core.comm import DedicatedCommContext
+from ._core.device import get_device_module
 from ._core.owner_rank import OwnerRankLike, normalize_owner_rank
 from ._core.process_groups import is_isolated_process_group
 
@@ -81,9 +82,15 @@ def collect_forward_unshard_profile(
     ctx = get_comm_ctx(model)
     if ctx is None:
         return {"enabled": False, "events_ready": 0, "events_pending": 0}
-    if synchronize and torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if synchronize:
+        get_device_module(ctx.device).synchronize()
     return ctx.consume_forward_unshard_profile(clear=clear)
+
+
+def _group_device_module(group):
+    context = getattr(group, "comm_ctx", None)
+    device = getattr(group, "device", getattr(context, "device", "cuda"))
+    return get_device_module(device)
 
 
 def prepare_group_muon_grads(g, *, use_reduce_stream: bool = False) -> None:
@@ -132,7 +139,7 @@ def wait_group_muon_grads(g) -> None:
 
     event = getattr(g, "_muon_grad_ready_event", None)
     if event is not None:
-        torch.cuda.current_stream().wait_event(event)
+        _group_device_module(g).current_stream().wait_event(event)
         setattr(g, "_muon_grad_ready_event", None)
     if hasattr(g, "_muon_grad_ready_refs"):
         g._muon_grad_ready_refs = []
@@ -169,7 +176,7 @@ def _coalesced_wait_prepared_muon_grads(groups) -> bool:
         return True
 
     ready_event = reduce_stream.record_event()
-    torch.cuda.current_stream().wait_event(ready_event)
+    _group_device_module(group).current_stream().wait_event(ready_event)
     for group in groups:
         _finish_group_muon_grads_after_coalesced_wait(group)
     return True
@@ -477,8 +484,9 @@ def fence_isolated_process_groups(model: nn.Module) -> None:
         return
 
     wait_all_replicate_broadcasts(model)
-    if torch.cuda.is_available():
-        torch.cuda.current_stream().synchronize()
+    ctx = get_comm_ctx(model)
+    if ctx is not None:
+        get_device_module(ctx.device).current_stream().synchronize()
 
     for process_group in process_groups:
         dist.barrier(group=process_group)

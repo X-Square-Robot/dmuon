@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.distributed as dist
 
+from .device import get_device_module
+
 if TYPE_CHECKING:
     from dmuon._core.state import DedicatedState
 
@@ -95,19 +97,20 @@ class DedicatedCommContext:
         user code directly.
         """
         self.device = device
-        self.broadcast_stream = torch.cuda.Stream(device=device, priority=-1)
-        self.sharded_adamw_unshard_stream = torch.cuda.Stream(
+        self._device_module = get_device_module(device)
+        self.broadcast_stream = self._device_module.Stream(device=device, priority=-1)
+        self.sharded_adamw_unshard_stream = self._device_module.Stream(
             device=device, priority=-1
         )
         self.sharded_adamw_unshard_separate_stream_enabled = False
-        self.reduce_stream = torch.cuda.Stream(device=device, priority=-1)
+        self.reduce_stream = self._device_module.Stream(device=device, priority=-1)
         # FSDP2 sets the all-reduce (i.e. replicate-dim) stream at default
         # priority because inter-node AR traffic uses different network
         # resources than intra-node AG/RS.  We follow the same convention so
         # the Phase C scheduler can issue broadcasts on this stream without
         # starving shard-dim collectives.
-        self.replicate_reduce_stream = torch.cuda.Stream(device=device)
-        self.replicate_broadcast_stream = torch.cuda.Stream(device=device)
+        self.replicate_reduce_stream = self._device_module.Stream(device=device)
+        self.replicate_broadcast_stream = self._device_module.Stream(device=device)
         self.replicate_group: Optional[dist.ProcessGroup] = replicate_group
         self.tp_buffer_reuse = self._normalize_tp_buffer_reuse(tp_buffer_reuse)
         if replicate_broadcast_bucket_mb <= 0:
@@ -269,12 +272,12 @@ class DedicatedCommContext:
 
         for item in events:
             end = item["end"]
-            if isinstance(end, torch.cuda.Event) and not end.query():
+            if isinstance(end, self._device_module.Event) and not end.query():
                 events_pending += 1
                 continue
             start = item["start"]
-            if not isinstance(start, torch.cuda.Event) or not isinstance(
-                end, torch.cuda.Event
+            if not isinstance(start, self._device_module.Event) or not isinstance(
+                end, self._device_module.Event
             ):
                 events_pending += 1
                 continue

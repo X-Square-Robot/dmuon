@@ -26,7 +26,11 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from dmuon.kernels import syrk_quack
+from dmuon._core.device import cuda_is_available
+
+syrk_quack = None
+if cuda_is_available():
+    from dmuon.kernels import syrk_quack
 
 _logger = logging.getLogger(__name__)
 
@@ -45,7 +49,7 @@ class SyrkBackend(str, Enum):
 # Hardware detection (filled at import time)
 # ---------------------------------------------------------------------------
 _SM_VERSION: int = 0
-if torch.cuda.is_available():
+if cuda_is_available():
     _cap = torch.cuda.get_device_capability()
     _SM_VERSION = _cap[0] * 10 + _cap[1]
 
@@ -54,12 +58,13 @@ if torch.cuda.is_available():
 # B-series transition.
 _HAS_CUTE_SM80 = False
 _syrk_sm80_fn = None
-try:
-    from dmuon.kernels.syrk_sm80 import syrk_sm80 as _syrk_sm80_fn
+if cuda_is_available():
+    try:
+        from dmuon.kernels.syrk_sm80 import syrk_sm80 as _syrk_sm80_fn
 
-    _HAS_CUTE_SM80 = True
-except ImportError:  # pragma: no cover — env-dependent
-    pass
+        _HAS_CUTE_SM80 = True
+    except ImportError:  # pragma: no cover — env-dependent
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +81,7 @@ def detect_best_backend(sm_version: Optional[int] = None) -> SyrkBackend:
     if sm_version is None:
         sm_version = _SM_VERSION
     if sm_version >= 90:
-        if syrk_quack.is_supported(sm_version):
+        if syrk_quack is not None and syrk_quack.is_supported(sm_version):
             return SyrkBackend.QUACK
         return SyrkBackend.CUBLAS
     if 80 <= sm_version < 90:
@@ -93,7 +98,7 @@ def _quack_unsupport_hint() -> str:
             "quack requires SM90+ (H100/B200).  On an SM80 device (A100/A800) "
             "use kernel='cute_sm80' or kernel='auto'."
         )
-    if not syrk_quack.HAS_QUACK:
+    if syrk_quack is None or not syrk_quack.HAS_QUACK:
         return "Install via `pip install dmuon[quack]`."
     if not syrk_quack.ADAPTER_READY:
         return (
@@ -115,12 +120,14 @@ def resolve_backend(user_choice: SyrkBackend) -> SyrkBackend:
     """
     if user_choice == SyrkBackend.AUTO:
         return detect_best_backend()
-    if user_choice == SyrkBackend.QUACK and not syrk_quack.is_supported(_SM_VERSION):
+    if user_choice == SyrkBackend.QUACK and (
+        syrk_quack is None or not syrk_quack.is_supported(_SM_VERSION)
+    ):
         hint = _quack_unsupport_hint()
         raise RuntimeError(
             f"kernel='quack' requested but not usable: SM={_SM_VERSION}, "
-            f"HAS_QUACK={syrk_quack.HAS_QUACK}, "
-            f"ADAPTER_READY={syrk_quack.ADAPTER_READY}.\n{hint}"
+            f"HAS_QUACK={syrk_quack is not None and syrk_quack.HAS_QUACK}, "
+            f"ADAPTER_READY={syrk_quack is not None and syrk_quack.ADAPTER_READY}.\n{hint}"
         )
     if user_choice == SyrkBackend.CUTE_SM80 and not _HAS_CUTE_SM80:
         raise RuntimeError(
@@ -142,7 +149,7 @@ def get_backend_status() -> dict:
     return {
         "sm_version": _SM_VERSION,
         "auto_choice": detect_best_backend().value,
-        "quack_available": syrk_quack.HAS_QUACK,
+        "quack_available": syrk_quack is not None and syrk_quack.HAS_QUACK,
         "cute_sm80_available": _HAS_CUTE_SM80,
         "cublas_always_available": True,
     }
@@ -205,6 +212,12 @@ def syrk_dispatch(
     resolve on every call — the detection result itself is cached at
     module import, so this is effectively free.
     """
+    if A.device.type != "cuda":
+        if backend not in (SyrkBackend.AUTO, SyrkBackend.CUBLAS):
+            raise RuntimeError(f"SYRK backend {backend!r} requires a CUDA tensor")
+        _cublas_syrk(A, D, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add)
+        return
+
     resolved = resolve_backend(backend)
 
     if resolved == SyrkBackend.CUBLAS:
@@ -229,6 +242,7 @@ def syrk_dispatch(
         return
 
     if resolved == SyrkBackend.QUACK:
+        assert syrk_quack is not None  # validated by resolve_backend
         syrk_quack.syrk(
             A, D, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add
         )

@@ -16,13 +16,15 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from dmuon._core.device import cuda_is_available, default_device
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Backend detection
 # ---------------------------------------------------------------------------
 _SM_VERSION = 0
-if torch.cuda.is_available():
+if cuda_is_available():
     _cap = torch.cuda.get_device_capability()
     _SM_VERSION = _cap[0] * 10 + _cap[1]
 
@@ -30,13 +32,14 @@ if torch.cuda.is_available():
 HAS_SYRK = False
 _syrk_sm80_fn = None
 _SYRK_CONFIGS = []
-try:
-    from dmuon.kernels.syrk_sm80 import syrk_sm80 as _syrk_sm80_fn
-    from dmuon.kernels.syrk_sm80 import SYRK_SM80_CONFIGS as _SYRK_CONFIGS
+if cuda_is_available():
+    try:
+        from dmuon.kernels.syrk_sm80 import syrk_sm80 as _syrk_sm80_fn
+        from dmuon.kernels.syrk_sm80 import SYRK_SM80_CONFIGS as _SYRK_CONFIGS
 
-    HAS_SYRK = True
-except ImportError:
-    pass
+        HAS_SYRK = True
+    except ImportError:
+        pass
 
 
 def get_ns_backend() -> str:
@@ -65,7 +68,7 @@ def get_ns_backend() -> str:
     elif choice == SyrkBackend.CUTE_SM80:
         detail = "DMuon internal"
     else:
-        detail = "universal fallback"
+        detail = "PyTorch eager on NPU" if default_device().type == "npu" else "universal fallback"
     return f"Gram NS · kernel={choice.value} (SM{_SM_VERSION}, {detail})"
 
 
@@ -305,7 +308,7 @@ def _cache_dir() -> Path:
 
 
 def _gpu_tag() -> str:
-    if torch.cuda.is_available():
+    if cuda_is_available():
         return torch.cuda.get_device_name(0).replace(" ", "_")
     return "cpu"
 

@@ -34,6 +34,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.autograd import Variable
+
+from dmuon._core.device import current_device
 try:
     from torch.distributed import DeviceMesh
 except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
@@ -106,7 +108,7 @@ class _ReplicatedGroup:
 
         self.mesh = mesh
         self._group: dist.ProcessGroup = mesh.get_group()
-        self._device = torch.device("cuda", torch.cuda.current_device())
+        self._device = current_device(mesh.device_type)
         dp_names = set(mesh.mesh_dim_names or ())
         self._dp_mesh_dim_names = frozenset(dp_names)
         self._allow_tp_dtensor = allow_tp_dtensor

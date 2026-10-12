@@ -16,6 +16,7 @@ except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
 from ._backends.ddp import DedicatedParamDDP, DedicatedParamGroupDDP
 from ._backends.fsdp2 import DedicatedParam, DedicatedParamGroup
 from ._core.comm import DedicatedCommContext
+from ._core.device import current_device
 from ._core.internal_utils import unsafe_setattr_param
 from ._core.owner_rank import normalize_owner_rank
 from ._core.partition import _extract_layer_id, compute_balanced_assignment
@@ -637,7 +638,7 @@ def dedicate_params(
         role="fsdp2.replicate",
     )
     device_type = mesh.device_type
-    device = torch.device(device_type, torch.cuda.current_device())
+    device = current_device(device_type)
     comm_ctx = DedicatedCommContext(
         device,
         replicate_group=replicate_group,
@@ -879,7 +880,7 @@ def dedicate_params_ddp(
         role="ddp.dp",
     )
     device_type = mesh.device_type
-    device = torch.device(device_type, torch.cuda.current_device())
+    device = current_device(device_type)
     comm_ctx = DedicatedCommContext(device, replicate_group=None)
 
     layer_to_dparams: dict[
@@ -1046,7 +1047,7 @@ def dedicate_params_ddp_tp(
         role="ddp_tp.dp",
     )
     device_type = mesh.device_type
-    device = torch.device(device_type, torch.cuda.current_device())
+    device = current_device(device_type)
     comm_ctx = DedicatedCommContext(
         device,
         replicate_group=None,

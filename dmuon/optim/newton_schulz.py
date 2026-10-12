@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from dmuon._core.device import cuda_is_available
 from dmuon.optim.syrk_dispatch import (
     HAS_SYRK as _HAS_SYRK,
     syrk_or_cublas as _syrk_or_cublas,
@@ -273,7 +274,6 @@ def direct_newton_schulz(
     return X.to(original_dtype)
 
 
-@torch.compile
 def _compiled_direct_newton_schulz(
     G: Tensor, coefficients: list[list[float]], eps: float = 1e-7
 ) -> Tensor:
@@ -291,6 +291,10 @@ def _compiled_direct_newton_schulz(
     if transposed:
         X = X.T
     return X
+
+
+if cuda_is_available():
+    _compiled_direct_newton_schulz = torch.compile(_compiled_direct_newton_schulz)
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +384,7 @@ def gram_newton_schulz(
 
     # Initial SYRK: R = X @ X^T
     m = X.shape[0]
-    _use_syrk = _HAS_SYRK and X.is_cuda and not deterministic
+    _use_syrk = _HAS_SYRK and X.device.type == "cuda" and not deterministic
     if _use_syrk:
         R = torch.empty(m, m, device=X.device, dtype=X.dtype)
         _syrk_or_cublas(X, R)
@@ -488,7 +492,7 @@ def gram_newton_schulz_factors(
     X = (X / normalizer).half().contiguous()
 
     m = X.shape[0]
-    _use_syrk = _HAS_SYRK and X.is_cuda and not deterministic
+    _use_syrk = _HAS_SYRK and X.device.type == "cuda" and not deterministic
     if _use_syrk:
         R = torch.empty(m, m, device=X.device, dtype=X.dtype)
         _syrk_or_cublas(X, R)

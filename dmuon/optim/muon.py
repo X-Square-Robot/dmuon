@@ -13,6 +13,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.optim import Optimizer
 
+from .._core.device import get_device_module
+
 from ..grad_clip import (
     MuonGradClipStats,
     _clip_ready_muon_grad_norm_,
@@ -209,6 +211,7 @@ class Muon(Optimizer):
                 "Model has no _dedicated_comm_ctx. Call dmuon.dedicate_params() first."
             )
         self._comm_ctx = comm_ctx
+        self._device_module = get_device_module(comm_ctx.device)
         self._comm_ctx.sharded_adamw_unshard_separate_stream_enabled = bool(
             sharded_adamw_unshard_separate_stream
         )
@@ -1006,7 +1009,7 @@ class Muon(Optimizer):
 
     def _profile_begin_step(self) -> None:
         self._step_profile_enabled = (
-            self._profile_requested() and torch.cuda.is_available()
+            self._profile_requested() and self._device_module.is_available()
         )
         self._last_step_profile_events = []
         self._last_step_profile = {
@@ -1018,8 +1021,8 @@ class Muon(Optimizer):
     def _profile_event_start(self, name: str):
         if not self._step_profile_enabled:
             return None
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = self._device_module.Event(enable_timing=True)
+        end = self._device_module.Event(enable_timing=True)
         start.record()
         return name, start, end
 
@@ -1127,7 +1130,7 @@ class Muon(Optimizer):
         assert dp.tp_group is not None
         assert dp._tp_owner_global_rank is not None
 
-        current_stream = torch.cuda.current_stream()
+        current_stream = self._device_module.current_stream()
         local_grad_tensor = dp._reduced_grad
         local_grad_tensor.record_stream(current_stream)
         local_grad = local_grad_tensor.view(local_grad_tensor.shape[0], -1)
@@ -1317,9 +1320,9 @@ class Muon(Optimizer):
             return profile
         event_totals: dict[str, float] = {}
         for name, start, end in self._last_step_profile_events:
-            if isinstance(start, torch.cuda.Event) and not start.query():
+            if isinstance(start, self._device_module.Event) and not start.query():
                 start.synchronize()
-            if isinstance(end, torch.cuda.Event) and not end.query():
+            if isinstance(end, self._device_module.Event) and not end.query():
                 end.synchronize()
             event_totals[name] = event_totals.get(name, 0.0) + float(
                 start.elapsed_time(end)
@@ -1621,7 +1624,7 @@ class Muon(Optimizer):
         if wait_for_tp_gather and any(
             dp.tp_group is not None for dp in dedicated_params
         ):
-            torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
+            self._device_module.current_stream().wait_stream(self._comm_ctx.reduce_stream)
 
         if self._tp_distributed_gram_enabled():
             for dp in dedicated_params:
@@ -1656,7 +1659,7 @@ class Muon(Optimizer):
                 for desc in tp_gram_descriptors:
                     self._apply_tp_distributed_gram_descriptor(desc)
 
-        current_stream = torch.cuda.current_stream()
+        current_stream = self._device_module.current_stream()
         for dp in dedicated_params:
             if dp._reduced_grad is None:
                 continue
@@ -1780,6 +1783,9 @@ class Muon(Optimizer):
         guarantees.  Eager path is byte-identical (same kernels, see
         ns_graph.py capture protocol).
         """
+        if ns_input.device.type != "cuda":
+            return self._ns.local(ns_input, self._ns_steps)
+
         from dmuon.optim import ns_graph as _ns_graph
 
         if not is_tp and _ns_graph.enabled():
@@ -1831,8 +1837,8 @@ class Muon(Optimizer):
         if wait_for_tp_gather and any(
             dp.tp_group is not None for dp in dedicated_params
         ):
-            torch.cuda.current_stream().wait_stream(self._comm_ctx.reduce_stream)
-        current_stream = torch.cuda.current_stream()
+            self._device_module.current_stream().wait_stream(self._comm_ctx.reduce_stream)
+        current_stream = self._device_module.current_stream()
 
         entries = []
         for dp in dedicated_params:

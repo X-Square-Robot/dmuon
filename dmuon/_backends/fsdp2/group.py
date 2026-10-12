@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 from dmuon._core.comm import DedicatedCommContext
 from dmuon._core.dynamo import dynamo_disable
+from dmuon._core.device import get_device_module
 from dmuon._core.owner_rank import OwnerCoord
 
 from .param import DedicatedParam
@@ -289,7 +290,8 @@ class DedicatedParamGroup:
     ):
         self.params = params
         self.comm_ctx = comm_ctx
-        self.device = params[0].device if params else torch.device("cuda")
+        self.device = params[0].device if params else comm_ctx.device
+        self._device_module = get_device_module(self.device)
 
         # Pre-group by owner so packed broadcasts / reduces can coalesce
         # all of an owner's params into a single NCCL call.  Phase A extends
@@ -570,13 +572,13 @@ class DedicatedParamGroup:
                     ),
                 )
         publish_wait_stream = (
-            self.comm_ctx.broadcast_stream if prefetch else torch.cuda.current_stream()
+            self.comm_ctx.broadcast_stream if prefetch else self._device_module.current_stream()
         )
         publish_wait_start = None
         publish_wait_end = None
         if self.comm_ctx.record_forward_profile:
-            publish_wait_start = torch.cuda.Event(enable_timing=True)
-            publish_wait_end = torch.cuda.Event(enable_timing=True)
+            publish_wait_start = self._device_module.Event(enable_timing=True)
+            publish_wait_end = self._device_module.Event(enable_timing=True)
             publish_wait_start.record(publish_wait_stream)
         if prefetch:
             with _profile_range(f"dmuon.forward_prefetch_publish.{group_name}"):
@@ -653,10 +655,10 @@ class DedicatedParamGroup:
         wait_current_start = None
         wait_current_end = None
         if self.comm_ctx.record_forward_profile:
-            wait_current_start = torch.cuda.Event(enable_timing=True)
-            wait_current_end = torch.cuda.Event(enable_timing=True)
+            wait_current_start = self._device_module.Event(enable_timing=True)
+            wait_current_end = self._device_module.Event(enable_timing=True)
             wait_current_start.record(broadcast_stream)
-        broadcast_stream.wait_stream(torch.cuda.current_stream())
+        broadcast_stream.wait_stream(self._device_module.current_stream())
         if wait_current_start is not None and wait_current_end is not None:
             wait_current_end.record(broadcast_stream)
             self.comm_ctx.record_forward_unshard_event(
@@ -670,11 +672,11 @@ class DedicatedParamGroup:
         sharded_wait_current_start = None
         sharded_wait_current_end = None
         if sharded_adamw_separate_stream and self.comm_ctx.record_forward_profile:
-            sharded_wait_current_start = torch.cuda.Event(enable_timing=True)
-            sharded_wait_current_end = torch.cuda.Event(enable_timing=True)
+            sharded_wait_current_start = self._device_module.Event(enable_timing=True)
+            sharded_wait_current_end = self._device_module.Event(enable_timing=True)
             sharded_wait_current_start.record(sharded_adamw_stream)
         if sharded_adamw_separate_stream:
-            sharded_adamw_stream.wait_stream(torch.cuda.current_stream())
+            sharded_adamw_stream.wait_stream(self._device_module.current_stream())
         if (
             sharded_wait_current_start is not None
             and sharded_wait_current_end is not None
@@ -744,7 +746,7 @@ class DedicatedParamGroup:
             replicate_publish_waits=1 if pending_replicate_publish else 0,
             sharded_muon_publish_waits=1 if pending_sharded_muon_publish else 0,
         )
-        with torch.cuda.stream(broadcast_stream):
+        with self._device_module.stream(broadcast_stream):
             # Alloc + owner copy-in BEFORE coalescing: these ops execute
             # immediately on broadcast_stream. Wrapped in no_grad +
             # preserve_version_counter so autograd doesn't see the resize /
@@ -784,8 +786,8 @@ class DedicatedParamGroup:
                 owner_start = None
                 owner_end = None
                 if self.comm_ctx.record_forward_profile:
-                    owner_start = torch.cuda.Event(enable_timing=True)
-                    owner_end = torch.cuda.Event(enable_timing=True)
+                    owner_start = self._device_module.Event(enable_timing=True)
+                    owner_end = self._device_module.Event(enable_timing=True)
                     owner_start.record(broadcast_stream)
                 with _profile_range(f"dmuon.unshard_broadcast.dispatch.{group_name}"):
                     with dist._coalescing_manager(group=dp_group, device=self.device):
@@ -821,7 +823,7 @@ class DedicatedParamGroup:
             # stream is optional because these large embedding/head gathers can
             # otherwise queue in front of the first decoder-layer owner
             # broadcasts on the regular forward unshard stream.
-            with torch.cuda.stream(sharded_adamw_stream):
+            with self._device_module.stream(sharded_adamw_stream):
                 for p in sharded_adamw_params:
                     assert p._sharded_adamw_full_padded is not None
                     assert p._sharded_adamw_comm_shard is not None
@@ -850,8 +852,8 @@ class DedicatedParamGroup:
                 gather_start = None
                 gather_end = None
                 if self.comm_ctx.record_forward_profile:
-                    gather_start = torch.cuda.Event(enable_timing=True)
-                    gather_end = torch.cuda.Event(enable_timing=True)
+                    gather_start = self._device_module.Event(enable_timing=True)
+                    gather_end = self._device_module.Event(enable_timing=True)
                     gather_start.record(sharded_adamw_stream)
                 with _profile_range(
                     f"dmuon.unshard_all_gather.sharded_adamw.dispatch.{group_name}"
@@ -909,10 +911,10 @@ class DedicatedParamGroup:
             return
 
         group_name = _group_profile_name(self)
-        current_stream = torch.cuda.current_stream()
+        current_stream = self._device_module.current_stream()
         if self.comm_ctx.record_forward_profile:
-            wait_start = torch.cuda.Event(enable_timing=True)
-            wait_end = torch.cuda.Event(enable_timing=True)
+            wait_start = self._device_module.Event(enable_timing=True)
+            wait_end = self._device_module.Event(enable_timing=True)
             wait_start.record(current_stream)
             if self._broadcast_event is not None:
                 current_stream.wait_event(self._broadcast_event)
@@ -961,10 +963,10 @@ class DedicatedParamGroup:
         """
         if self._broadcast_event is not None:
             # Drain and discard — the prefetched unshard was not consumed.
-            torch.cuda.current_stream().wait_event(self._broadcast_event)
+            self._device_module.current_stream().wait_event(self._broadcast_event)
             self._broadcast_event = None
         if self._sharded_adamw_unshard_event is not None:
-            torch.cuda.current_stream().wait_event(self._sharded_adamw_unshard_event)
+            self._device_module.current_stream().wait_event(self._sharded_adamw_unshard_event)
             self._sharded_adamw_unshard_event = None
         for p in self.params:
             p.reshard()
@@ -1065,7 +1067,7 @@ class DedicatedParamGroup:
         replicate_gated = replicate_group is not None and not self.replicate_grads_enabled
 
         # Ensure gradients are computed before reduce_stream reads them
-        reduce_stream.wait_stream(torch.cuda.current_stream())
+        reduce_stream.wait_stream(self._device_module.current_stream())
 
         self._pending_reduce = []
         # ``stage2_pending``: per-(grad_buf, param) records; only shard-owner
@@ -1087,7 +1089,7 @@ class DedicatedParamGroup:
         # that ``reshard()`` freeing ``_unsharded_param``'s storage does not
         # dangle the post-reduce view.
         with _profile_range(f"dmuon.stage1_shard_reduce.{group_name}"):
-            with torch.cuda.stream(reduce_stream):
+            with self._device_module.stream(reduce_stream):
                 normal_work = [
                     p
                     for p in self.params
@@ -1223,13 +1225,13 @@ class DedicatedParamGroup:
         profile_start = profile_end = None
         stage2_bytes = 0
         if self.comm_ctx.record_post_step_profile:
-            profile_start = torch.cuda.Event(enable_timing=True)
-            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_start = self._device_module.Event(enable_timing=True)
+            profile_end = self._device_module.Event(enable_timing=True)
             stage2_bytes = sum(_param_payload_bytes(p) for _grad, p in stage2_pending)
         with _profile_range(f"dmuon.stage2_replicate_reduce.{group_name}"):
             if wait_event is not None:
                 replicate_stream.wait_event(wait_event)
-            with torch.cuda.stream(replicate_stream):
+            with self._device_module.stream(replicate_stream):
                 if profile_start is not None:
                     profile_start.record(replicate_stream)
                 # Accumulator flush: if a prior micro-batch ran with
@@ -1319,7 +1321,7 @@ class DedicatedParamGroup:
         if self._stage1_reduce_event is None:
             return None
 
-        target_stream = stream if stream is not None else torch.cuda.current_stream()
+        target_stream = stream if stream is not None else self._device_module.current_stream()
 
         def _wait_and_compact() -> None:
             target_stream.wait_event(self._stage1_reduce_event)
@@ -1328,7 +1330,7 @@ class DedicatedParamGroup:
         if stream is None:
             _wait_and_compact()
         else:
-            with torch.cuda.stream(stream):
+            with self._device_module.stream(stream):
                 _wait_and_compact()
 
         self._stage1_reduce_event = None
@@ -1352,7 +1354,7 @@ class DedicatedParamGroup:
         if self._post_reduce_event is None and self._replicate_reduce_state is None:
             return None
 
-        target_stream = stream if stream is not None else torch.cuda.current_stream()
+        target_stream = stream if stream is not None else self._device_module.current_stream()
         replicate_state = self._replicate_reduce_state
 
         def _wait_and_unpack() -> None:
@@ -1379,7 +1381,7 @@ class DedicatedParamGroup:
         if stream is None:
             _wait_and_unpack()
         else:
-            with torch.cuda.stream(stream):
+            with self._device_module.stream(stream):
                 _wait_and_unpack()
 
         self._post_reduce_event = None
@@ -1448,7 +1450,7 @@ class DedicatedParamGroup:
         # Per-group prefetch unpacks on reduce_stream and disables this wait
         # so later groups' gathers can overlap current-group NS work.
         if wait_current_stream:
-            reduce_stream.wait_stream(torch.cuda.current_stream())
+            reduce_stream.wait_stream(self._device_module.current_stream())
 
         grouped_work = []
         for item in work:
@@ -1460,7 +1462,7 @@ class DedicatedParamGroup:
             else:
                 grouped_work.append((tp_group, [item]))
 
-        with torch.cuda.stream(reduce_stream):
+        with self._device_module.stream(reduce_stream):
             gather_refs: list[torch.Tensor] = []
             self._tp_gather_pending_full_grads = []
             pending_full_grads: list[
@@ -1549,7 +1551,7 @@ class DedicatedParamGroup:
         """Wait until this group's TP gathered grads are visible to compute."""
         if self._tp_gather_event is None:
             return
-        torch.cuda.current_stream().wait_event(self._tp_gather_event)
+        self._device_module.current_stream().wait_event(self._tp_gather_event)
         self._materialize_tp_gathered_grads()
         self._tp_gather_event = None
         self._tp_gather_refs = []
@@ -1579,7 +1581,7 @@ class DedicatedParamGroup:
             return None
 
         bcast_stream = self.comm_ctx.replicate_broadcast_stream
-        bcast_stream.wait_stream(torch.cuda.current_stream())
+        bcast_stream.wait_stream(self._device_module.current_stream())
         # TP grad-gather prefetch uses ``reduce_stream`` while TP scatter uses
         # ``replicate_broadcast_stream``.  Both issue collectives on the same
         # TP process group, so preserve one global launch order across streams;
@@ -1598,7 +1600,7 @@ class DedicatedParamGroup:
             else:
                 grouped_work.append((p.tp_group, [p]))
 
-        with torch.cuda.stream(bcast_stream):
+        with self._device_module.stream(bcast_stream):
             reuse_buffers = _tp_scatter_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
                 with dist._coalescing_manager(group=tp_group, device=self.device):
@@ -1703,7 +1705,7 @@ class DedicatedParamGroup:
         # the caller can read ``_owned_data``. This is a GPU-side wait, not a
         # CPU block, so keep TP-owner split tensors alive until the event is
         # consumed by the next pre-forward/wait_all drain.
-        torch.cuda.current_stream().wait_event(event)
+        self._device_module.current_stream().wait_event(event)
         self._tp_scatter_state = TPScatterState(refs=refs, event=event)
 
     def tp_scatter_delta_async(self) -> None:
@@ -1764,9 +1766,9 @@ class DedicatedParamGroup:
             return
 
         bcast_stream = self.comm_ctx.replicate_broadcast_stream
-        bcast_stream.wait_stream(torch.cuda.current_stream())
+        bcast_stream.wait_stream(self._device_module.current_stream())
 
-        with torch.cuda.stream(bcast_stream):
+        with self._device_module.stream(bcast_stream):
             with dist._coalescing_manager(group=replicate_group, device=self.device):
                 for p in self.params:
                     if my_shard_rank != p.owner_shard:
@@ -1792,7 +1794,7 @@ class DedicatedParamGroup:
         """
         if self._replicate_broadcast_event is None:
             return
-        torch.cuda.current_stream().wait_event(self._replicate_broadcast_event)
+        self._device_module.current_stream().wait_event(self._replicate_broadcast_event)
         self._replicate_broadcast_event = None
 
     # ---- replicate-dim post-step broadcast (Phase C.1 async) -------------
@@ -1836,7 +1838,7 @@ class DedicatedParamGroup:
             return
 
         bcast_stream = self.comm_ctx.replicate_broadcast_stream
-        bcast_stream.wait_stream(torch.cuda.current_stream())
+        bcast_stream.wait_stream(self._device_module.current_stream())
 
         # Pick one ``_owned_data`` tensor to pin via the state tuple.  Any
         # rank-participating param works; allocator arena is shared within
@@ -1864,10 +1866,10 @@ class DedicatedParamGroup:
         profile_start = profile_end = None
         broadcast_bytes = 0
         if self.comm_ctx.record_post_step_profile:
-            profile_start = torch.cuda.Event(enable_timing=True)
-            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_start = self._device_module.Event(enable_timing=True)
+            profile_end = self._device_module.Event(enable_timing=True)
             broadcast_bytes = sum(_param_payload_bytes(p) for p in eligible_params)
-        with torch.cuda.stream(bcast_stream):
+        with self._device_module.stream(bcast_stream):
             if profile_start is not None:
                 profile_start.record(bcast_stream)
             for bucket_idx, bucket in enumerate(buckets):
@@ -1928,7 +1930,7 @@ class DedicatedParamGroup:
         local_shard_rank = dp_group.rank()
         local_replicate_rank = replicate_group.rank() if replicate_group else 0
         publish_stream = self.comm_ctx.replicate_broadcast_stream
-        publish_stream.wait_stream(torch.cuda.current_stream())
+        publish_stream.wait_stream(self._device_module.current_stream())
         if self._tp_scatter_state is not None:
             publish_stream.wait_event(self._tp_scatter_state.event)
         if self._replicate_broadcast_state is not None:
@@ -1936,7 +1938,7 @@ class DedicatedParamGroup:
 
         refs: list[torch.Tensor] = []
         group_name = _group_profile_name(self)
-        with torch.cuda.stream(publish_stream):
+        with self._device_module.stream(publish_stream):
             if replicate_group is None:
                 with _profile_range(
                     f"dmuon.sharded_muon_publish.reduce_scatter.{group_name}"
@@ -2045,7 +2047,7 @@ class DedicatedParamGroup:
     def wait_for_sharded_muon_publish(self) -> None:
         if self._sharded_muon_publish_state is None:
             return
-        torch.cuda.current_stream().wait_event(self._sharded_muon_publish_state.event)
+        self._device_module.current_stream().wait_event(self._sharded_muon_publish_state.event)
         self._sharded_muon_publish_state = None
 
     def _pre_forward_prefetch_publish(self) -> None:
@@ -2097,13 +2099,13 @@ class DedicatedParamGroup:
         # we still wait the scatter event explicitly so the state tuple
         # (and its pinned TP-owner send refs) can be released.
         group_name = _group_profile_name(self)
-        current_stream = torch.cuda.current_stream()
+        current_stream = self._device_module.current_stream()
         tp_state = self._tp_scatter_state
         if tp_state is not None:
             start = end = None
             if self.comm_ctx.record_forward_profile:
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
+                start = self._device_module.Event(enable_timing=True)
+                end = self._device_module.Event(enable_timing=True)
                 start.record(current_stream)
             current_stream.wait_event(tp_state.event)
             if start is not None and end is not None:
@@ -2125,8 +2127,8 @@ class DedicatedParamGroup:
         if state is not None:
             start = end = None
             if self.comm_ctx.record_forward_profile:
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
+                start = self._device_module.Event(enable_timing=True)
+                end = self._device_module.Event(enable_timing=True)
                 start.record(current_stream)
             current_stream.wait_event(state.event)
             if start is not None and end is not None:
@@ -2150,8 +2152,8 @@ class DedicatedParamGroup:
 
         start = end = None
         if self.comm_ctx.record_forward_profile:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
+            start = self._device_module.Event(enable_timing=True)
+            end = self._device_module.Event(enable_timing=True)
             start.record(current_stream)
         current_stream.wait_event(sharded_state.event)
         if start is not None and end is not None:
