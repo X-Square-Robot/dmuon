@@ -732,6 +732,9 @@ def get_optimizer_state_dict(
                 )
                 if keep:
                     fsdp_entry[key] = gathered
+            elif isinstance(val, torch.Tensor):
+                if keep:
+                    fsdp_entry[key] = val.cpu() if cpu_offload else val
             else:
                 # Scalar (e.g., step count)
                 if keep:

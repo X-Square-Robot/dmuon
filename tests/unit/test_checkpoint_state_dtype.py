@@ -4,11 +4,48 @@ import pytest
 import torch
 import torch.nn as nn
 
-from dmuon.checkpoint import set_optimizer_state_dict
+from dmuon.checkpoint import get_optimizer_state_dict, set_optimizer_state_dict
 
 
 class FakeDedicatedParam:
     pass
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize("keep", [False, True])
+def test_plain_adamw_export_honors_offload_and_rank_filter(monkeypatch, cpu_offload, keep):
+    import dmuon.checkpoint as checkpoint
+
+    model = nn.Linear(2, 2, bias=False)
+    model.proj = nn.Linear(2, 2, bias=False)
+    dp = FakeDedicatedParam()
+    dp.module, dp.param_name, dp.device = model.proj, "weight", torch.device("cpu")
+    model.proj._dedicated_state = SimpleNamespace(group=SimpleNamespace(params=[dp]))
+    state = {"exp_avg": torch.ones(2, 2), "exp_avg_sq": torch.full((2, 2), 0.25),
+             "step": 3, "metadata": "unchanged"}
+    optimizer = SimpleNamespace(state={model.weight: state}, _fsdp_params=[model.weight],
+                                param_groups=[{"params": [model.weight], "lr": 0.001}])
+    calls = []
+    original_cpu = torch.Tensor.cpu
+
+    def observed_cpu(tensor, *args, **kwargs):
+        calls.append(id(tensor))
+        return original_cpu(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(checkpoint, "wait_all_replicate_broadcasts", lambda _model: None)
+    monkeypatch.setattr(checkpoint.dist, "get_rank", lambda: 0 if keep else 1)
+    monkeypatch.setattr(checkpoint.dist, "all_reduce", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(torch.Tensor, "cpu", observed_cpu)
+    saved = get_optimizer_state_dict(model, optimizer, cpu_offload=cpu_offload)
+
+    assert calls == ([id(state["exp_avg"]), id(state["exp_avg_sq"])] if keep and cpu_offload else [])
+    if not keep:
+        assert saved["fsdp"] == {} and saved["param_groups"] == []
+        return
+    entry = saved["fsdp"]["weight"]
+    assert entry["step"] == 3 and entry["metadata"] == "unchanged"
+    for name in ("exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(entry[name], state[name], rtol=0, atol=0)
 
 
 def test_set_optimizer_state_dict_restores_muon_momentum_to_compute_dtype():
