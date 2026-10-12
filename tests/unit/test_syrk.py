@@ -8,11 +8,21 @@ This means:
 
 import os
 import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
 
 from dmuon.optim.syrk_dispatch import HAS_SYRK
+
+if (
+    __name__ != "__main__"
+    and "pytest" in sys.modules
+    and (not HAS_SYRK or not torch.cuda.is_available())
+):
+    import pytest
+
+    pytest.skip("CUDA/CuteDSL SYRK kernel unavailable", allow_module_level=True)
 
 if not HAS_SYRK:
     print("SKIP: CuteDSL SYRK kernel not available (missing dependencies or unsupported GPU)")
@@ -37,6 +47,7 @@ def _make_symmetric(M_tensor):
 # ---------------------------------------------------------------------------
 # Test 1: basic SYRK vs cuBLAS (A @ A^T)
 # ---------------------------------------------------------------------------
+
 
 def test_syrk_vs_cublas_basic():
     torch.manual_seed(42)
@@ -69,6 +80,7 @@ def test_syrk_vs_cublas_basic():
 # Test 2: SYRK with C, alpha, beta (C must be symmetric)
 # ---------------------------------------------------------------------------
 
+
 def test_syrk_with_C_alpha_beta():
     torch.manual_seed(42)
     M, K = 256, 512
@@ -80,8 +92,7 @@ def test_syrk_with_C_alpha_beta():
     D_ref = torch.addmm(C, A, A.T, alpha=alpha, beta=beta)
 
     D_syrk = torch.empty(M, M, device=DEVICE, dtype=DTYPE)
-    syrk_sm80(A, D_syrk, C=C, alpha=alpha, beta=beta,
-              tile_m=128, tile_k=32, num_stages=4)
+    syrk_sm80(A, D_syrk, C=C, alpha=alpha, beta=beta, tile_m=128, tile_k=32, num_stages=4)
 
     diff = (D_ref.float() - D_syrk.float()).abs().max().item()
     scale = D_ref.float().abs().max().item()
@@ -96,6 +107,7 @@ def test_syrk_with_C_alpha_beta():
 # Test 3: SYRK with diag_add (C must be symmetric)
 # ---------------------------------------------------------------------------
 
+
 def test_syrk_diag_add():
     torch.manual_seed(42)
     M, K = 256, 512
@@ -109,8 +121,17 @@ def test_syrk_diag_add():
         D_ref.diagonal().add_(diag_val)
 
         D_syrk = torch.empty(M, M, device=DEVICE, dtype=DTYPE)
-        syrk_sm80(A, D_syrk, C=C, alpha=alpha, beta=beta, diag_add=diag_val,
-                  tile_m=128, tile_k=32, num_stages=4)
+        syrk_sm80(
+            A,
+            D_syrk,
+            C=C,
+            alpha=alpha,
+            beta=beta,
+            diag_add=diag_val,
+            tile_m=128,
+            tile_k=32,
+            num_stages=4,
+        )
 
         diff = (D_ref.float() - D_syrk.float()).abs().max().item()
         scale = D_ref.float().abs().max().item()
@@ -123,11 +144,19 @@ def test_syrk_diag_add():
 
     # Verify diag_add=0 gives same result as no-diag_add
     D_no_diag = torch.empty(M, M, device=DEVICE, dtype=DTYPE)
-    syrk_sm80(A, D_no_diag, C=C, alpha=alpha, beta=beta,
-              tile_m=128, tile_k=32, num_stages=4)
+    syrk_sm80(A, D_no_diag, C=C, alpha=alpha, beta=beta, tile_m=128, tile_k=32, num_stages=4)
     D_with_zero = torch.empty(M, M, device=DEVICE, dtype=DTYPE)
-    syrk_sm80(A, D_with_zero, C=C, alpha=alpha, beta=beta, diag_add=0.0,
-              tile_m=128, tile_k=32, num_stages=4)
+    syrk_sm80(
+        A,
+        D_with_zero,
+        C=C,
+        alpha=alpha,
+        beta=beta,
+        diag_add=0.0,
+        tile_m=128,
+        tile_k=32,
+        num_stages=4,
+    )
     diff_zero = (D_no_diag.float() - D_with_zero.float()).abs().max().item()
     assert diff_zero == 0.0, (
         f"test_syrk_diag_add FAILED: diag_add=0.0 differs from no-diag_add, "
@@ -139,6 +168,7 @@ def test_syrk_diag_add():
 # ---------------------------------------------------------------------------
 # Test 4: SYRK with B != A (symmetric inputs: B@A^T must be symmetric)
 # ---------------------------------------------------------------------------
+
 
 def test_syrk_B_not_A():
     """SYRK with B!=A only valid when result is symmetric.
@@ -158,8 +188,7 @@ def test_syrk_B_not_A():
 
     D_ref = torch.mm(R, Z.T)  # R @ Z^T = R @ Z (since Z is symmetric)
     D_syrk = torch.empty(M, M, device=DEVICE, dtype=DTYPE)
-    syrk_sm80(R, D_syrk, B=Z, _symmetric=True,
-              tile_m=128, tile_k=32, num_stages=4)
+    syrk_sm80(R, D_syrk, B=Z, _symmetric=True, tile_m=128, tile_k=32, num_stages=4)
 
     diff = (D_ref.float() - D_syrk.float()).abs().max().item()
     scale = D_ref.float().abs().max().item()
@@ -175,6 +204,7 @@ def test_syrk_B_not_A():
 # ---------------------------------------------------------------------------
 # Test 5: autotune cache behaviour
 # ---------------------------------------------------------------------------
+
 
 def test_autotune_cache():
     torch.manual_seed(42)

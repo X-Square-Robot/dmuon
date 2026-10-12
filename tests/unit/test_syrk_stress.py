@@ -14,6 +14,15 @@ import torch
 
 from dmuon.optim.syrk_dispatch import HAS_SYRK
 
+if (
+    __name__ != "__main__"
+    and "pytest" in sys.modules
+    and (not HAS_SYRK or not torch.cuda.is_available())
+):
+    import pytest
+
+    pytest.skip("CUDA/CuteDSL SYRK kernel unavailable", allow_module_level=True)
+
 if not HAS_SYRK:
     print("SKIP: CuteDSL SYRK kernel not available")
     sys.exit(0)
@@ -70,6 +79,7 @@ def _find_config(M):
 # Test 1: Basic SYRK (D = A @ A^T) across all shapes and dtypes
 # ---------------------------------------------------------------------------
 
+
 def test_basic_syrk():
     """D = A @ A^T for all Transformer shapes."""
     passed, failed = 0, 0
@@ -100,6 +110,7 @@ def test_basic_syrk():
 # Test 2: SYRK with C, alpha, beta (D = alpha * A @ A^T + beta * C)
 # ---------------------------------------------------------------------------
 
+
 def test_alpha_beta_C():
     """D = alpha * A @ A^T + beta * C for varied shapes."""
     passed, failed = 0, 0
@@ -118,8 +129,16 @@ def test_alpha_beta_C():
                 C = _make_symmetric(torch.randn(M, M, device=DEVICE, dtype=dtype))
                 ref = torch.addmm(C, A, A.T, alpha=alpha, beta=beta)
                 out = torch.empty(M, M, device=DEVICE, dtype=dtype)
-                syrk_sm80(A, out, C=C, alpha=alpha, beta=beta,
-                          tile_m=tile_m, tile_k=tile_k, num_stages=num_stages)
+                syrk_sm80(
+                    A,
+                    out,
+                    C=C,
+                    alpha=alpha,
+                    beta=beta,
+                    tile_m=tile_m,
+                    tile_k=tile_k,
+                    num_stages=num_stages,
+                )
 
                 if _check(f"a={alpha},b={beta}", ref, out, dtype, f"({M},{K})"):
                     passed += 1
@@ -133,6 +152,7 @@ def test_alpha_beta_C():
 # ---------------------------------------------------------------------------
 # Test 3: B != A guard — syrk_sm80 must reject B!=A with ValueError
 # ---------------------------------------------------------------------------
+
 
 def test_B_not_A_guard():
     """syrk_sm80 must reject B!=A without _symmetric flag, accept with it."""
@@ -202,8 +222,9 @@ def test_B_not_A_guard():
         ref = torch.mm(R, Z.T)
         out = torch.empty(M, M, device=DEVICE, dtype=dtype)
         try:
-            syrk_sm80(R, out, B=Z, _symmetric=True,
-                      tile_m=tile_m, tile_k=tile_k, num_stages=num_stages)
+            syrk_sm80(
+                R, out, B=Z, _symmetric=True, tile_m=tile_m, tile_k=tile_k, num_stages=num_stages
+            )
             if _check("_symmetric B!=A", ref, out, dtype, f"({M},{M})"):
                 passed += 1
             else:
@@ -219,6 +240,7 @@ def test_B_not_A_guard():
 # ---------------------------------------------------------------------------
 # Test 5: Determinism — same input N times, must be bit-exact
 # ---------------------------------------------------------------------------
+
 
 def test_determinism():
     """Run SYRK 10 times with identical input, verify bit-exact output."""
@@ -255,13 +277,29 @@ def test_determinism():
 
             # Mode 2: with C, alpha, beta
             baseline2 = torch.empty(M, M, device=DEVICE, dtype=dtype)
-            syrk_sm80(A, baseline2, C=C, alpha=0.5, beta=0.3,
-                      tile_m=tile_m, tile_k=tile_k, num_stages=num_stages)
+            syrk_sm80(
+                A,
+                baseline2,
+                C=C,
+                alpha=0.5,
+                beta=0.3,
+                tile_m=tile_m,
+                tile_k=tile_k,
+                num_stages=num_stages,
+            )
             all_match2 = True
             for _ in range(N_RUNS - 1):
                 out2 = torch.empty(M, M, device=DEVICE, dtype=dtype)
-                syrk_sm80(A, out2, C=C, alpha=0.5, beta=0.3,
-                          tile_m=tile_m, tile_k=tile_k, num_stages=num_stages)
+                syrk_sm80(
+                    A,
+                    out2,
+                    C=C,
+                    alpha=0.5,
+                    beta=0.3,
+                    tile_m=tile_m,
+                    tile_k=tile_k,
+                    num_stages=num_stages,
+                )
                 if not torch.equal(baseline2, out2):
                     all_match2 = False
                     diff = (baseline2 - out2).abs().max().item()
@@ -274,13 +312,31 @@ def test_determinism():
 
             # Mode 3: with diag_add
             baseline3 = torch.empty(M, M, device=DEVICE, dtype=dtype)
-            syrk_sm80(A, baseline3, C=C, alpha=0.5, beta=0.3, diag_add=1.0,
-                      tile_m=tile_m, tile_k=tile_k, num_stages=num_stages)
+            syrk_sm80(
+                A,
+                baseline3,
+                C=C,
+                alpha=0.5,
+                beta=0.3,
+                diag_add=1.0,
+                tile_m=tile_m,
+                tile_k=tile_k,
+                num_stages=num_stages,
+            )
             all_match3 = True
             for _ in range(N_RUNS - 1):
                 out3 = torch.empty(M, M, device=DEVICE, dtype=dtype)
-                syrk_sm80(A, out3, C=C, alpha=0.5, beta=0.3, diag_add=1.0,
-                          tile_m=tile_m, tile_k=tile_k, num_stages=num_stages)
+                syrk_sm80(
+                    A,
+                    out3,
+                    C=C,
+                    alpha=0.5,
+                    beta=0.3,
+                    diag_add=1.0,
+                    tile_m=tile_m,
+                    tile_k=tile_k,
+                    num_stages=num_stages,
+                )
                 if not torch.equal(baseline3, out3):
                     all_match3 = False
                     diff = (baseline3 - out3).abs().max().item()
@@ -298,6 +354,7 @@ def test_determinism():
 # ---------------------------------------------------------------------------
 # Test 6: NaN/Inf stability — extreme inputs should not produce NaN
 # ---------------------------------------------------------------------------
+
 
 def test_nan_stability():
     """SYRK should not produce NaN/Inf for various input magnitudes."""
@@ -327,7 +384,9 @@ def test_nan_stability():
             has_nan = torch.isnan(out).any().item()
             has_inf = torch.isinf(out).any().item()
             if has_nan or has_inf:
-                print(f"  FAIL nan_stability ({M},{K}) scale={scale_name}: nan={has_nan} inf={has_inf}")
+                print(
+                    f"  FAIL nan_stability ({M},{K}) scale={scale_name}: nan={has_nan} inf={has_inf}"
+                )
                 failed += 1
             else:
                 passed += 1
@@ -335,12 +394,22 @@ def test_nan_stability():
             # Also test with C + alpha + beta
             C = _make_symmetric(torch.randn(M, M, device=DEVICE, dtype=dtype) * scale)
             out2 = torch.empty(M, M, device=DEVICE, dtype=dtype)
-            syrk_sm80(A, out2, C=C, alpha=0.5, beta=0.3,
-                      tile_m=tile_m, tile_k=tile_k, num_stages=num_stages)
+            syrk_sm80(
+                A,
+                out2,
+                C=C,
+                alpha=0.5,
+                beta=0.3,
+                tile_m=tile_m,
+                tile_k=tile_k,
+                num_stages=num_stages,
+            )
             has_nan2 = torch.isnan(out2).any().item()
             has_inf2 = torch.isinf(out2).any().item()
             if has_nan2 or has_inf2:
-                print(f"  FAIL nan_stability+C ({M},{K}) scale={scale_name}: nan={has_nan2} inf={has_inf2}")
+                print(
+                    f"  FAIL nan_stability+C ({M},{K}) scale={scale_name}: nan={has_nan2} inf={has_inf2}"
+                )
                 failed += 1
             else:
                 passed += 1
@@ -352,6 +421,7 @@ def test_nan_stability():
 # ---------------------------------------------------------------------------
 # Test 7: All tile configs — each config should produce correct results
 # ---------------------------------------------------------------------------
+
 
 def test_all_tile_configs():
     """Verify correctness for every tile config in SYRK_SM80_CONFIGS."""
@@ -383,8 +453,16 @@ def test_all_tile_configs():
         ref2 = torch.addmm(C, A, A.T, alpha=0.5, beta=0.3)
         out2 = torch.empty(M, M, device=DEVICE, dtype=dtype)
         try:
-            syrk_sm80(A, out2, C=C, alpha=0.5, beta=0.3,
-                      tile_m=tile_m, tile_k=tile_k, num_stages=num_stages)
+            syrk_sm80(
+                A,
+                out2,
+                C=C,
+                alpha=0.5,
+                beta=0.3,
+                tile_m=tile_m,
+                tile_k=tile_k,
+                num_stages=num_stages,
+            )
             if _check(f"cfg({tile_m},{tile_k},{num_stages})+C", ref2, out2, dtype, f"({M},{K})"):
                 passed += 1
             else:
@@ -423,9 +501,9 @@ if __name__ == "__main__":
 
     total_passed, total_failed = 0, 0
     for name, fn in tests_to_run:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Running: {name}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         try:
             fn()
             total_passed += 1
@@ -436,7 +514,7 @@ if __name__ == "__main__":
             print(f"ERROR: {e}")
             total_failed += 1
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"SUMMARY: {total_passed} test groups passed, {total_failed} failed")
     if total_failed > 0:
         sys.exit(1)

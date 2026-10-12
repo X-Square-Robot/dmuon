@@ -24,6 +24,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import torch
 from dmuon.optim.syrk_dispatch import HAS_SYRK
 
+if (
+    __name__ != "__main__"
+    and "pytest" in sys.modules
+    and (not HAS_SYRK or not torch.cuda.is_available())
+):
+    import pytest
+
+    pytest.skip("CUDA/CuteDSL SYRK kernel unavailable", allow_module_level=True)
+
 if not HAS_SYRK:
     print("SKIP: CuteDSL SYRK kernel not available")
     sys.exit(0)
@@ -41,8 +50,19 @@ from cutlass import Float32
 DEVICE = torch.device("cuda")
 
 
-def _call_syrk_raw(A, D, B=None, C=None, alpha=1.0, beta=1.0, diag_add=0.0,
-                    tile_m=128, tile_k=32, num_stages=4, skip_mirror=False):
+def _call_syrk_raw(
+    A,
+    D,
+    B=None,
+    C=None,
+    alpha=1.0,
+    beta=1.0,
+    diag_add=0.0,
+    tile_m=128,
+    tile_k=32,
+    num_stages=4,
+    skip_mirror=False,
+):
     """Call SYRK kernel directly, bypassing the B!=A guard."""
     squeeze = A.ndim == 2
     if squeeze:
@@ -76,9 +96,16 @@ def _call_syrk_raw(A, D, B=None, C=None, alpha=1.0, beta=1.0, diag_add=0.0,
     diag_add_mode = 1 if diag_add != 0.0 else 0
 
     compiled_fn = _compile_syrk_sm80(
-        a_dtype, b_dtype, d_dtype, c_dtype,
-        alpha_mode, beta_mode, diag_add_mode=diag_add_mode,
-        tile_m=tile_m, tile_k=tile_k, num_stages=num_stages,
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        alpha_mode,
+        beta_mode,
+        diag_add_mode=diag_add_mode,
+        tile_m=tile_m,
+        tile_k=tile_k,
+        num_stages=num_stages,
         skip_mirror=skip_mirror,
     )
 
@@ -101,6 +128,7 @@ def _tril_match(ref, out, atol=0.01):
 # Test 1: Single tile (M=tile_m) — only diagonal tile, no mirror
 # ---------------------------------------------------------------------------
 
+
 def test_single_tile():
     """With only 1 tile (M=tile_m), only diagonal tile is launched.
     Diagonal mirror is simple element-wise copy. If this fails, bug is in mainloop."""
@@ -121,14 +149,17 @@ def test_single_tile():
             max_diff = (ref.float() - out.float()).abs().max().item()
             tril_diff = _tril_match(ref, out)
             sym_diff = (out.float() - out.float().T).abs().max().item()
-            print(f"  tile_m={tile_m} {dtype}: NaN={has_nan} "
-                  f"max_diff={max_diff:.6f} tril_diff={tril_diff:.6f} "
-                  f"sym_diff={sym_diff:.6f}")
+            print(
+                f"  tile_m={tile_m} {dtype}: NaN={has_nan} "
+                f"max_diff={max_diff:.6f} tril_diff={tril_diff:.6f} "
+                f"sym_diff={sym_diff:.6f}"
+            )
 
 
 # ---------------------------------------------------------------------------
 # Test 2: Two tiles — introduces off-diagonal mirror
 # ---------------------------------------------------------------------------
+
 
 def test_two_tiles():
     """M = 2*tile_m → 3 tiles (2 diagonal + 1 off-diagonal).
@@ -155,14 +186,17 @@ def test_two_tiles():
             upper = torch.triu(out.float(), diagonal=1)
             mirror_diff = (lower.T - upper).abs().max().item()
 
-            print(f"  tile_m={tile_m} M={M} {dtype}: NaN={has_nan} "
-                  f"max_diff={max_diff:.6f} tril_diff={tril_diff:.6f} "
-                  f"mirror_diff={mirror_diff:.6f}")
+            print(
+                f"  tile_m={tile_m} M={M} {dtype}: NaN={has_nan} "
+                f"max_diff={max_diff:.6f} tril_diff={tril_diff:.6f} "
+                f"mirror_diff={mirror_diff:.6f}"
+            )
 
 
 # ---------------------------------------------------------------------------
 # Test 3: Scaling M — find the threshold where NaN appears
 # ---------------------------------------------------------------------------
+
 
 def test_nan_threshold():
     """Sweep M to find where NaN first appears for B!=A."""
@@ -183,13 +217,16 @@ def test_nan_threshold():
                 total = M * M
                 has_nan = nan_count > 0
                 tag = "NaN!" if has_nan else "OK  "
-                print(f"  [{tag}] tile_m={tile_m} M={M:5d} ({num_tiles} tiles) "
-                      f"{dtype}: nan_count={nan_count}/{total}")
+                print(
+                    f"  [{tag}] tile_m={tile_m} M={M:5d} ({num_tiles} tiles) "
+                    f"{dtype}: nan_count={nan_count}/{total}"
+                )
 
 
 # ---------------------------------------------------------------------------
 # Test 4: Symmetric B!=A — result SHOULD be symmetric
 # ---------------------------------------------------------------------------
+
 
 def test_symmetric_bneqa():
     """B!=A but A@B^T is symmetric (A,B are polynomials of same symmetric matrix).
@@ -211,13 +248,15 @@ def test_symmetric_bneqa():
             has_nan = torch.isnan(out).any().item()
             max_diff = (ref.float() - out.float()).abs().max().item()
             tril_diff = _tril_match(ref, out)
-            print(f"  M={M} {dtype}: NaN={has_nan} "
-                  f"max_diff={max_diff:.6f} tril_diff={tril_diff:.6f}")
+            print(
+                f"  M={M} {dtype}: NaN={has_nan} max_diff={max_diff:.6f} tril_diff={tril_diff:.6f}"
+            )
 
 
 # ---------------------------------------------------------------------------
 # Test 5: Lower triangle correctness isolation
 # ---------------------------------------------------------------------------
+
 
 def test_lower_triangle_only():
     """Check if the LOWER triangle of B!=A output is correct.
@@ -255,15 +294,18 @@ def test_lower_triangle_only():
             # Diagonal
             diag_diff = (out.float().diag() - ref.float().diag()).abs().max().item()
 
-            print(f"  M={M} {dtype}: "
-                  f"lower(NaN={has_nan_lower}, diff={lower_diff:.6f}) "
-                  f"upper(NaN={has_nan_upper}, diff={upper_diff:.6f}) "
-                  f"diag(diff={diag_diff:.6f})")
+            print(
+                f"  M={M} {dtype}: "
+                f"lower(NaN={has_nan_lower}, diff={lower_diff:.6f}) "
+                f"upper(NaN={has_nan_upper}, diff={upper_diff:.6f}) "
+                f"diag(diff={diag_diff:.6f})"
+            )
 
 
 # ---------------------------------------------------------------------------
 # Test 6: B!=A determinism (10 runs)
 # ---------------------------------------------------------------------------
+
 
 def test_bneqa_determinism():
     """Run B!=A kernel 10 times, check if results are bit-exact."""
@@ -298,6 +340,7 @@ def test_bneqa_determinism():
 # Test 7: B!=A with C matrix
 # ---------------------------------------------------------------------------
 
+
 def test_bneqa_with_C():
     """B!=A + C matrix — the most problematic pattern."""
     print("\n=== Test 7: B!=A with C matrix ===")
@@ -312,19 +355,22 @@ def test_bneqa_with_C():
 
             ref = torch.addmm(C, A, B.T, alpha=0.5, beta=0.3)
             out = torch.empty(M, M, device=DEVICE, dtype=dtype)
-            _call_syrk_raw(A, out, B=B, C=C, alpha=0.5, beta=0.3,
-                           tile_m=tile_m, tile_k=32, num_stages=4)
+            _call_syrk_raw(
+                A, out, B=B, C=C, alpha=0.5, beta=0.3, tile_m=tile_m, tile_k=32, num_stages=4
+            )
 
             has_nan = torch.isnan(out).any().item()
             max_diff = (ref.float() - out.float()).abs().max().item()
             tril_diff = _tril_match(ref, out)
-            print(f"  M={M} {dtype}: NaN={has_nan} "
-                  f"max_diff={max_diff:.6f} tril_diff={tril_diff:.6f}")
+            print(
+                f"  M={M} {dtype}: NaN={has_nan} max_diff={max_diff:.6f} tril_diff={tril_diff:.6f}"
+            )
 
 
 # ---------------------------------------------------------------------------
 # Test 8: skip_mirror isolation — compare lower triangle with/without mirror
 # ---------------------------------------------------------------------------
+
 
 def test_skip_mirror_isolation():
     """Run B!=A with skip_mirror=True (only lower triangle written).
@@ -342,20 +388,24 @@ def test_skip_mirror_isolation():
             ref = torch.mm(A, B.T)
 
             # With mirror (default)
-            out_mirror = torch.full((M, M), float('nan'), device=DEVICE, dtype=dtype)
-            _call_syrk_raw(A, out_mirror, B=B, tile_m=tile_m, tile_k=32, num_stages=4,
-                           skip_mirror=False)
+            out_mirror = torch.full((M, M), float("nan"), device=DEVICE, dtype=dtype)
+            _call_syrk_raw(
+                A, out_mirror, B=B, tile_m=tile_m, tile_k=32, num_stages=4, skip_mirror=False
+            )
 
             # Without mirror (lower triangle only)
-            out_nomirror = torch.full((M, M), float('nan'), device=DEVICE, dtype=dtype)
-            _call_syrk_raw(A, out_nomirror, B=B, tile_m=tile_m, tile_k=32, num_stages=4,
-                           skip_mirror=True)
+            out_nomirror = torch.full((M, M), float("nan"), device=DEVICE, dtype=dtype)
+            _call_syrk_raw(
+                A, out_nomirror, B=B, tile_m=tile_m, tile_k=32, num_stages=4, skip_mirror=True
+            )
 
             mask = torch.tril(torch.ones(M, M, dtype=torch.bool, device=DEVICE))
 
             # Lower triangle: both should match ref
             mirror_lower_diff = (out_mirror[mask].float() - ref[mask].float()).abs().max().item()
-            nomirror_lower_diff = (out_nomirror[mask].float() - ref[mask].float()).abs().max().item()
+            nomirror_lower_diff = (
+                (out_nomirror[mask].float() - ref[mask].float()).abs().max().item()
+            )
             mirror_lower_nan = torch.isnan(out_mirror[mask]).any().item()
             nomirror_lower_nan = torch.isnan(out_nomirror[mask]).any().item()
 
@@ -365,15 +415,21 @@ def test_skip_mirror_isolation():
             mirror_upper_nan = torch.isnan(out_mirror[umask]).any().item()
 
             print(f"  M={M} {dtype}:")
-            print(f"    mirror:   lower(NaN={mirror_lower_nan}, diff={mirror_lower_diff:.6f}) "
-                  f"upper(NaN={mirror_upper_nan})")
-            print(f"    nomirror: lower(NaN={nomirror_lower_nan}, diff={nomirror_lower_diff:.6f}) "
-                  f"upper(NaN%={nomirror_upper_nan_pct:.1%})")
+            print(
+                f"    mirror:   lower(NaN={mirror_lower_nan}, diff={mirror_lower_diff:.6f}) "
+                f"upper(NaN={mirror_upper_nan})"
+            )
+            print(
+                f"    nomirror: lower(NaN={nomirror_lower_nan}, diff={nomirror_lower_diff:.6f}) "
+                f"upper(NaN%={nomirror_upper_nan_pct:.1%})"
+            )
 
             if not nomirror_lower_nan and nomirror_lower_diff < 0.01:
                 print("    --> DIAGNOSIS: mainloop OK, bug is in mirror epilogue")
             elif not nomirror_lower_nan:
-                print(f"    --> DIAGNOSIS: mainloop has precision issues (diff={nomirror_lower_diff:.6f})")
+                print(
+                    f"    --> DIAGNOSIS: mainloop has precision issues (diff={nomirror_lower_diff:.6f})"
+                )
             else:
                 print("    --> DIAGNOSIS: mainloop produces NaN, bug is in tile indexing/MMA")
 
