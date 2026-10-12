@@ -87,6 +87,21 @@ with BF16 momentum are not an exact reference for a package using FP32 momentum.
 
 ### Ascend distributed restart tests (four NPUs)
 
+The [contribution guide](../docs/contributing.md#native-ascend-distributed-tests-requires-4-npus)
+defines the mandatory native gate. Run it before a PR that changes NPU
+distributed behavior:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+    tests/distributed/test_hsdp_correctness.py --device npu --steps 4 \
+    --resume-after 2 --output-dir /path/to/new-hsdp-proof
+```
+
+It uses the upstream model with identical initialization and actual inputs
+across a 1D shard-only mesh and a 2x2 HSDP mesh, checks every rank's full state
+without tolerance, and verifies continuation from one canonical rank-0 disk
+checkpoint. This is separate from the varied-input regression below.
+
 The tiny HCCL regression covers a one-dimensional four-rank mesh and a 2x2
 hybrid mesh. Each topology tests GAS4 with synchronized/default gradients and
 `no_sync` with explicit FP32 gradients, followed by an exact disk restart.

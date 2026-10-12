@@ -18,12 +18,11 @@ fp rounding.
 Run: ``torchrun --nproc_per_node=4 tests/distributed/test_hsdp_correctness.py``
 """
 
+import argparse
 import os
 import sys
 
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
 import torch.distributed as dist
@@ -61,9 +60,7 @@ class Block(nn.Module):
 class TinyModel(nn.Module):
     def __init__(self, num_layers=4, hidden=256, intermediate=1024):
         super().__init__()
-        self.layers = nn.ModuleList(
-            [Block(hidden, intermediate) for _ in range(num_layers)]
-        )
+        self.layers = nn.ModuleList([Block(hidden, intermediate) for _ in range(num_layers)])
         self.head = nn.Linear(hidden, 1, bias=False)
 
     def forward(self, x):
@@ -76,13 +73,21 @@ class TinyModel(nn.Module):
 
 
 def run_shard_only(
-    model_state, device, shard_mesh, data_list, lr, ns_steps, adamw_lr,
-    adamw_betas, adamw_wd,
+    model_state,
+    device,
+    shard_mesh,
+    data_list,
+    lr,
+    ns_steps,
+    adamw_lr,
+    adamw_betas,
+    adamw_wd,
 ):
     model = TinyModel().to(device)
     model.load_state_dict(model_state)
     dedicate_params(
-        model, shard_mesh,
+        model,
+        shard_mesh,
         predicate=lambda n, p: "proj" in n and p.ndim == 2,
     )
     for layer in model.layers:
@@ -90,9 +95,13 @@ def run_shard_only(
     fully_shard(model, mesh=shard_mesh)
 
     optimizer = Muon(
-        model, lr=lr, momentum=0.0, weight_decay=0.0,
+        model,
+        lr=lr,
+        momentum=0.0,
+        weight_decay=0.0,
         ns_steps=ns_steps,
-        adamw_lr=adamw_lr, adamw_betas=adamw_betas,
+        adamw_lr=adamw_lr,
+        adamw_betas=adamw_betas,
         adamw_weight_decay=adamw_wd,
     )
 
@@ -110,15 +119,25 @@ def run_shard_only(
 
 
 def run_hsdp(
-    model_state, device, shard_mesh, replicate_mesh, fsdp_mesh, data_list,
-    lr, ns_steps, adamw_lr, adamw_betas, adamw_wd,
+    model_state,
+    device,
+    shard_mesh,
+    replicate_mesh,
+    fsdp_mesh,
+    data_list,
+    lr,
+    ns_steps,
+    adamw_lr,
+    adamw_betas,
+    adamw_wd,
 ):
     model = TinyModel().to(device)
     model.load_state_dict(model_state)
     # DMuon's dedicated partition uses the HSDP 2D layout; FSDP2 uses the
     # combined (replicate, shard) mesh for its own DTensors.
     dedicate_params(
-        model, shard_mesh,
+        model,
+        shard_mesh,
         predicate=lambda n, p: "proj" in n and p.ndim == 2,
         replicate_mesh=replicate_mesh,
     )
@@ -127,9 +146,13 @@ def run_hsdp(
     fully_shard(model, mesh=fsdp_mesh)
 
     optimizer = Muon(
-        model, lr=lr, momentum=0.0, weight_decay=0.0,
+        model,
+        lr=lr,
+        momentum=0.0,
+        weight_decay=0.0,
         ns_steps=ns_steps,
-        adamw_lr=adamw_lr, adamw_betas=adamw_betas,
+        adamw_lr=adamw_lr,
+        adamw_betas=adamw_betas,
         adamw_weight_decay=adamw_wd,
     )
 
@@ -191,8 +214,15 @@ def main():
     # Path A: 1D shard-only mesh
     shard_only_mesh = init_device_mesh("cuda", (4,))
     losses_a = run_shard_only(
-        model_state, device, shard_only_mesh, data_list,
-        lr, ns_steps, adamw_lr, adamw_betas, adamw_wd,
+        model_state,
+        device,
+        shard_only_mesh,
+        data_list,
+        lr,
+        ns_steps,
+        adamw_lr,
+        adamw_betas,
+        adamw_wd,
     )
     dist.barrier()
     torch.cuda.empty_cache()
@@ -201,14 +231,25 @@ def main():
     # FSDP2 itself runs in HSDP mode (replicate-dim all-reduces symmetric
     # grads), paralleling DMuon's replicate-dim reduce on dedicated params.
     hsdp_mesh = init_device_mesh(
-        "cuda", (2, 2), mesh_dim_names=("replicate", "shard"),
+        "cuda",
+        (2, 2),
+        mesh_dim_names=("replicate", "shard"),
     )
     shard_mesh = hsdp_mesh["shard"]
     replicate_mesh = hsdp_mesh["replicate"]
 
     losses_b = run_hsdp(
-        model_state, device, shard_mesh, replicate_mesh, hsdp_mesh, data_list,
-        lr, ns_steps, adamw_lr, adamw_betas, adamw_wd,
+        model_state,
+        device,
+        shard_mesh,
+        replicate_mesh,
+        hsdp_mesh,
+        data_list,
+        lr,
+        ns_steps,
+        adamw_lr,
+        adamw_betas,
+        adamw_wd,
     )
     dist.barrier()
 
@@ -217,7 +258,7 @@ def main():
             f"\n  {'Step':<6s} {'ShardOnly':>12s} {'HSDP':>12s} "
             f"{'Diff':>12s} {'RelDiff':>10s} {'Status':>8s}"
         )
-        print(f"  {'-'*68}")
+        print(f"  {'-' * 68}")
         all_pass = True
         for i in range(num_steps):
             diff = abs(losses_a[i] - losses_b[i])
@@ -241,5 +282,28 @@ def main():
     dist.destroy_process_group()
 
 
+def dispatch_backend() -> None:
+    """Keep the CUDA default and expose the native NPU correctness gate."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", choices=("cuda", "npu"), default="cuda")
+    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--resume-after", type=int)
+    parser.add_argument("--output-dir")
+    args = parser.parse_args()
+    if args.device == "npu":
+        from ascend_hsdp_correctness import main as native_main
+
+        native_main(
+            steps=args.steps,
+            resume_after=args.resume_after,
+            output_dir=args.output_dir,
+            model_cls=TinyModel,
+        )
+    else:
+        if args.steps != 10 or args.resume_after is not None or args.output_dir is not None:
+            parser.error("--steps, --resume-after, and --output-dir apply to the NPU gate")
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    dispatch_backend()
