@@ -873,6 +873,9 @@ def set_optimizer_state_dict(
                     opt_state[key] = _padded_local_shard(
                         full_on_device, shard_rank, shard_world, local_ref
                     ).contiguous()
+                elif isinstance(val, torch.Tensor):
+                    # Unsharded AdamW states must follow the live parameter.
+                    opt_state[key] = val.to(device=p.device, dtype=p.dtype)
                 else:
                     opt_state[key] = val
             optimizer.state[p] = opt_state
