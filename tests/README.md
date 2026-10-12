@@ -93,14 +93,15 @@ distributed behavior:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
-    tests/distributed/test_hsdp_correctness.py --device npu --steps 4 \
-    --resume-after 2 --output-dir /path/to/new-hsdp-proof
+    tests/distributed/test_hsdp_correctness.py --device npu \
+    --output-dir /path/to/new-hsdp-proof
 ```
 
 It uses the upstream model with identical initialization and actual inputs
 across a 1D shard-only mesh and a 2x2 HSDP mesh, checks every rank's full state
 without tolerance, and verifies continuation from one canonical rank-0 disk
 checkpoint. This is separate from the varied-input regression below.
+The default uses ten updates per topology and two replay updates.
 
 The tiny HCCL regression covers a one-dimensional four-rank mesh and a 2x2
 hybrid mesh. Each topology tests GAS4 with synchronized/default gradients and

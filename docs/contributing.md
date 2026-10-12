@@ -60,8 +60,8 @@ visible devices. The same mandatory entry provides a native NPU/HCCL gate:
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
-    tests/distributed/test_hsdp_correctness.py --device npu --steps 4 \
-    --resume-after 2 --output-dir /path/to/new-hsdp-proof
+    tests/distributed/test_hsdp_correctness.py --device npu \
+    --output-dir /path/to/new-hsdp-proof
 ```
 
 This compares the upstream model and optimizer configuration across a 1D
@@ -70,8 +70,9 @@ Every rank checks the exact loss, full model state, and optimizer state after
 each update. HSDP saves one canonical rank-0 checkpoint and checks two further
 updates after rebuilding and restoring that checkpoint. No tolerance or
 rank-local state override is used. Four steps per topology plus two replay
-steps require ten distributed optimizer calls; `--steps 10` extends the gate
-to the original trajectory length. The CUDA command above remains unchanged.
+steps provide a ten-call smoke check with `--steps 4 --resume-after 2`.
+The default gate uses ten steps per topology and two replay steps, for 22
+distributed optimizer calls. The CUDA command above remains unchanged.
 
 ### Single-test smoke check pattern
 
