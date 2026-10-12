@@ -367,5 +367,5 @@
     "dmuon/kernels/cache_utils.py": "84dce5f2b62b7ecd0f2de69ca5dc54c13053b5de15d40579ad341699d2939da1",
     "dmuon/optim/ns_graph.py": "90dc211be37136019b336d7a82fecd8f06dbadda03829de7f805193cbca8db86"
   },
-  "base_revision": "a6cc0dd63fafa58449821473f281d8f5edb678ca"
+  "base_revision": "ce5aa24fd513e3ceffada2dbf8d1b1d359259a3e"
 }
