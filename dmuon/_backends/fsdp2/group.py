@@ -274,6 +274,26 @@ class ShardedMuonPublishState(NamedTuple):
     event: torch.cuda.Event
 
 
+def _get_grad_for_reduce(
+    p: DedicatedParam, *, merge_accumulated: bool = False
+) -> Optional[torch.Tensor]:
+    """Merge local grads in the reduction dtype without changing Parameter.grad."""
+    raw_grad = p._unsharded_param.grad
+    if raw_grad is None:
+        if not merge_accumulated or p._accumulated_grad is None:
+            return None
+        grad = p._accumulated_grad.clone()
+    else:
+        grad = p.local_grad_for_reduce(raw_grad.data)
+        if p._grad_dtype is not None and grad.dtype != p._grad_dtype:
+            grad = grad.to(p._grad_dtype)
+        if merge_accumulated and p._accumulated_grad is not None:
+            grad.add_(p._accumulated_grad)
+    if merge_accumulated:
+        p._accumulated_grad = None
+    return grad
+
+
 class DedicatedParamGroup:
     """Manages all dedicated parameters within one layer.
 
@@ -1030,8 +1050,7 @@ class DedicatedParamGroup:
             for p in self.params:
                 if not p._is_unsharded or p._unsharded_param.grad is None:
                     continue
-                grad = p._unsharded_param.grad.data
-                grad = p.local_grad_for_reduce(grad)
+                grad = _get_grad_for_reduce(p)
                 if p._accumulated_grad is not None:
                     p._accumulated_grad.add_(grad)
                 else:
@@ -1048,17 +1067,6 @@ class DedicatedParamGroup:
             or self._replicate_reduce_state is not None
         ):
             self.wait_for_reduce()
-
-        # Merge any accumulated gradients from prior no_sync steps
-        for p in self.params:
-            if p._accumulated_grad is not None and p._is_unsharded:
-                if p._unsharded_param.grad is not None:
-                    grad = p._unsharded_param.grad.data
-                    grad = p.local_grad_for_reduce(grad)
-                    grad.add_(p._accumulated_grad)
-                else:
-                    p._unsharded_param.grad = p._accumulated_grad.clone()
-                p._accumulated_grad = None
 
         reduce_stream = self.comm_ctx.reduce_stream
         replicate_stream = self.comm_ctx.replicate_reduce_stream
@@ -1095,16 +1103,16 @@ class DedicatedParamGroup:
                     for p in self.params
                     if not _sharded_adamw_enabled(p)
                     and p._is_unsharded
-                    and p._unsharded_param.grad is not None
+                    and (p._unsharded_param.grad is not None or p._accumulated_grad is not None)
                 ]
                 if normal_work:
                     with dist._coalescing_manager(group=dp_group, device=self.device):
                         for p in normal_work:
-                            grad = p._unsharded_param.grad.data
-                            grad = p.local_grad_for_reduce(grad)
+                            if p._accumulated_grad is not None:
+                                p._accumulated_grad.record_stream(reduce_stream)
+                            grad = _get_grad_for_reduce(p, merge_accumulated=True)
                             grad = grad.contiguous()
-                            if p._grad_dtype is not None and grad.dtype != p._grad_dtype:
-                                grad = grad.to(p._grad_dtype)
+                            grad.record_stream(reduce_stream)
                             dist.reduce(
                                 grad,
                                 dst=self._global_owner_ranks[p.owner_rank],
@@ -1123,34 +1131,37 @@ class DedicatedParamGroup:
                     for p in self.params
                     if _sharded_adamw_enabled(p)
                     and p._is_unsharded
-                    and p._unsharded_param.grad is not None
+                    and (p._unsharded_param.grad is not None or p._accumulated_grad is not None)
                 ]
                 if sharded_work:
                     with dist._coalescing_manager(group=dp_group, device=self.device):
                         for p in sharded_work:
                             assert p._sharded_adamw_reduce_input is not None
                             assert p._sharded_adamw_comm_shard is not None
-                            grad = p._unsharded_param.grad.data
-                            grad = p.local_grad_for_reduce(grad)
+                            if p._accumulated_grad is not None:
+                                p._accumulated_grad.record_stream(reduce_stream)
+                            grad = _get_grad_for_reduce(p, merge_accumulated=True)
+                            grad.record_stream(reduce_stream)
                             flat_grad = grad.contiguous().view(-1)
                             reduce_input = p._sharded_adamw_reduce_input
                             reduce_input.zero_()
                             reduce_input[: flat_grad.numel()].copy_(flat_grad)
-                            p._sharded_adamw_grad = torch.empty(
+                            sharded_grad = torch.empty(
                                 p._sharded_adamw_chunk_numel,
                                 dtype=reduce_input.dtype,
                                 device=reduce_input.device,
                             )
                             dist.reduce_scatter_tensor(
-                                p._sharded_adamw_grad,
+                                sharded_grad,
                                 reduce_input,
                                 op=dist.ReduceOp.AVG,
                                 group=dp_group,
                             )
                             p._unsharded_param.grad = None
+                            self._pending_reduce.append((sharded_grad, [p]))
                             if has_replicate:
                                 sharded_stage2_pending.append(
-                                    (p._sharded_adamw_grad, p)
+                                    (sharded_grad, p)
                                 )
                             elif replicate_gated:
                                 # A shard-only partial must not reach the
@@ -1283,7 +1294,10 @@ class DedicatedParamGroup:
         finishes because the replicate reduce may still be reading them.  The
         final global owner (or the local AdamW all-reduce owner) also needs the
         tensor for ``wait_for_reduce()`` to materialize ``_reduced_grad``.
+        Sharded AdamW retains a meaningful local shard on every rank.
         """
+        if _sharded_adamw_enabled(p):
+            return True
         local_adamw_owner = (
             _adamw_replicate_allreduce_enabled(p) and p._owned_data is not None
         )
@@ -1348,8 +1362,8 @@ class DedicatedParamGroup:
         the same event in Phase B, but the dual-wait keeps the control flow
         ready for the Phase C async-broadcast extension).
 
-        After the wait, only the **global owner** has a meaningful grad —
-        ``is_owner`` already encodes both shard and replicate dimensions.
+        After the wait, owner-managed grads are meaningful only on the global
+        owner; sharded AdamW grads are accumulated locally on every rank.
         """
         if self._post_reduce_event is None and self._replicate_reduce_state is None:
             return None
@@ -1367,6 +1381,15 @@ class DedicatedParamGroup:
                 if grad_buf is None:
                     continue
                 p = plist[0]
+                if _sharded_adamw_enabled(p):
+                    # Only fully reduced shards enter the accumulator. Reusing
+                    # it as a collective output would overwrite prior microbatches.
+                    grad_buf.record_stream(target_stream)
+                    if p._sharded_adamw_grad is None:
+                        p._sharded_adamw_grad = grad_buf
+                    else:
+                        p._sharded_adamw_grad.add_(grad_buf)
+                    continue
                 local_adamw_owner = (
                     _adamw_replicate_allreduce_enabled(p) and p._owned_data is not None
                 )
