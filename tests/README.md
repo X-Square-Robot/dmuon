@@ -69,6 +69,23 @@ python tests/unit/test_syrk.py diag_add
 torchrun --nproc_per_node=4 tests/distributed/test_reduce_regression.py single
 ```
 
+### Native Ascend validation ownership
+
+`tests/native/` is a manual hardware suite and is not run by CUDA CI. The PR
+author is responsible for collecting its results; an Ascend contributor or
+maintainer with a matching PyTorch, `torch_npu`, and CANN environment runs it.
+Run the relevant single-device and four-device checks before merging changes
+to the NPU backend or shared device, reduction, accumulation, clipping, or
+checkpoint behavior. Authors without NPU access should request an Ascend run
+and identify the checks that remain unvalidated in the PR.
+
+Record the tested Git SHA, hardware and rank count, PyTorch/`torch_npu`/CANN
+versions, dtype settings, exact commands, exit codes, skips, and logs. Results
+apply to that revision and the exercised paths. A single-NPU result does not
+validate multi-rank HCCL behavior; rank-local restart and canonical rank-0
+checkpoint restoration are separate checks. These correctness tests do not
+establish training convergence or performance.
+
 ### Ascend tests (single NPU)
 
 Use a matched PyTorch, `torch_npu`, and CANN environment. The native suite uses
