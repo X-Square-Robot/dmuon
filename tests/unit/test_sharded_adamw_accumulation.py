@@ -25,6 +25,7 @@ class Stream:
     def __init__(self, name):
         self.name = name
         self.callbacks = []
+        self.last_event = None
 
     def wait_stream(self, stream):
         self.wait_event(stream.record_event())
@@ -35,6 +36,7 @@ class Stream:
     def record_event(self):
         event = Event(self.callbacks)
         self.callbacks = []
+        self.last_event = event
         return event
 
 
@@ -50,6 +52,10 @@ class Runtime:
 
     @contextmanager
     def stream(self, stream):
+        # Host tensor ops in this fixture execute immediately. Finish earlier
+        # work on the same mock stream before a second stream block stashes it.
+        if stream.last_event is not None:
+            stream.last_event.finish()
         previous, self.active = self.active, stream
         try:
             yield
@@ -86,6 +92,7 @@ def make_group(
         _owned_data=None,
         owner_rank=(0, 0),
         owner_shard=0,
+        _owner_replicate_global_rank=0,
         is_owner=shard_rank == 0,
         uses_sharded_adamw=lambda: sharded,
         _dmuon_route="sharded_adamw" if sharded else "muon",
@@ -142,8 +149,12 @@ def make_group(
         runtime.active.callbacks.append(finish)
 
     def reduce(grad, *, dst, op, group):
-        assert group is dp_group and dst == 0 and op == torch.distributed.ReduceOp.AVG
-        runtime.active.callbacks.append(lambda: trace.append(("stage1", grad.data_ptr())))
+        assert dst == 0 and op == torch.distributed.ReduceOp.AVG
+        if group is dp_group:
+            runtime.active.callbacks.append(lambda: trace.append(("stage1", grad.data_ptr())))
+        else:
+            assert group is group_for_replicate
+            all_reduce(grad, op=op, group=group)
 
     def record_stream(tensor, stream):
         trace.append(("record", tensor.data_ptr(), stream.name))
@@ -153,6 +164,7 @@ def make_group(
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     monkeypatch.setattr(torch.distributed, "reduce", reduce)
     monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
+    group_for_replicate = group.comm_ctx.replicate_group
     return group, param, runtime, trace, outputs, local_calls
 
 
@@ -226,7 +238,7 @@ def test_missing_grad_and_zero_grad_do_not_reuse_previous_microbatches(monkeypat
     backward(group, param, [4, 3, 2, 1])
     group.wait_for_reduce()
     torch.testing.assert_close(result(param), torch.full((4,), 5.0), rtol=0, atol=0)
-    optimizer = SimpleNamespace(_fsdp_params=[], _all_dedicated_params=[param])
+    optimizer = optimizer_fixture(group, param)
     Muon.zero_grad(optimizer)
     assert result(param) is None and param._accumulated_grad is None
     backward(group, param, [7, 8, 9, 10])
@@ -295,3 +307,87 @@ def test_fp32_stash_without_final_raw_grad_does_not_assign_parameter_grad(
     assert param._unsharded_param.grad is None
     assert result(param, sharded).dtype == torch.float32
     torch.testing.assert_close(result(param, sharded), torch.full((4,), 2049.0), rtol=0, atol=0)
+
+
+def optimizer_fixture(group, param):
+    return SimpleNamespace(
+        _fsdp_params=[],
+        _all_dedicated_params=[param],
+        _comm_ctx=SimpleNamespace(all_states=[SimpleNamespace(group=group)]),
+    )
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("gates", [(False, True), (False, False, False, True), (True, False, True)])
+def test_replicate_gated_partials_flush_once_and_preserve_completed_grads(
+    monkeypatch, sharded, gates
+):
+    group, param, _, trace, _, _ = make_group(monkeypatch, replicate=True, sharded=sharded)
+    expected = torch.zeros(4)
+    for index, enabled in enumerate(gates):
+        micro = torch.full((4,), float(index + 1))
+        expected.add_(micro * 0.5)
+        group.replicate_grads_enabled = enabled
+        backward(group, param, micro.tolist())
+        group.wait_for_stage1_reduce()
+        if not enabled:
+            assert group._pending_reduce == []
+            assert id(param) in group._partial_reduce_by_param
+        group.wait_for_reduce()
+        before_repeat = result(param, sharded)
+        before_repeat = before_repeat.clone() if before_repeat is not None else None
+        assert group.wait_for_reduce() is None
+        if before_repeat is not None:
+            torch.testing.assert_close(result(param, sharded), before_repeat, rtol=0, atol=0)
+    assert not group._partial_reduce_by_param
+    torch.testing.assert_close(result(param, sharded), expected, rtol=0, atol=0)
+    # Stashed buffers move to the replicate stream before being released.
+    assert any(item[0] == "record" and item[-1] == "replicate" for item in trace)
+
+
+@pytest.mark.parametrize("numel", [1, 5])
+def test_replicate_gate_stashes_nonowner_shards_including_padding(monkeypatch, numel):
+    group, param, _, _, _, _ = make_group(
+        monkeypatch, replicate=True, shard_rank=1, shard_size=2, numel=numel
+    )
+    for enabled in (False, False, True):
+        group.replicate_grads_enabled = enabled
+        backward(group, param, [2.0] * numel)
+        group.wait_for_stage1_reduce()
+        group.wait_for_reduce()
+        if not enabled:
+            assert result(param) is None
+            assert id(param) in group._partial_reduce_by_param
+    assert not group._partial_reduce_by_param
+    expected = torch.zeros(param._sharded_adamw_chunk_numel)
+    start = param._sharded_adamw_chunk_numel
+    expected[: max(0, numel - start)] = 3.0
+    torch.testing.assert_close(result(param), expected, rtol=0, atol=0)
+
+
+def test_owner_managed_nonowner_drops_undefined_stage1_output(monkeypatch):
+    group, param, _, _, _, _ = make_group(
+        monkeypatch, replicate=True, sharded=False, shard_rank=1, shard_size=2
+    )
+    group.replicate_grads_enabled = False
+    backward(group, param, [1.0] * 4)
+    group.wait_for_stage1_reduce()
+    group.wait_for_reduce()
+    assert not group._partial_reduce_by_param
+    assert result(param, False) is None
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_zero_grad_discards_unflushed_replicate_partial(monkeypatch, sharded):
+    group, param, _, _, _, _ = make_group(monkeypatch, replicate=True, sharded=sharded)
+    group.replicate_grads_enabled = False
+    backward(group, param, [12.0] * 4)
+    group.wait_for_reduce()
+    assert id(param) in group._partial_reduce_by_param
+    assert result(param, sharded) is None
+    Muon.zero_grad(optimizer_fixture(group, param))
+    assert not group._partial_reduce_by_param
+    group.replicate_grads_enabled = True
+    backward(group, param, [2.0] * 4)
+    group.wait_for_reduce()
+    torch.testing.assert_close(result(param, sharded), torch.ones(4), rtol=0, atol=0)

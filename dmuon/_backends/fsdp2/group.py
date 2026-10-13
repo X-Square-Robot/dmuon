@@ -387,8 +387,9 @@ class DedicatedParamGroup:
                 Optional[torch.Tensor],
             ]
         ] = []
-        # Partial accumulator across ``no_sync`` micro-batches (per-param, on
-        # the shard-owner rank).  Set during grad-accum when
+        # Partial accumulator across replicate-gated micro-batches: on the
+        # shard-owner rank for owner-managed params and every shard rank for
+        # sharded AdamW. Set during grad-accum when
         # ``replicate_grads_enabled`` is False; flushed into the next Stage-2
         # reduce when the gate flips back.  Mirrors FSDP2's
         # ``_partial_reduce_output`` (``_fsdp_param_group.py:220``).
@@ -989,7 +990,7 @@ class DedicatedParamGroup:
           locally on every rank without any collective.
         * ``reduce_grads_enabled=True, replicate_grads_enabled=False``:
           Stage-1 runs to average across the shard peers and produce a
-          per-shard-owner partial; this partial is stored in
+          partial on each parameter's Stage-1 destination ranks, stored in
           ``_partial_reduce_by_param[id(p)]`` until the gate flips back.
         """
         if not self.reduce_grads_enabled:
@@ -1028,9 +1029,6 @@ class DedicatedParamGroup:
         # reduce-scatter, then use replicate all-reduce for HSDP.
         stage2_pending: list[tuple[torch.Tensor, DedicatedParam]] = []
         sharded_stage2_pending: list[tuple[torch.Tensor, DedicatedParam]] = []
-        # Sharded AdamW Stage-1 outputs held back from the optimizer while the
-        # replicate gate is off; folded into ``_partial_reduce_by_param``.
-        sharded_partial_pending: list[tuple[torch.Tensor, DedicatedParam]] = []
         dp_group = self._dp_group
         my_shard_rank = dp_group.rank()
 
@@ -1104,24 +1102,14 @@ class DedicatedParamGroup:
                             p._unsharded_param.grad = None
                             self._pending_reduce.append((sharded_grad, [p]))
                             if has_replicate:
-                                sharded_stage2_pending.append(
-                                    (sharded_grad, p)
-                                )
-                            elif replicate_gated:
-                                # A shard-only partial must not reach the
-                                # optimizer as a finished gradient.
-                                sharded_partial_pending.append(
-                                    (p._sharded_adamw_grad, p)
-                                )
-                                p._sharded_adamw_grad = None
+                                sharded_stage2_pending.append((sharded_grad, p))
 
         stage1_event = reduce_stream.record_event()
         self._stage1_reduce_event = stage1_event
 
-        # Stage 2 — replicate reduce.  Only shard-owner ranks dispatch; the
-        # non-shard-owner grads are already "garbage" after Stage 1 (undefined
-        # per NCCL spec).  The pipeline's tail event is recorded on whichever
-        # stream ran last.
+        # Stage 2 — owner-managed grads dispatch on shard-owner ranks only;
+        # sharded AdamW dispatches its valid local shard on every shard rank.
+        # The pipeline's tail event is recorded on whichever stream ran last.
         combined_stage2_pending = stage2_pending + sharded_stage2_pending
         if has_replicate and combined_stage2_pending:
             stage2_event = self._launch_stage2_replicate_reduce(
@@ -1148,10 +1136,9 @@ class DedicatedParamGroup:
             partials = [
                 (grad, plist[0])
                 for grad, plist in self._pending_reduce
-                if my_shard_rank == plist[0].owner_shard
+                if _sharded_adamw_enabled(plist[0]) or my_shard_rank == plist[0].owner_shard
             ]
-            partials.extend(sharded_partial_pending)
-            with torch.cuda.stream(reduce_stream):
+            with self._device_module.stream(reduce_stream):
                 for grad, p in partials:
                     flat_grad = grad.view(-1)
                     existing = self._partial_reduce_by_param.get(id(p))
@@ -1198,9 +1185,7 @@ class DedicatedParamGroup:
                     if partial is not None:
                         partial.record_stream(replicate_stream)
                         grad.view(-1).add_(partial)
-                with dist._coalescing_manager(
-                    group=replicate_group, device=self.device
-                ):
+                with dist._coalescing_manager(group=replicate_group, device=self.device):
                     for grad, p in stage2_pending:
                         if _adamw_replicate_allreduce_enabled(p) or _sharded_adamw_enabled(p):
                             dist.all_reduce(
