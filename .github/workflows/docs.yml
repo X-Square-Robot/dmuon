@@ -32,7 +32,10 @@ jobs:
             mkdocs-material==9.7.5 \
             mkdocs-static-i18n==1.3.1 \
             mkdocstrings==1.0.3 \
-            mkdocstrings-python==2.0.3
+            mkdocstrings-python==2.0.3 \
+            "pymdown-extensions<12"
+          # pymdown-extensions 12 made ``md`` a required argument of
+          # ``Highlight.__init__``, which mkdocstrings 1.0.3 does not pass.
           # mkdocstrings uses griffe to parse source as AST — no runtime
           # import needed, so we skip installing DMuon's heavy deps (torch).
 

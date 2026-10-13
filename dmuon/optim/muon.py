@@ -1958,3 +1958,8 @@ class Muon(Optimizer):
             if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
                 dp._sharded_adamw_grad = None
             dp._accumulated_grad = None
+        for state in self._comm_ctx.all_states:
+            # Replicate-gated Stage-1 partials never flushed by a Stage-2 reduce.
+            partials = getattr(state.group, "_partial_reduce_by_param", None)
+            if partials:
+                partials.clear()
