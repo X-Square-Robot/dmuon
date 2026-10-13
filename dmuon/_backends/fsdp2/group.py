@@ -1062,6 +1062,7 @@ class DedicatedParamGroup:
         replicate_stream = self.comm_ctx.replicate_reduce_stream
         replicate_group = self.comm_ctx.replicate_group
         has_replicate = replicate_group is not None and self.replicate_grads_enabled
+        replicate_gated = replicate_group is not None and not self.replicate_grads_enabled
 
         # Ensure gradients are computed before reduce_stream reads them
         reduce_stream.wait_stream(torch.cuda.current_stream())
@@ -1073,6 +1074,9 @@ class DedicatedParamGroup:
         # reduce-scatter, then use replicate all-reduce for HSDP.
         stage2_pending: list[tuple[torch.Tensor, DedicatedParam]] = []
         sharded_stage2_pending: list[tuple[torch.Tensor, DedicatedParam]] = []
+        # Sharded AdamW Stage-1 outputs held back from the optimizer while the
+        # replicate gate is off; folded into ``_partial_reduce_by_param``.
+        sharded_partial_pending: list[tuple[torch.Tensor, DedicatedParam]] = []
         dp_group = self._dp_group
         my_shard_rank = dp_group.rank()
 
@@ -1146,6 +1150,13 @@ class DedicatedParamGroup:
                                 sharded_stage2_pending.append(
                                     (p._sharded_adamw_grad, p)
                                 )
+                            elif replicate_gated:
+                                # A shard-only partial must not reach the
+                                # optimizer as a finished gradient.
+                                sharded_partial_pending.append(
+                                    (p._sharded_adamw_grad, p)
+                                )
+                                p._sharded_adamw_grad = None
 
         stage1_event = reduce_stream.record_event()
         self._stage1_reduce_event = stage1_event
@@ -1168,21 +1179,34 @@ class DedicatedParamGroup:
                 event=stage2_event,
             )
             self._post_reduce_event = stage2_event
-        elif has_replicate and not self.replicate_grads_enabled:
-            # Replicate side is gated off: save Stage-1 output as partial
-            # accumulator (shard-owner only; others drop their undefined grad).
-            for grad, plist in self._pending_reduce:
-                p = plist[0]
-                if my_shard_rank != p.owner_shard:
-                    continue
-                existing = self._partial_reduce_by_param.get(id(p))
-                if existing is not None:
-                    existing.add_(grad.view(p._orig_size))
-                else:
-                    self._partial_reduce_by_param[id(p)] = grad.view(
-                        p._orig_size
-                    ).clone()
-            self._post_reduce_event = stage1_event
+        elif replicate_gated:
+            # Replicate side is gated off: the Stage-1 output is only a
+            # shard-averaged partial.  Fold it into the per-param accumulator
+            # (shard-owner only for owner-managed params; every shard rank for
+            # sharded AdamW) and flush it into the next enabled Stage-2 reduce.
+            # The fold runs on ``reduce_stream`` so it is ordered after the
+            # Stage-1 collectives.  ``_pending_reduce`` is dropped so that
+            # ``wait_for_reduce`` does not also unpack the partial into
+            # ``_reduced_grad``.
+            partials = [
+                (grad, plist[0])
+                for grad, plist in self._pending_reduce
+                if my_shard_rank == plist[0].owner_shard
+            ]
+            partials.extend(sharded_partial_pending)
+            with torch.cuda.stream(reduce_stream):
+                for grad, p in partials:
+                    flat_grad = grad.view(-1)
+                    existing = self._partial_reduce_by_param.get(id(p))
+                    if existing is not None:
+                        existing.add_(flat_grad)
+                    else:
+                        self._partial_reduce_by_param[id(p)] = flat_grad.clone()
+            # Stage-1 inputs may alias grads allocated on the compute stream.
+            for grad, _plist in self._pending_reduce:
+                grad.record_stream(reduce_stream)
+            self._pending_reduce = []
+            self._post_reduce_event = reduce_stream.record_event()
         else:
             self._post_reduce_event = stage1_event
 
@@ -1215,7 +1239,8 @@ class DedicatedParamGroup:
                 for grad, p in stage2_pending:
                     partial = self._partial_reduce_by_param.pop(id(p), None)
                     if partial is not None:
-                        grad.add_(partial)
+                        partial.record_stream(replicate_stream)
+                        grad.view(-1).add_(partial)
                 with dist._coalescing_manager(
                     group=replicate_group, device=self.device
                 ):
