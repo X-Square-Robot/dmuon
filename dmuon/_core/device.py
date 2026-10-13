@@ -51,12 +51,16 @@ def current_device(device_type: str) -> torch.device:
 
 
 def cuda_is_available() -> bool:
-    """Check that a genuine CUDA build and CUDA device are available.
+    """Check that an NVIDIA CUDA build and CUDA device are available.
+
+    ROCm builds also expose ``torch.cuda`` but are intentionally excluded:
+    this helper gates optional NVIDIA CUDA kernels, not general GPU support.
+    CUDA-to-NPU compatibility shims are excluded for the same reason.
 
     Returns
     -------
     bool
-        Whether optional CUDA kernels can use the actual CUDA runtime.
+        Whether optional NVIDIA kernels can use the actual CUDA runtime.
     """
     # A CUDA compatibility shim can report NPU availability through CUDA.
     # Optional CUDA kernels require an actual CUDA-enabled PyTorch build.

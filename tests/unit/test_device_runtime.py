@@ -39,6 +39,20 @@ def test_cuda_kernel_detection_rejects_a_compatibility_shim(monkeypatch):
     assert not cuda_is_available()
 
 
+def test_cuda_kernel_detection_excludes_rocm(monkeypatch):
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(torch.version, "hip", "6.2")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert not cuda_is_available()
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_cuda_kernel_detection_checks_nvidia_runtime(monkeypatch, available):
+    monkeypatch.setattr(torch.version, "cuda", "12.4")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: available)
+    assert cuda_is_available() is available
+
+
 def test_default_device_keeps_cuda_precedence(monkeypatch):
     monkeypatch.setattr(torch.version, "cuda", "12.4")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
