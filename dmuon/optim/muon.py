@@ -1853,7 +1853,7 @@ class Muon(Optimizer):
                 state["exp_avg"] = torch.zeros_like(param)
                 state["exp_avg_sq"] = torch.zeros_like(param)
             state["step"] += 1
-            if param.device.type == "npu" and param.numel() == 0:
+            if param.numel() == 0:
                 # Empty FSDP shards still need state and step bookkeeping.
                 continue
             key = (state["step"], param.dtype, param.device, grad.dtype)
