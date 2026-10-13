@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -269,6 +270,58 @@ class _FakeOptimizer:
 
     def _ensure_grads_ready(self, *, coalesce_wait: bool = False) -> None:
         self._ensure_calls += 1
+
+
+@pytest.mark.parametrize("device", ["cpu", "privateuseone:0"])
+def test_optimizer_fast_clip_early_return_on_non_cuda_device(monkeypatch, device):
+    grad = torch.tensor([3.0, 4.0])
+    original = grad.clone()
+    optimizer = _FakeOptimizer(grad)
+    optimizer._comm_ctx = SimpleNamespace(device=device)
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("Non-CUDA early return must not load kernels or issue collectives")
+
+    monkeypatch.setattr(fast_clip, "_load_fast_clip_extension", unexpected_call)
+    monkeypatch.setattr(fast_clip.dist, "all_reduce", unexpected_call)
+    assert (
+        try_clip_optimizer_grad_norm_buckets_(
+            optimizer, regular_grads=[grad], adamw_grads=[], max_norm=1.0
+        )
+        is None
+    )
+    assert optimizer._ensure_calls == 0
+    torch.testing.assert_close(grad, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("reason", ["extension_unavailable", "missing_ensure"])
+def test_optimizer_fast_clip_early_return_without_required_capability(monkeypatch, reason):
+    grad = torch.tensor([3.0, 4.0])
+    original = grad.clone()
+    calls = []
+    optimizer = SimpleNamespace(_comm_ctx=SimpleNamespace(device="cuda:0"))
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError(
+            "Capability early return must not prepare gradients or issue collectives"
+        )
+
+    def load_extension():
+        calls.append("load")
+        return None if reason == "extension_unavailable" else object()
+
+    if reason == "extension_unavailable":
+        optimizer._ensure_grads_ready = unexpected_call
+    monkeypatch.setattr(fast_clip, "_load_fast_clip_extension", load_extension)
+    monkeypatch.setattr(fast_clip.dist, "all_reduce", unexpected_call)
+    assert (
+        try_clip_optimizer_grad_norm_buckets_(
+            optimizer, regular_grads=[grad], adamw_grads=[], max_norm=1.0
+        )
+        is None
+    )
+    assert calls == ["load"]
+    torch.testing.assert_close(grad, original, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

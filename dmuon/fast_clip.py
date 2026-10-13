@@ -438,12 +438,14 @@ def try_clip_optimizer_grad_norm_buckets_(
 ) -> SegmentedGradClipResult | None:
     """Fast path for Wall-X style regular/Muon/dedicated-AdamW clipping.
 
-    Returns ``None`` only when the fast-clip CUDA extension is entirely
-    unavailable, letting the caller run its own path.  Extension availability
-    is a property of the install and is therefore uniform across ranks, so this
-    ``None`` decision is rank-consistent and cannot desync collectives.  Once a
-    result is produced, clipping goes through the distributed-safe
-    :func:`clip_grad_norm_buckets_`.
+    Returns ``None`` when the optimizer's communication device is non-CUDA,
+    the CUDA extension is unavailable, or the optimizer does not expose
+    ``_ensure_grads_ready``. The caller can then run its own clipping path.
+    These early returns do not prepare gradients, scale tensors, or issue
+    collectives. Distributed callers must use the same device type, extension
+    availability, and optimizer capabilities on every rank so the fallback
+    decision is consistent. Once a result is produced, clipping goes through
+    the distributed-safe :func:`clip_grad_norm_buckets_`.
     """
 
     device = getattr(getattr(optimizer, "_comm_ctx", None), "device", None)
