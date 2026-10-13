@@ -42,6 +42,18 @@ On the next backward **outside** `no_sync()`:
 
 After `optimizer.step()`, calling `optimizer.zero_grad()` clears both `_reduced_grad` and `_accumulated_grad`.
 
+!!! note "FP32 accumulation memory"
+    With an explicit `grad_dtype=torch.float32` parameter policy, `no_sync()`
+    stores dedicated gradients in an FP32 accumulator. For BF16 parameters,
+    this buffer uses 4 bytes per element instead of 2 bytes for BF16
+    accumulation, so its payload is twice as large. The accumulator is
+    unsharded across the data-parallel mesh on each rank; with tensor
+    parallelism, it covers only that rank's local TP slice. This 2x comparison
+    applies to the accumulator alone. Count dtype-cast and merge temporaries,
+    communication buffers, model gradients, and optimizer state separately
+    when estimating peak memory. Without an explicit `grad_dtype`, the
+    accumulator retains the raw gradient dtype.
+
 ## Example: Full Training Loop with Accumulation
 
 ```python
