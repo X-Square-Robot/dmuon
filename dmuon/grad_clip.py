@@ -45,13 +45,13 @@ class MuonGradClipStats:
     ``total_norm`` is the norm before clipping.  ``max_norm=None`` means the
     call was stats-only and did not scale any gradient.
 
-    DEVICE-TENSOR CONTRACT: ``total_norm`` / ``clip_coef`` / ``clipped`` /
-    ``found_inf`` are 0-dim CUDA tensors, never host scalars. The clip call
-    itself is sync-free; consumers that need python numbers (logging)
-    materialize them in one batched D2H on their own schedule. There is no
-    eager mode: the only reason to read these on the host at clip time would
-    be host-side control flow (inf-skip / dynamic thresholds), which DMuon
-    does not do.
+    ``total_norm`` and ``found_inf`` are 0-dim tensors on the gradients'
+    device; ``found_inf`` has dtype ``torch.bool``. When clipping is enabled,
+    ``clip_coef`` and ``clipped`` are also 0-dim device tensors. In stats-only
+    mode they remain the host constants ``1.0`` and ``False``. The default
+    path performs no host readback; consumers materialize values on their
+    own schedule. Explicit ``error_if_nonfinite=True`` may synchronize to
+    raise an exception.
     """
 
     total_norm: torch.Tensor

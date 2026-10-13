@@ -19,6 +19,55 @@ def _bucket_stats(result):
     return {stats.name: stats for stats in result.bucket_stats}
 
 
+def _assert_found_inf_contract(stats, device, expected):
+    assert isinstance(stats.found_inf, torch.Tensor)
+    assert stats.found_inf.ndim == 0
+    assert stats.found_inf.dtype == torch.bool
+    assert stats.found_inf.device == device
+    assert stats.found_inf.item() is expected
+
+
+@pytest.mark.parametrize("path", ["cpu", "cuda_extension", "cuda_fallback", "npu"])
+@pytest.mark.parametrize("values", [[3.0, 4.0], [float("inf")], [float("nan")], []])
+@pytest.mark.parametrize("max_norm", [None, 2.5])
+def test_segmented_clip_device_contract(monkeypatch, path, values, max_norm):
+    if path.startswith("cuda"):
+        if torch.version.cuda is None or not torch.cuda.is_available():
+            pytest.skip("native CUDA is required")
+        device = torch.device("cuda", torch.cuda.current_device())
+        if path == "cuda_extension":
+            if fast_clip._load_fast_clip_extension() is None:
+                pytest.skip("DMuon fast clip CUDA extension is unavailable")
+        else:
+            monkeypatch.setattr(fast_clip, "_load_fast_clip_extension", lambda: None)
+    elif path == "npu":
+        pytest.importorskip("torch_npu")
+        if not torch.npu.is_available():
+            pytest.skip("native NPU is required")
+        device = torch.device("npu", torch.npu.current_device())
+    else:
+        device = torch.device("cpu")
+
+    grad = torch.tensor(values, device=device)
+    expected_inf = not torch.isfinite(grad).all().item()
+    result = clip_grad_norm_buckets_(
+        (
+            GradClipBucket("gradient", [grad], reduce=False),
+            GradClipBucket("empty", [], reduce=False),
+        ),
+        max_norm,
+    )
+    assert result.fastpath is (path == "cuda_extension")
+    for stats in result.bucket_stats:
+        for field in ("total_norm", "clip_coef", "clipped", "found_inf"):
+            tensor = getattr(stats, field)
+            assert isinstance(tensor, torch.Tensor)
+            assert tensor.ndim == 0 and tensor.device == device
+        assert stats.clipped.dtype == torch.bool
+    _assert_found_inf_contract(result.stats_by_name["gradient"], device, expected_inf)
+    _assert_found_inf_contract(result.stats_by_name["empty"], device, False)
+
+
 def test_fast_clip_chunk_size_defaults_and_env_override(monkeypatch) -> None:
     monkeypatch.delenv("DMUON_FAST_CLIP_CHUNK_SIZE", raising=False)
     assert _resolve_chunk_size(None) == _DEFAULT_CHUNK_SIZE
@@ -95,8 +144,8 @@ def test_collective_count_is_invariant_to_local_conditions(monkeypatch) -> None:
     assert len(calls) == 1  # exactly one fused collective
     assert calls[0].shape == (3,)  # one entry per bucket, not per-bucket scalars
     stats = _bucket_stats(result)
-    assert bool(stats["regular"].found_inf) is True  # reported, not acted on via control flow
-    assert bool(stats["muon"].found_inf) is False
+    _assert_found_inf_contract(stats["regular"], regular.device, True)
+    _assert_found_inf_contract(stats["muon"], muon.device, False)
 
 
 def test_noncontiguous_tensor_is_clipped_not_skipped() -> None:
@@ -116,7 +165,7 @@ def test_noncontiguous_tensor_is_clipped_not_skipped() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_fast_clip_matches_python_reference(monkeypatch) -> None:
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     max_norm = 9.0
     source_buckets = (
         (
@@ -165,6 +214,8 @@ def test_cuda_fast_clip_matches_python_reference(monkeypatch) -> None:
     fast_stats = _bucket_stats(fast)
     ref_stats = _bucket_stats(ref)
     for name in fast_stats:
+        _assert_found_inf_contract(fast_stats[name], device, False)
+        _assert_found_inf_contract(ref_stats[name], device, False)
         assert fast_stats[name].total_norm == pytest.approx(
             ref_stats[name].total_norm, rel=2e-3, abs=2e-3
         )

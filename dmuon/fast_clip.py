@@ -53,9 +53,10 @@ class GradClipBucketStats:
     """Pre-clip norm and coefficient for one gradient segment.
 
     DEVICE-TENSOR CONTRACT: ``total_norm`` / ``clip_coef`` / ``clipped`` /
-    ``found_inf`` are 0-dim CUDA tensors; the clip path performs no D2H.
-    Consumers materialize them in their own batched readback (the wall-x
-    trainer does one packed copy per logging step).
+    ``found_inf`` are 0-dim tensors on the gradients' device on both the CUDA
+    extension and torch fallback paths. ``clipped`` and ``found_inf`` have
+    dtype ``torch.bool``. The clip path performs no D2H; consumers materialize
+    values in their own readback when needed.
     """
 
     name: str
@@ -415,7 +416,7 @@ def clip_grad_norm_buckets_(
     if max_norm is not None:
         _segmented_scale(buckets, coefs, device=device, ext=ext, chunk_size=resolved_chunk_size)
 
-    # Stage 5 -- stats (single batched D2H).
+    # Stage 5 -- stats stay on the device; consumers own any host readback.
     stats = _build_stats(buckets, total_norms, coefs, max_norm=max_norm, fastpath=ext is not None)
     combined_total = torch.linalg.vector_norm(total_norms, 2.0)
     return SegmentedGradClipResult(
