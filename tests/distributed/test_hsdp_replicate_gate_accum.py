@@ -9,6 +9,13 @@ The reduced gradients handed to the optimizer must match plain ``no_sync``
 accumulation, which defers both stages.  This covers owner-managed Muon params
 and sharded AdamW params; FSDP2 symmetric params use FSDP2's own gate.
 
+The continuous optimizer/state check uses controlled equal-gradient inputs:
+each native gated gradient first passes the unchanged gradient oracle, then
+receives the reference's frozen gradient before the optimizer step. Model and
+optimizer state must match byte-for-byte over three naturally continuing
+updates. This does not assert equal raw training trajectories for two different
+floating-point accumulation orders through low-precision Newton-Schulz.
+
 Run: ``torchrun --nproc_per_node=4 tests/distributed/test_hsdp_replicate_gate_accum.py``
 For native HCCL, append ``--device npu``. Both require four physical devices.
 All ranks participate in every parameter on the final micro-batch: this test
@@ -31,6 +38,7 @@ from torch.distributed.fsdp import fully_shard
 
 from dmuon import (
     Muon,
+    NewtonSchulz,
     dedicate_params,
     get_model_state_dict,
     get_optimizer_state_dict,
@@ -150,6 +158,11 @@ def capture_grads(model, optimizer):
         assert not state.group._partial_reduce_by_param, (
             "replicate partial was not flushed before the optimizer step"
         )
+    return {name: grad.detach().cpu().clone() for name, grad in live_gradients(model).items()}
+
+
+def live_gradients(model):
+    """Return the actual local tensors about to be consumed, including padding."""
     grads = {}
     for dp, fqn in _compute_dedicated_fqns(model).items():
         if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
@@ -157,19 +170,48 @@ def capture_grads(model, optimizer):
         else:
             grad = dp._reduced_grad
         if grad is not None:
-            grads[fqn] = grad.detach().float().cpu().clone()
+            grads[fqn] = grad
     for name, param in model.named_parameters():
         if param.grad is not None:
             local = getattr(param.grad, "_local_tensor", param.grad)
-            grads[name] = local.detach().float().cpu().clone()
+            assert name not in grads, f"duplicate gradient entry: {name}"
+            grads[name] = local
     return grads
 
 
-def train(model_state, device, hsdp_mesh, batches, *, gates, gated, reset_weights):
+def assign_canonical_gradients(model, canonical):
+    """Copy frozen equal-gradient inputs after validating the entire schema."""
+    actual = live_gradients(model)
+    assert actual.keys() == canonical.keys(), "canonical gradient names differ"
+    for name, grad in actual.items():
+        source = canonical[name]
+        assert isinstance(source, torch.Tensor), f"{name}: canonical gradient is not a tensor"
+        assert source.shape == grad.shape and source.dtype == grad.dtype, (
+            f"{name}: canonical gradient shape/dtype differs"
+        )
+        assert torch.isfinite(source).all(), f"{name}: non-finite canonical gradient"
+    with torch.no_grad():
+        for name, grad in actual.items():
+            grad.copy_(canonical[name])
+
+
+def train(
+    model_state,
+    device,
+    hsdp_mesh,
+    batches,
+    *,
+    gates,
+    gated,
+    reset_weights,
+    canonical_observations=None,
+    gradient_failures=None,
+    gradient_worst=None,
+):
     runtime = get_device_module(device)
     model, optimizer = build(model_state, device, hsdp_mesh)
     observations = []
-    for micros in batches:
+    for step, micros in enumerate(batches):
         for index, (batch, enabled) in enumerate(zip(micros, gates)):
             if gated:
                 set_replicate_gate(model, enabled)
@@ -185,6 +227,19 @@ def train(model_state, device, hsdp_mesh, batches, *, gates, gated, reset_weight
         repeated = capture_grads(model, optimizer)
         for name in gradients:
             torch.testing.assert_close(repeated[name], gradients[name], rtol=0, atol=0)
+        if canonical_observations is not None:
+            assert gradient_failures is not None
+            canonical = canonical_observations[step]["gradients"]
+            compare(
+                gradients,
+                canonical,
+                gradient_failures,
+                path=f"controlled-native-gradient[{step}]",
+                worst=gradient_worst if gradient_worst is not None else [0.0],
+            )
+            # Validate the native result first. The explicit copy isolates the
+            # optimizer/state test from accumulation-order roundoff in NS.
+            assign_canonical_gradients(model, canonical)
         optimizer.step()
         wait_all_post_step_broadcasts(model)
         observation = {"gradients": gradients}
@@ -252,9 +307,75 @@ def compare(actual, expected, failures, *, path, worst):
         failures.append(f"{path}: values differ")
 
 
+def compare_exact(actual, expected, failures, *, path):
+    """Strict state oracle, including dtype, empty shards and signed-zero bits."""
+    if isinstance(expected, torch.Tensor):
+        if (
+            not isinstance(actual, torch.Tensor)
+            or actual.shape != expected.shape
+            or actual.dtype != expected.dtype
+        ):
+            failures.append(f"{path}: tensor schema differs")
+            return
+        if expected.is_floating_point() and (
+            not torch.isfinite(actual).all() or not torch.isfinite(expected).all()
+        ):
+            failures.append(f"{path}: non-finite state")
+            return
+        left = actual.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        right = expected.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        if not torch.equal(left, right):
+            failures.append(f"{path}: tensor bytes differ")
+    elif isinstance(expected, dict):
+        if not isinstance(actual, dict) or actual.keys() != expected.keys():
+            failures.append(f"{path}: mapping keys differ")
+            return
+        for name in expected:
+            compare_exact(actual[name], expected[name], failures, path=f"{path}.{name}")
+    elif isinstance(expected, (list, tuple)):
+        if type(actual) is not type(expected) or len(actual) != len(expected):
+            failures.append(f"{path}: sequence schema differs")
+            return
+        for index, item in enumerate(expected):
+            compare_exact(actual[index], item, failures, path=f"{path}[{index}]")
+    elif type(actual) is not type(expected) or actual != expected:
+        failures.append(f"{path}: values differ")
+
+
+def diagnose_ns_rounding(reference, gated, device):
+    """Report the raw first-step rounding boundary; never an acceptance gate."""
+    ns = NewtonSchulz()
+    for name, ref_cpu in reference[0]["gradients"].items():
+        if "proj" not in name:
+            continue
+        ref = ref_cpu.to(device)
+        got = gated[0]["gradients"][name].to(device)
+
+        def normalized_half(grad):
+            value = grad.float()
+            if value.shape[0] > value.shape[1]:
+                value = value.T
+            return (value / (value.norm() + 1e-7)).half().contiguous()
+
+        ref_half, got_half = normalized_half(ref), normalized_half(got)
+        ref_update, got_update = ns.local(ref, 3), ns.local(got, 3)
+        repeated_update = ns.local(ref, 3)
+        assert torch.equal(ref_update, repeated_update), "same-input NS replay differed"
+        grad_diff = (got - ref).abs().max().item()
+        half_mismatches = int((got_half != ref_half).sum().item())
+        ns_diff = (got_update - ref_update).abs().max().item()
+        print(
+            f"DIAGNOSTIC {name}: raw_grad_max_abs={grad_diff:.9e}, "
+            f"normalized_fp16_changed={half_mismatches}, ns_max_abs={ns_diff:.9e}, "
+            "same_input_ns_replay=exact",
+            flush=True,
+        )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("cuda", "npu"), default="cuda")
+    parser.add_argument("--diagnose-ns-rounding", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -292,6 +413,10 @@ def main():
             [torch.randn(4, 128, generator=gen).to(device) * 0.125 for _ in gates]
             for _ in range(num_steps)
         ]
+        if args.diagnose_ns_rounding and reset_weights:
+            continue  # Advance the generator to the original continuous case.
+        if args.diagnose_ns_rounding:
+            batches = batches[:1]
         reference = train(
             model_state,
             device,
@@ -310,11 +435,32 @@ def main():
             gates=gates,
             gated=True,
             reset_weights=reset_weights,
+            canonical_observations=reference
+            if not reset_weights and not args.diagnose_ns_rounding
+            else None,
+            gradient_failures=failures,
+            gradient_worst=worst,
         )
         dist.barrier()
-        compare(
-            gated, reference, failures, path=f"gates={gates},reset={reset_weights}", worst=worst
-        )
+        if args.diagnose_ns_rounding:
+            diagnose_ns_rounding(reference, gated, device)
+            continue
+        if reset_weights:
+            compare(gated, reference, failures, path=f"gates={gates},reset=True", worst=worst)
+        else:
+            for step, (actual, expected) in enumerate(zip(gated, reference)):
+                for section in ("model", "optimizer"):
+                    compare_exact(
+                        actual[section],
+                        expected[section],
+                        failures,
+                        path=f"controlled-same-gradient[{step}].{section}",
+                    )
+            if rank == 0:
+                print(
+                    "Controlled same-gradient trajectory: three continuing updates; model/state byte-exact oracle",
+                    flush=True,
+                )
     flag = torch.tensor([len(failures)], device=device)
     dist.all_reduce(flag)
     if failures:
@@ -322,9 +468,17 @@ def main():
     worst_t = torch.tensor(worst, device=device)
     dist.all_reduce(worst_t, op=dist.ReduceOp.MAX)
     if rank == 0:
-        print(f"replicate-gate vs no_sync: worst rel grad diff = {worst_t.item():.3e}")
+        if not args.diagnose_ns_rounding:
+            print(f"replicate-gate vs no_sync: worst rel consumed-grad diff = {worst_t.item():.3e}")
         if flag.item() == 0:
-            print("PASSED: replicate-gated accumulation matches no_sync")
+            if args.diagnose_ns_rounding:
+                print(
+                    "DIAGNOSTIC ONLY: raw accumulation/FP16/NS differences reported; no trajectory equivalence claim"
+                )
+            else:
+                print(
+                    "PASSED: native consumed-gradient oracle and controlled same-gradient optimizer trajectory"
+                )
     dist.barrier()
     dist.destroy_process_group()
     if flag.item():
