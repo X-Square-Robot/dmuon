@@ -269,18 +269,27 @@ class ShardedMuonPublishState(NamedTuple):
 
 
 def _get_grad_for_reduce(
-    p: DedicatedParam, *, merge_accumulated: bool = False
+    p: DedicatedParam, *, merge_accumulated: bool = False, copy_borrowed: bool = False
 ) -> Optional[torch.Tensor]:
-    """Merge local grads in the reduction dtype without changing Parameter.grad."""
+    """Merge local grads without changing Parameter.grad.
+
+    A dtype cast owns its new storage. When the caller needs to retain a first
+    no_sync accumulator, copy an uncast local gradient because it may be a
+    borrowed TP view; transfer an already cast tensor without a second copy.
+    """
     raw_grad = p._unsharded_param.grad
     if raw_grad is None:
         if not merge_accumulated or p._accumulated_grad is None:
             return None
-        grad = p._accumulated_grad.clone()
+        # The no_sync accumulator owns its storage. Transfer that ownership to
+        # the reduction instead of allocating another full gradient tensor.
+        grad = p._accumulated_grad
     else:
         grad = p.local_grad_for_reduce(raw_grad.data)
         if p._grad_dtype is not None and grad.dtype != p._grad_dtype:
             grad = grad.to(p._grad_dtype)
+        elif copy_borrowed:
+            grad = grad.clone()
         if merge_accumulated and p._accumulated_grad is not None:
             grad.add_(p._accumulated_grad)
     if merge_accumulated:
@@ -998,11 +1007,11 @@ class DedicatedParamGroup:
             for p in self.params:
                 if not p._is_unsharded or p._unsharded_param.grad is None:
                     continue
-                grad = _get_grad_for_reduce(p)
+                grad = _get_grad_for_reduce(p, copy_borrowed=p._accumulated_grad is None)
                 if p._accumulated_grad is not None:
                     p._accumulated_grad.add_(grad)
                 else:
-                    p._accumulated_grad = grad.clone()
+                    p._accumulated_grad = grad
                 p._unsharded_param.grad = None
             return
 
@@ -1318,6 +1327,7 @@ class DedicatedParamGroup:
                 )
                 if not (p.is_owner or local_adamw_owner):
                     continue
+                grad_buf.record_stream(target_stream)
                 new_grad = grad_buf.view(p._orig_size)
                 if p._reduced_grad is not None:
                     p._reduced_grad.add_(new_grad)

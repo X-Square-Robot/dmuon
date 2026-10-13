@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from dmuon._backends.fsdp2.group import DedicatedParamGroup
+from dmuon._backends.fsdp2.param import _normalize_tp_local_grad
 from dmuon.optim.muon import Muon
 
 
@@ -391,3 +392,81 @@ def test_zero_grad_discards_unflushed_replicate_partial(monkeypatch, sharded):
     backward(group, param, [2.0] * 4)
     group.wait_for_reduce()
     torch.testing.assert_close(result(param, sharded), torch.ones(4), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype,grad_dtype",
+    [
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, None),
+        (torch.bfloat16, None),
+    ],
+)
+def test_no_sync_accumulator_transfers_storage_through_tp_local_view(
+    monkeypatch, dtype, grad_dtype
+):
+    group, param, _, trace, _, _ = make_group(
+        monkeypatch, dtype=dtype, grad_dtype=grad_dtype, sharded=False, numel=16
+    )
+    param._unsharded_param = nn.Parameter(torch.zeros((4, 4), dtype=dtype))
+    param._orig_size = torch.Size((4, 2))
+    param.full_shape = torch.Size((4, 4))
+    param.shard_dim = 1
+    param.tp_group = SimpleNamespace(rank=lambda: 1)
+    param.param_name = "weight"
+    param.local_grad_for_reduce = lambda grad: _normalize_tp_local_grad(param, grad)
+    source = torch.arange(16, dtype=dtype).view(4, 4)
+    expected = source[:, 2:].to(grad_dtype or dtype).clone()
+    param._unsharded_param.grad = source
+    group.reduce_grads_enabled = False
+    group.reduce_grads()
+    stash = param._accumulated_grad
+    stash_ptr = stash.data_ptr()
+    assert stash.dtype == (grad_dtype or dtype) and stash.shape == (4, 2)
+    # The original gradient is caller-owned and may be reused after no_sync.
+    # Its copy is still required; only the private accumulator transfers.
+    source.fill_(-123)
+    torch.testing.assert_close(stash, expected, rtol=0, atol=0)
+    group.reduce_grads_enabled = True
+    group.reduce_grads()  # Final raw grad is None, using the private stash.
+    assert param._accumulated_grad is None
+    assert param._unsharded_param.grad is None
+    assert group._pending_reduce[0][0].data_ptr() == stash_ptr
+    consumer = Stream("consumer")
+    group.wait_for_stage1_reduce()
+    group.wait_for_reduce(stream=consumer)
+    assert param._reduced_grad.data_ptr() != stash_ptr
+    assert ("record", stash_ptr, "consumer") in trace
+    torch.testing.assert_close(param._reduced_grad, expected, rtol=0, atol=0)
+    assert group.wait_for_reduce(stream=consumer) is None
+
+
+@pytest.mark.parametrize(
+    "dtype,grad_dtype",
+    [(torch.bfloat16, torch.float32), (torch.bfloat16, None), (torch.float32, torch.float32)],
+)
+def test_first_no_sync_stash_reuses_cast_but_copies_borrowed_grad(monkeypatch, dtype, grad_dtype):
+    group, param, _, _, _, _ = make_group(monkeypatch, dtype=dtype, grad_dtype=grad_dtype)
+    original_to = torch.Tensor.to
+    casts = []
+
+    def track_to(tensor, *args, **kwargs):
+        converted = original_to(tensor, *args, **kwargs)
+        if converted.data_ptr() != tensor.data_ptr():
+            casts.append(converted)
+        return converted
+
+    monkeypatch.setattr(torch.Tensor, "to", track_to)
+    source = torch.arange(4, dtype=dtype)
+    param._unsharded_param.grad = source
+    group.reduce_grads_enabled = False
+    group.reduce_grads()
+    stash = param._accumulated_grad
+    assert stash.data_ptr() != source.data_ptr()
+    if grad_dtype is not None and dtype != grad_dtype:
+        assert len(casts) == 1 and stash is casts[0]
+    else:
+        assert not casts
+    source.fill_(-123)
+    torch.testing.assert_close(stash, torch.arange(4, dtype=grad_dtype or dtype), rtol=0, atol=0)
