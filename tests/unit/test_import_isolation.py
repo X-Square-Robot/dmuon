@@ -6,13 +6,17 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
 
-def test_import_keeps_torch_device_apis_and_optional_dependencies_isolated():
+
+@pytest.mark.parametrize("hide_cuda", [False, True], ids=["native-runtime", "without-cuda"])
+def test_import_keeps_torch_device_apis_and_optional_dependencies_isolated(hide_cuda):
     script = textwrap.dedent("""
         import importlib.abc
         import sys
         import torch
 
+        genuine_cuda = torch.version.cuda is not None and torch.cuda.is_available()
         protected = (
             torch.cuda, torch.cuda.is_available, torch.cuda.current_device,
             torch.cuda.Stream, torch.cuda.Event, torch.Tensor.cuda,
@@ -40,12 +44,21 @@ def test_import_keeps_torch_device_apis_and_optional_dependencies_isolated():
             torch.distributed.init_process_group,
         )
         assert 'torch_npu.contrib.transfer_to_npu' not in sys.modules
-        assert not attempted_optional_imports, attempted_optional_imports
+        assert not any(name.startswith('torch_npu.contrib.transfer_to_npu')
+                       for name in attempted_optional_imports)
+        if not genuine_cuda:
+            assert not attempted_optional_imports, attempted_optional_imports
         import dmuon.kernels
         assert dmuon.kernels.__all__ == []
         assert not any(name == 'cutlass' or name.startswith('cutlass.') for name in sys.modules)
         assert dmuon.NewtonSchulz(kernel='cublas').kernel.value == 'cublas'
+        if genuine_cuda:
+            # CUDA may probe optional kernels, but missing dependencies must
+            # leave the package importable and route auto selection to cuBLAS.
+            assert dmuon.NewtonSchulz(kernel='auto').kernel.value == 'cublas'
     """)
     root = Path(__file__).resolve().parents[2]
     env = dict(os.environ, PYTHONPATH=str(root), TORCH_DEVICE_BACKEND_AUTOLOAD="0")
+    if hide_cuda:
+        env["CUDA_VISIBLE_DEVICES"] = ""
     subprocess.run([sys.executable, "-c", script], cwd=root, env=env, check=True)
