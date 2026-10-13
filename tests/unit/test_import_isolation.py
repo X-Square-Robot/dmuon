@@ -26,7 +26,10 @@ def test_import_keeps_torch_device_apis_and_optional_dependencies_isolated(hide_
         cuda_optional = ('cutlass', 'quack', 'dmuon.kernels.syrk_quack', 'dmuon.kernels.syrk_sm80')
         # PyTorch's cross-device Dynamo/Triton imports are allowed. Only
         # CUDA-specific dependencies and the global transfer shim are blocked.
-        blocked = cuda_optional + ('torch_npu.contrib.transfer_to_npu',)
+        # Internal adapters are shipped by DMuon. On CUDA they must be
+        # allowed to load and handle their missing external dependencies.
+        blocked = (('cutlass', 'quack') if genuine_cuda else cuda_optional)
+        blocked += ('torch_npu.contrib.transfer_to_npu',)
         attempted_optional_imports = []
 
         class RejectOptionalDependencies(importlib.abc.MetaPathFinder):
