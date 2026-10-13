@@ -82,6 +82,60 @@ pip install -e ".[syrk]"
 
 首次使用时 JIT 编译通常需要 1–3 分钟，编译产物缓存在 `~/.cache/dmuon/`。
 
+## Ascend 950DT（实验性支持）
+
+安装与 CANN 版本匹配的 PyTorch 和 `torch_npu`，然后激活 CANN 并安装核心包：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation
+```
+
+使用 `import torch_npu`、`dist.init_process_group("hccl")` 和
+`init_device_mesh("npu", ...)`。在调用 `dedicate_params` 前，将模型移动到原生
+NPU 设备。DMuon 优化器、参数策略、梯度裁剪与检查点 API 和 CUDA 使用相同接口。
+不要为 DMuon 导入 `torch_npu.contrib.transfer_to_npu`。
+
+Ascend 使用共享的 eager PyTorch Newton–Schulz 路径。CUDA 专属的 SYRK 内核、
+fast-clip 扩展和 CUDA graph replay 仅用于 CUDA。
+
+### 原生 FSDP2 集成
+
+在通过 `torchrun` 启动的脚本中使用以下设置。提供自己的 `MyModel` 和
+dataloader，并在前向计算前将每个 batch 移动到本地 NPU。
+
+```python
+import os
+import torch
+import torch_npu
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
+import dmuon
+
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.npu.set_device(local_rank)
+dist.init_process_group("hccl")
+world_size = dist.get_world_size()
+mesh = init_device_mesh("npu", (world_size,))
+model = MyModel().to(torch.device("npu", local_rank))
+
+dmuon.dedicate_params(model, mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2)
+for layer in model.layers:
+    fully_shard(layer, mesh=mesh)
+fully_shard(model, mesh=mesh)
+optimizer = dmuon.Muon(model, lr=0.02, ns_steps=5, adamw_lr=1e-3)
+
+for batch in dataloader:
+    optimizer.zero_grad()
+    loss = model(batch).loss
+    loss.backward()
+    optimizer.step()
+```
+
+单设备与分布式验证命令见
+[测试说明](https://github.com/X-Square-Robot/dmuon/blob/main/tests/README.md#ascend-tests-single-npu)。
+
 ---
 
 ## 可选：快速梯度裁剪（CUDA）
