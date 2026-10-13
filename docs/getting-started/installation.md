@@ -84,7 +84,7 @@ This pulls in:
 Build time is typically 1–3 minutes on first use (JIT compilation).
 The compiled artifact is cached in `~/.cache/dmuon/`.
 
-## Ascend 950DT
+## Ascend 950DT (experimental)
 
 Install the matching PyTorch and `torch_npu` versions for your CANN release,
 then activate CANN and install the core package:
@@ -103,9 +103,42 @@ Do not import `torch_npu.contrib.transfer_to_npu` for DMuon.
 On Ascend, DMuon uses the shared eager PyTorch Newton–Schulz path.
 CUDA-specific SYRK kernels, fast-clip extensions, and CUDA graph replay remain CUDA features.
 
-The [README example](../../README.md#ascend-950dt) shows the native FSDP2
-integration. See [the test instructions](../../tests/README.md#ascend-tests-single-npu)
-for a single-device regression check.
+### Native FSDP2 integration
+
+Use the following setup in a script launched with `torchrun`. Supply your own
+`MyModel` and dataloader, and move each batch to the local NPU before the forward.
+
+```python
+import os
+import torch
+import torch_npu
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
+import dmuon
+
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.npu.set_device(local_rank)
+dist.init_process_group("hccl")
+world_size = dist.get_world_size()
+mesh = init_device_mesh("npu", (world_size,))
+model = MyModel().to(torch.device("npu", local_rank))
+
+dmuon.dedicate_params(model, mesh, predicate=lambda n, p: "proj" in n and p.ndim == 2)
+for layer in model.layers:
+    fully_shard(layer, mesh=mesh)
+fully_shard(model, mesh=mesh)
+optimizer = dmuon.Muon(model, lr=0.02, ns_steps=5, adamw_lr=1e-3)
+
+for batch in dataloader:
+    optimizer.zero_grad()
+    loss = model(batch).loss
+    loss.backward()
+    optimizer.step()
+```
+
+See the [test instructions](https://github.com/X-Square-Robot/dmuon/blob/main/tests/README.md#ascend-tests-single-npu)
+for single-device and distributed validation commands.
 
 ---
 

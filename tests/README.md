@@ -21,6 +21,15 @@ tests/
 
 ### Unit tests (single GPU)
 
+Run the full unit suite with the optional CUDA dependencies available for your
+GPU. Tests that require unavailable hardware or optional extensions report skips.
+
+```bash
+pytest tests/unit/
+```
+
+Individual scripts also support direct execution:
+
 ```bash
 python tests/unit/test_partition.py
 python tests/unit/test_syrk.py
@@ -28,6 +37,19 @@ python tests/unit/test_newton_schulz.py
 ```
 
 ### Distributed tests (multi GPU)
+
+Run the CUDA correctness checks on four GPUs:
+
+```bash
+torchrun --nproc_per_node=4 tests/distributed/test_hsdp_correctness.py
+torchrun --nproc_per_node=4 tests/distributed/test_hsdp_async_correctness.py
+torchrun --nproc_per_node=4 tests/distributed/test_grad_accum.py
+torchrun --nproc_per_node=4 tests/distributed/test_muon_step.py
+torchrun --nproc_per_node=4 tests/distributed/test_checkpoint.py
+torchrun --nproc_per_node=4 tests/distributed/test_ddp_correctness.py
+```
+
+Additional communication and end-to-end checks:
 
 ```bash
 torchrun --nproc_per_node=4 tests/distributed/test_multiprocessing.py
