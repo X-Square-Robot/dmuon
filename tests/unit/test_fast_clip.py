@@ -217,12 +217,16 @@ def test_cuda_fast_clip_matches_python_reference(monkeypatch) -> None:
     for name in fast_stats:
         _assert_found_inf_contract(fast_stats[name], device, False)
         _assert_found_inf_contract(ref_stats[name], device, False)
-        assert fast_stats[name].total_norm == pytest.approx(
-            ref_stats[name].total_norm, rel=2e-3, abs=2e-3
-        )
-        assert fast_stats[name].clip_coef == pytest.approx(
-            ref_stats[name].clip_coef, rel=2e-3, abs=2e-3
-        )
+        for field in ("total_norm", "clip_coef"):
+            actual = getattr(fast_stats[name], field)
+            expected = getattr(ref_stats[name], field)
+            assert isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor)
+            assert actual.ndim == expected.ndim == 0
+            assert actual.dtype == expected.dtype == torch.float32
+            assert actual.device == expected.device == device
+            # Read back only in the test. Keep pytest's original max-based
+            # absolute/relative tolerance without implicit NumPy conversion.
+            assert actual.item() == pytest.approx(expected.item(), rel=2e-3, abs=2e-3)
     for fast_bucket, ref_bucket in zip(fast_buckets, ref_buckets):
         for fast_grad, ref_grad in zip(fast_bucket.grads, ref_bucket.grads):
             assert torch.allclose(fast_grad.float(), ref_grad.float(), rtol=3e-3, atol=3e-3)
@@ -342,5 +346,8 @@ def test_optimizer_fast_clip_sets_muon_stats_when_available() -> None:
 
     assert opt._ensure_calls == 1
     assert opt._last_muon_grad_clip_stats is not None
-    assert opt._last_muon_grad_clip_stats.total_norm == pytest.approx(10.0)
+    total_norm = opt._last_muon_grad_clip_stats.total_norm
+    assert isinstance(total_norm, torch.Tensor) and total_norm.ndim == 0
+    assert total_norm.dtype == torch.float32 and total_norm.device == muon_grad.device
+    assert total_norm.item() == pytest.approx(10.0)
     assert opt._last_muon_grad_clip_stats.strategy == "segmented_cuda_fastpath"
