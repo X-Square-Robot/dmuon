@@ -171,7 +171,7 @@ def _coalesced_wait_prepared_muon_grads(groups) -> bool:
         return True
 
     ready_event = reduce_stream.record_event()
-    _group_device_module(group).current_stream().wait_event(ready_event)
+    _group_device_module(groups[0]).current_stream().wait_event(ready_event)
     for group in groups:
         _finish_group_muon_grads_after_coalesced_wait(group)
     return True
