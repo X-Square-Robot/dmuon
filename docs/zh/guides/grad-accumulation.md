@@ -42,6 +42,14 @@ for i, batch in enumerate(dataloader):
 
 `optimizer.step()` 后调用 `optimizer.zero_grad()` 会清除 `_reduced_grad` 和 `_accumulated_grad`。
 
+!!! note "FP32 累积缓冲的显存开销"
+    参数策略显式设置 `grad_dtype=torch.float32` 时，`no_sync()` 使用 FP32
+    缓冲累积专属参数的梯度。对 BF16 参数，该缓冲每个元素占 4 字节，而 BF16
+    累积占 2 字节，因此缓冲本身的有效载荷是两倍。每个 rank 上的累积缓冲不做
+    数据并行分片；启用张量并行时，它仅覆盖该 rank 的本地 TP 分片。这里的两倍
+    仅指累积缓冲，估算峰值显存时还需另计类型转换和合并的临时张量、通信缓冲、
+    模型梯度及优化器状态。未显式指定 `grad_dtype` 时，缓冲保留原始梯度的类型。
+
 ## 完整训练循环示例
 
 ```python

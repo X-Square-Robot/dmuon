@@ -21,6 +21,15 @@ tests/
 
 ### Unit tests (single GPU)
 
+Run the full unit suite with the optional CUDA dependencies available for your
+GPU. Tests that require unavailable hardware or optional extensions report skips.
+
+```bash
+pytest tests/unit/
+```
+
+Individual scripts also support direct execution:
+
 ```bash
 python tests/unit/test_partition.py
 python tests/unit/test_syrk.py
@@ -28,6 +37,19 @@ python tests/unit/test_newton_schulz.py
 ```
 
 ### Distributed tests (multi GPU)
+
+Run the CUDA correctness checks on four GPUs:
+
+```bash
+torchrun --nproc_per_node=4 tests/distributed/test_hsdp_correctness.py
+torchrun --nproc_per_node=4 tests/distributed/test_hsdp_async_correctness.py
+torchrun --nproc_per_node=4 tests/distributed/test_grad_accum.py
+torchrun --nproc_per_node=4 tests/distributed/test_muon_step.py
+torchrun --nproc_per_node=4 tests/distributed/test_checkpoint.py
+torchrun --nproc_per_node=4 tests/distributed/test_ddp_correctness.py
+```
+
+Additional communication and end-to-end checks:
 
 ```bash
 torchrun --nproc_per_node=4 tests/distributed/test_multiprocessing.py
@@ -46,3 +68,92 @@ Most test files support running individual tests:
 python tests/unit/test_syrk.py diag_add
 torchrun --nproc_per_node=4 tests/distributed/test_reduce_regression.py single
 ```
+
+### Native Ascend validation ownership
+
+`tests/native/` is a manual hardware suite and is not run by CUDA CI. The PR
+author is responsible for collecting its results; an Ascend contributor or
+maintainer with a matching PyTorch, `torch_npu`, and CANN environment runs it.
+Run the relevant single-device and four-device checks before merging changes
+to the NPU backend or shared device, reduction, accumulation, clipping, or
+checkpoint behavior. Authors without NPU access should request an Ascend run
+and identify the checks that remain unvalidated in the PR.
+
+Record the tested Git SHA, hardware and rank count, PyTorch/`torch_npu`/CANN
+versions, dtype settings, exact commands, exit codes, skips, and logs. Results
+apply to that revision and the exercised paths. A single-NPU result does not
+validate multi-rank HCCL behavior; rank-local restart and canonical rank-0
+checkpoint restoration are separate checks. These correctness tests do not
+establish training convergence or performance.
+
+### Ascend tests (single NPU)
+
+Use a matched PyTorch, `torch_npu`, and CANN environment. The native suite uses
+one visible NPU and a world-size-one HCCL group; it does not load the transfer
+shim. It checks matrix dtypes/shapes, clipping result types, independent AdamW
+step counters, gradient accumulation, asynchronous publication, stream lifetime,
+and checkpoint restoration through the public package APIs.
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation
+pytest tests/unit/test_device_runtime.py tests/unit/test_import_isolation.py \
+    tests/unit/test_nested_input_cast.py tests/unit/test_grad_clip_result_contract.py
+ASCEND_RT_VISIBLE_DEVICES=0 python tests/native/ascend_snapshot.py \
+    --pathway fsdp2 --output /path/to/new-fsdp2.pt
+ASCEND_RT_VISIBLE_DEVICES=0 python tests/native/ascend_snapshot.py \
+    --pathway ddp --output /path/to/new-ddp.pt
+```
+
+For a backend migration, run the same snapshot utility in a separate process
+against a reference with the same optimizer dtype policy using `--package-root`.
+If that package requires
+a legacy compatibility bootstrap, pass its existing file with
+`--legacy-bootstrap`; keep it out of the new package process. Run the two
+processes sequentially on the same NPU, and compare corresponding snapshots:
+
+```bash
+DMUON_NPU_REFERENCE=/path/to/old-fsdp2.pt \
+DMUON_NPU_SNAPSHOT=/path/to/new-fsdp2.pt \
+pytest tests/native/test_ascend_snapshot.py
+```
+
+The comparison requires exact tensor values, dtypes, shapes, result fields and
+optimizer state. Use the corresponding DDP snapshots for the DDP check.
+
+Exact comparisons require matching Muon momentum policies. Historical snapshots
+with BF16 momentum are not an exact reference for a package using FP32 momentum.
+
+### Ascend distributed restart tests (four NPUs)
+
+The [contribution guide](../docs/contributing.md#native-ascend-distributed-tests-requires-4-npus)
+defines the mandatory native gate. Run it before a PR that changes NPU
+distributed behavior:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+    tests/distributed/test_hsdp_correctness.py --device npu \
+    --output-dir /path/to/new-hsdp-proof
+```
+
+It uses the upstream model with identical initialization and actual inputs
+across a 1D shard-only mesh and a 2x2 HSDP mesh, checks every rank's full state
+without tolerance, and verifies continuation from one canonical rank-0 disk
+checkpoint. This is separate from the varied-input regression below.
+The default uses ten updates per topology and two replay updates.
+
+The tiny HCCL regression covers a one-dimensional four-rank mesh and a 2x2
+hybrid mesh. Each topology tests GAS4 with synchronized/default gradients and
+`no_sync` with explicit FP32 gradients, followed by an exact disk restart.
+It performs 28 global optimizer calls in total. The checkpoint retains each
+rank's exported state to preserve replica-local collective rounding:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc_per_node=4 tests/native/ascend_distributed.py \
+    --package-root . --topology all --output-dir /path/to/new-restart-proof
+```
+
+The proof compares live momentum, AdamW moments, master parameters, model
+parameters, scheduler, RNG, and data cursor within each execution path.
+Synchronized and `no_sync` paths are not asserted to share a numerical trajectory.

@@ -49,6 +49,16 @@ git clone git@github.com:X-Square-Robot/dmuon.git && cd dmuon
 pip install -e .
 ```
 
+Optional CUDA kernels: `pip install -e ".[syrk]"` (SM80) or
+`pip install -e ".[quack]"` (SM90+).
+
+**Ascend NPU (experimental):** activate CANN, then run
+`DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation`. Import `torch_npu`
+and use an `"npu"` device mesh with the `hccl` backend and the same public API.
+CUDA-only SYRK, fast-clip kernels, and CUDA-graph Newton–Schulz are skipped on NPU.
+See the [installation guide](docs/getting-started/installation.md#ascend-950dt-experimental)
+and [test instructions](tests/README.md) for details.
+
 ## 3-Line Integration
 
 ```python

@@ -33,6 +33,7 @@ import torch.distributed as dist
 
 from dmuon._core.comm import DedicatedCommContext
 from dmuon._core.dynamo import dynamo_disable
+from dmuon._core.device import get_device_module
 from dmuon._core.owner_rank import OwnerCoord
 
 from dmuon._backends.fsdp2.group import (
@@ -84,7 +85,8 @@ class DedicatedParamGroupDDP:
     ):
         self.params: list[DedicatedParamDDP] = params
         self.comm_ctx = comm_ctx
-        self.device = params[0].device if params else torch.device("cuda")
+        self.device = params[0].device if params else comm_ctx.device
+        self._device_module = get_device_module(self.device)
 
         # Pre-group by owner so coalesced broadcasts/reduces can fuse
         # per-owner work into one NCCL kernel.
@@ -99,9 +101,7 @@ class DedicatedParamGroupDDP:
         self._post_reduce_event: Optional[torch.cuda.Event] = None
         self._muon_grad_ready_event: Optional[torch.cuda.Event] = None
         self._muon_grad_ready_refs: list[torch.Tensor] = []
-        self._pending_reduce: list[
-            tuple[Optional[torch.Tensor], list[DedicatedParamDDP]]
-        ] = []
+        self._pending_reduce: list[tuple[Optional[torch.Tensor], list[DedicatedParamDDP]]] = []
 
         # Post-step broadcast state
         self._post_step_broadcast_event: Optional[torch.cuda.Event] = None
@@ -126,21 +126,13 @@ class DedicatedParamGroupDDP:
         self._post_backward_fired: bool = False
 
         # Cached metadata
-        self._dp_group: Optional[dist.ProcessGroup] = (
-            params[0].dp_group if params else None
+        self._dp_group: Optional[dist.ProcessGroup] = params[0].dp_group if params else None
+        self._param_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_param_dtype")
+        self._grad_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_grad_dtype")
+        self._output_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_output_dtype")
+        self._cast_forward_inputs: bool = (
+            bool(_uniform_param_attr(params, "_cast_forward_inputs")) if params else True
         )
-        self._param_dtype: Optional[torch.dtype] = _uniform_param_attr(
-            params, "_param_dtype"
-        )
-        self._grad_dtype: Optional[torch.dtype] = _uniform_param_attr(
-            params, "_grad_dtype"
-        )
-        self._output_dtype: Optional[torch.dtype] = _uniform_param_attr(
-            params, "_output_dtype"
-        )
-        self._cast_forward_inputs: bool = bool(
-            _uniform_param_attr(params, "_cast_forward_inputs")
-        ) if params else True
         self._comm_dtype: Optional[torch.dtype] = (
             (self._param_dtype or params[0]._orig_dtype) if params else None
         )
@@ -150,8 +142,7 @@ class DedicatedParamGroupDDP:
         }
         if self._dp_group is not None:
             self._global_owner_ranks: dict[OwnerCoord, int] = {
-                owner: dist.get_global_rank(self._dp_group, owner[0])
-                for owner in self._by_owner
+                owner: dist.get_global_rank(self._dp_group, owner[0]) for owner in self._by_owner
             }
         else:
             self._global_owner_ranks = {}
@@ -239,12 +230,12 @@ class DedicatedParamGroupDDP:
                 p._accumulated_grad = None
 
         reduce_stream = self.comm_ctx.reduce_stream
-        reduce_stream.wait_stream(torch.cuda.current_stream())
+        reduce_stream.wait_stream(self._device_module.current_stream())
 
         self._pending_reduce = []
         dp_group = self._dp_group
 
-        with torch.cuda.stream(reduce_stream):
+        with self._device_module.stream(reduce_stream):
             work = [p for p in self.params if p._orig_param.grad is not None]
             if work:
                 with dist._coalescing_manager(group=dp_group, device=self.device):
@@ -273,15 +264,15 @@ class DedicatedParamGroupDDP:
         if self._post_reduce_event is None:
             return None
 
-        target_stream = stream if stream is not None else torch.cuda.current_stream()
+        target_stream = stream if stream is not None else self._device_module.current_stream()
         if stream is None:
             target_stream.wait_event(self._post_reduce_event)
         else:
-            with torch.cuda.stream(stream):
+            with self._device_module.stream(stream):
                 target_stream.wait_event(self._post_reduce_event)
         self._post_reduce_event = None
 
-        stream_ctx = torch.cuda.stream(stream) if stream is not None else None
+        stream_ctx = self._device_module.stream(stream) if stream is not None else None
         if stream_ctx is None:
             for grad_buf, plist in self._pending_reduce:
                 if grad_buf is None:
@@ -309,9 +300,7 @@ class DedicatedParamGroupDDP:
                         p._reduced_grad = new_grad.clone()
 
         self._muon_grad_ready_refs = [
-            grad_buf
-            for grad_buf, _plist in self._pending_reduce
-            if grad_buf is not None
+            grad_buf for grad_buf, _plist in self._pending_reduce if grad_buf is not None
         ]
         self._pending_reduce = []
         self._muon_grad_ready_event = target_stream.record_event()
@@ -329,9 +318,7 @@ class DedicatedParamGroupDDP:
 
     # ---- TP gather/scatter -------------------------------------------------
 
-    def tp_gather_grads(
-        self, *, wait_current_stream: bool = True
-    ) -> Optional[torch.cuda.Event]:
+    def tp_gather_grads(self, *, wait_current_stream: bool = True) -> Optional[torch.cuda.Event]:
         """Gather TP-local reduced grads to each parameter's TP owner.
 
         Only DP-owner ranks have ``_reduced_grad`` populated after the DP
@@ -352,7 +339,7 @@ class DedicatedParamGroupDDP:
             return None
 
         if wait_current_stream:
-            reduce_stream.wait_stream(torch.cuda.current_stream())
+            reduce_stream.wait_stream(self._device_module.current_stream())
 
         grouped_work: list[
             tuple[dist.ProcessGroup, list[tuple[DedicatedParamDDP, torch.Tensor]]]
@@ -366,10 +353,12 @@ class DedicatedParamGroupDDP:
             else:
                 grouped_work.append((tp_group, [item]))
 
-        with torch.cuda.stream(reduce_stream):
+        with self._device_module.stream(reduce_stream):
             gather_refs: list[torch.Tensor] = []
             pending_full_grads: list[
-                tuple[DedicatedParamDDP, list[torch.Tensor], torch.Tensor, int, Optional[torch.Tensor]]
+                tuple[
+                    DedicatedParamDDP, list[torch.Tensor], torch.Tensor, int, Optional[torch.Tensor]
+                ]
             ] = []
             reuse_buffers = _tp_gather_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
@@ -395,9 +384,7 @@ class DedicatedParamGroupDDP:
                                     device=local_grad.device,
                                 )
                             else:
-                                recv_bufs = [
-                                    torch.empty_like(local_grad) for _ in range(tp_size)
-                                ]
+                                recv_bufs = [torch.empty_like(local_grad) for _ in range(tp_size)]
                                 full_grad_buf = None
                             gather_refs.extend(recv_bufs)
                             gather_refs.append(local_grad)
@@ -442,7 +429,7 @@ class DedicatedParamGroupDDP:
     def wait_for_tp_gather(self) -> None:
         if self._tp_gather_event is None:
             return
-        torch.cuda.current_stream().wait_event(self._tp_gather_event)
+        self._device_module.current_stream().wait_event(self._tp_gather_event)
         self._materialize_tp_gathered_grads()
         self._tp_gather_event = None
         self._tp_gather_refs = []
@@ -451,15 +438,13 @@ class DedicatedParamGroupDDP:
 
     def _tp_scatter_dispatch(self) -> Optional[list[torch.Tensor]]:
         work: list[DedicatedParamDDP] = [
-            p
-            for p in self.params
-            if p.tp_group is not None and p._reduced_grad is not None
+            p for p in self.params if p.tp_group is not None and p._reduced_grad is not None
         ]
         if not work:
             return None
 
         bcast_stream = self.comm_ctx.replicate_broadcast_stream
-        bcast_stream.wait_stream(torch.cuda.current_stream())
+        bcast_stream.wait_stream(self._device_module.current_stream())
         bcast_stream.wait_stream(self.comm_ctx.reduce_stream)
 
         refs: list[torch.Tensor] = []
@@ -473,7 +458,7 @@ class DedicatedParamGroupDDP:
             else:
                 grouped_work.append((p.tp_group, [p]))
 
-        with torch.cuda.stream(bcast_stream):
+        with self._device_module.stream(bcast_stream):
             reuse_buffers = _tp_scatter_buffer_reuse_enabled(self.comm_ctx)
             for tp_group, group_work in grouped_work:
                 with dist._coalescing_manager(group=tp_group, device=self.device):
@@ -544,7 +529,7 @@ class DedicatedParamGroupDDP:
         if refs is None:
             return
         event = self.comm_ctx.replicate_broadcast_stream.record_event()
-        torch.cuda.current_stream().wait_event(event)
+        self._device_module.current_stream().wait_event(event)
         self._tp_scatter_state = TPScatterState(refs=refs, event=event)
 
     def tp_scatter_delta_async(self) -> None:
@@ -584,9 +569,9 @@ class DedicatedParamGroupDDP:
             # the TP scatter event explicitly.  HSDP gets this ordering by
             # using the same replicate_broadcast_stream for both stages.
             bcast_stream.wait_event(tp_state.event)
-        bcast_stream.wait_stream(torch.cuda.current_stream())
+        bcast_stream.wait_stream(self._device_module.current_stream())
 
-        with torch.cuda.stream(bcast_stream):
+        with self._device_module.stream(bcast_stream):
             with dist._coalescing_manager(group=self._dp_group, device=self.device):
                 for p in self.params:
                     dist.broadcast(
@@ -610,7 +595,7 @@ class DedicatedParamGroupDDP:
         """
         if self._post_step_broadcast_event is None:
             return
-        torch.cuda.current_stream().wait_event(self._post_step_broadcast_event)
+        self._device_module.current_stream().wait_event(self._post_step_broadcast_event)
         self._post_step_broadcast_event = None
 
     # ---- async post-step broadcast -----------------------------------------
@@ -649,11 +634,11 @@ class DedicatedParamGroupDDP:
         """
         tp_state = self._tp_scatter_state
         if tp_state is not None:
-            torch.cuda.current_stream().wait_event(tp_state.event)
+            self._device_module.current_stream().wait_event(tp_state.event)
             self._tp_scatter_state = None
 
         state = self._post_step_broadcast_state
         if state is None:
             return
-        torch.cuda.current_stream().wait_event(state.event)
+        self._device_module.current_stream().wait_event(state.event)
         self._post_step_broadcast_state = None

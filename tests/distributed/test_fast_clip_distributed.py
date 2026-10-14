@@ -16,9 +16,7 @@ as a torchrun timeout.
 import os
 import sys
 
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import math
 
@@ -35,8 +33,8 @@ def run() -> None:
 
     # reduce=True buckets: each rank contributes a known local square; the
     # segment-local norm after reduction is sqrt(sum_r local_sq_r).
-    muon = torch.tensor([float(rank + 1), 0.0])       # local sq = (rank+1)^2
-    adamw = torch.tensor([0.0, float(rank + 2)])       # local sq = (rank+2)^2
+    muon = torch.tensor([float(rank + 1), 0.0])  # local sq = (rank+1)^2
+    adamw = torch.tensor([0.0, float(rank + 2)])  # local sq = (rank+2)^2
 
     # reduce=False bucket stays rank-local; rank 0 injects a non-finite value.
     regular = torch.tensor([3.0, 4.0])
@@ -57,13 +55,25 @@ def run() -> None:
     expected_adamw = math.sqrt(sum((r + 2) ** 2 for r in range(world_size)))
 
     assert abs(stats["muon"].total_norm - expected_muon) < 1e-4, (
-        rank, stats["muon"].total_norm, expected_muon,
+        rank,
+        stats["muon"].total_norm,
+        expected_muon,
     )
     assert abs(stats["adamw"].total_norm - expected_adamw) < 1e-4, (
-        rank, stats["adamw"].total_norm, expected_adamw,
+        rank,
+        stats["adamw"].total_norm,
+        expected_adamw,
     )
     # regular is local: only rank 0 saw the inf.
-    assert stats["regular"].found_inf is (rank == 0), (rank, stats["regular"].found_inf)
+    for name, stat in stats.items():
+        assert isinstance(stat.found_inf, torch.Tensor)
+        assert stat.found_inf.ndim == 0 and stat.found_inf.dtype == torch.bool
+        assert stat.found_inf.device == regular.device
+        assert stat.found_inf.item() is (name == "regular" and rank == 0), (
+            rank,
+            name,
+            stat.found_inf,
+        )
 
     dist.barrier()
     if rank == 0:

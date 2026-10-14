@@ -16,13 +16,15 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from dmuon._core.device import cuda_is_available, default_device
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Backend detection
 # ---------------------------------------------------------------------------
 _SM_VERSION = 0
-if torch.cuda.is_available():
+if cuda_is_available():
     _cap = torch.cuda.get_device_capability()
     _SM_VERSION = _cap[0] * 10 + _cap[1]
 
@@ -30,13 +32,14 @@ if torch.cuda.is_available():
 HAS_SYRK = False
 _syrk_sm80_fn = None
 _SYRK_CONFIGS = []
-try:
-    from dmuon.kernels.syrk_sm80 import syrk_sm80 as _syrk_sm80_fn
-    from dmuon.kernels.syrk_sm80 import SYRK_SM80_CONFIGS as _SYRK_CONFIGS
+if cuda_is_available():
+    try:
+        from dmuon.kernels.syrk_sm80 import syrk_sm80 as _syrk_sm80_fn
+        from dmuon.kernels.syrk_sm80 import SYRK_SM80_CONFIGS as _SYRK_CONFIGS
 
-    HAS_SYRK = True
-except ImportError:
-    pass
+        HAS_SYRK = True
+    except ImportError:
+        pass
 
 
 def get_ns_backend() -> str:
@@ -65,7 +68,7 @@ def get_ns_backend() -> str:
     elif choice == SyrkBackend.CUTE_SM80:
         detail = "DMuon internal"
     else:
-        detail = "universal fallback"
+        detail = "PyTorch eager on NPU" if default_device().type == "npu" else "universal fallback"
     return f"Gram NS · kernel={choice.value} (SM{_SM_VERSION}, {detail})"
 
 
@@ -166,7 +169,7 @@ def _bench_cuda_ms(fn, iters: int = 10, warmup: int = 3) -> float:
     # torch.cuda._sleep is a private API: if it disappears in a future
     # torch, degrade to plain event timing (host launch gaps then count
     # toward the measurement -- worse fidelity, never wrong results).
-    if hasattr(torch.cuda, '_sleep'):
+    if hasattr(torch.cuda, "_sleep"):
         torch.cuda._sleep(30_000_000)
     start.record()
     for _ in range(iters):
@@ -207,9 +210,7 @@ def _autotune_quack_vs_cublas(A, D, B, C, alpha, beta, diag_add) -> bool:
     D_c = torch.empty_like(D)
 
     def run_quack():
-        syrk_quack.syrk(
-            A, D_q, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add
-        )
+        syrk_quack.syrk(A, D_q, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add)
 
     def run_cublas():
         if has_C:
@@ -242,8 +243,7 @@ def _autotune_quack_vs_cublas(A, D, B, C, alpha, beta, diag_add) -> bool:
             )
     except Exception as exc:  # noqa: BLE001 -- loud degrade, never crash step
         _progress_log(
-            f"SYRK quack autotune FAILED shape=({M},{K}): "
-            f"{type(exc).__name__}: {exc}; using cuBLAS"
+            f"SYRK quack autotune FAILED shape=({M},{K}): {type(exc).__name__}: {exc}; using cuBLAS"
         )
 
     _quack_autotune_cache[key] = verdict
@@ -305,7 +305,7 @@ def _cache_dir() -> Path:
 
 
 def _gpu_tag() -> str:
-    if torch.cuda.is_available():
+    if cuda_is_available():
         return torch.cuda.get_device_name(0).replace(" ", "_")
     return "cpu"
 
@@ -479,18 +479,14 @@ def _autotune_syrk(
         f"for shape=({M}, {K}), dtype={dtype}, backend={backend}, has_C={has_C}"
     )
     if has_C:
-        C_mat = _autotune_randn(
-            M, M, device=device, dtype=dtype, generator=autotune_gen
-        )
-        t_cublas = _bench_median(
-            lambda: torch.addmm(C_mat, X, X.T, alpha=0.5, beta=0.3)
-        )
+        C_mat = _autotune_randn(M, M, device=device, dtype=dtype, generator=autotune_gen)
+        t_cublas = _bench_median(lambda: torch.addmm(C_mat, X, X.T, alpha=0.5, beta=0.3))
     else:
         t_cublas = _bench_median(lambda: torch.mm(X, X.T, out=D))
     _progress_log(
         "SYRK autotune baseline finished "
         f"for shape=({M}, {K}), dtype={dtype}, backend={backend}, "
-        f"cuBLAS={t_cublas*1e6:.0f}us"
+        f"cuBLAS={t_cublas * 1e6:.0f}us"
     )
 
     best_time = t_cublas
@@ -517,9 +513,7 @@ def _autotune_syrk(
         )
         try:
             if has_C:
-                C_mat2 = _autotune_randn(
-                    M, M, device=device, dtype=dtype, generator=autotune_gen
-                )
+                C_mat2 = _autotune_randn(M, M, device=device, dtype=dtype, generator=autotune_gen)
 
                 def bench_syrk(tm=tile_m, tk=tile_k, ns=num_stages):
                     _syrk_sm80_fn(
@@ -544,7 +538,7 @@ def _autotune_syrk(
                 f"{idx}/{len(eligible_configs)} for shape=({M}, {K}), "
                 f"dtype={dtype}, backend={backend}, "
                 f"tile_m={tile_m}, tile_k={tile_k}, num_stages={num_stages}, "
-                f"time={t*1e6:.0f}us"
+                f"time={t * 1e6:.0f}us"
             )
             if t < best_time:
                 best_time = t
@@ -564,13 +558,13 @@ def _autotune_syrk(
     _progress_log(
         "SYRK autotune finished "
         f"for shape=({M}, {K}), dtype={dtype}, backend={backend}: "
-        f"cuBLAS={t_cublas*1e6:.0f}us, best={best_time*1e6:.0f}us, "
+        f"cuBLAS={t_cublas * 1e6:.0f}us, best={best_time * 1e6:.0f}us, "
         f"config={best_config}, speedup={speedup:.2f}x, "
         f"elapsed={elapsed:.3f}s"
     )
     logger.info(
         f"SYRK autotune ({M},{K}) has_C={has_C}: "
-        f"cuBLAS={t_cublas*1e6:.0f}us, best={best_time*1e6:.0f}us "
+        f"cuBLAS={t_cublas * 1e6:.0f}us, best={best_time * 1e6:.0f}us "
         f"config={best_config} speedup={speedup:.2f}x"
     )
 
@@ -603,9 +597,7 @@ def syrk_or_cublas(
         from dmuon.kernels import syrk_quack
 
         if _autotune_quack_vs_cublas(A, D, B, C, alpha, beta, diag_add):
-            syrk_quack.syrk(
-                A, D, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add
-            )
+            syrk_quack.syrk(A, D, B=B, C=C, alpha=alpha, beta=beta, diag_add=diag_add)
         else:
             if has_C:
                 torch.addmm(C, A, BT, alpha=alpha, beta=beta, out=D)

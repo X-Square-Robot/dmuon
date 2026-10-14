@@ -16,6 +16,7 @@ except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
 from ._backends.ddp import DedicatedParamDDP, DedicatedParamGroupDDP
 from ._backends.fsdp2 import DedicatedParam, DedicatedParamGroup
 from ._core.comm import DedicatedCommContext
+from ._core.device import current_device
 from ._core.internal_utils import unsafe_setattr_param
 from ._core.owner_rank import normalize_owner_rank
 from ._core.partition import _extract_layer_id, compute_balanced_assignment
@@ -30,9 +31,7 @@ from .policy import ParamPolicyFn, resolve_param_policies
 logger = logging.getLogger(__name__)
 
 
-def _find_parent_module(
-    model: nn.Module, target_param: nn.Parameter
-) -> tuple[nn.Module, str]:
+def _find_parent_module(model: nn.Module, target_param: nn.Parameter) -> tuple[nn.Module, str]:
     """Find the direct parent module and param name for a parameter."""
     for module_name, module in model.named_modules():
         for param_name, param in module.named_parameters(recurse=False):
@@ -90,9 +89,7 @@ def _link_forward_prefetch_states(
         state._next_groups = []
     for idx in range(len(ordered) - 1):
         ordered[idx]._next_group = ordered[idx + 1].group
-        ordered[idx]._next_groups = [
-            later_state.group for later_state in ordered[idx + 1 :]
-        ]
+        ordered[idx]._next_groups = [later_state.group for later_state in ordered[idx + 1 :]]
     comm_ctx.all_states[:] = ordered
 
 
@@ -144,13 +141,10 @@ def _validate_policy_hook_boundaries(
         cast_input_targets = {
             _effective_param_dtype(dp)
             for dp in d_params
-            if getattr(dp, "_cast_forward_inputs", False)
-            and _effective_param_dtype(dp) is not None
+            if getattr(dp, "_cast_forward_inputs", False) and _effective_param_dtype(dp) is not None
         }
         effective_param_dtypes = {
-            _effective_param_dtype(dp)
-            for dp in d_params
-            if _effective_param_dtype(dp) is not None
+            _effective_param_dtype(dp) for dp in d_params if _effective_param_dtype(dp) is not None
         }
         if cast_input_targets and len(effective_param_dtypes) > 1:
             name = module_fqns.get(id(module), "<unknown>")
@@ -178,9 +172,7 @@ def _validate_policy_hook_boundaries(
             )
 
 
-def _lowest_common_ancestor_module(
-    model: nn.Module, modules: list[nn.Module]
-) -> nn.Module:
+def _lowest_common_ancestor_module(model: nn.Module, modules: list[nn.Module]) -> nn.Module:
     """Return the lowest module that contains every module in ``modules``.
 
     Tied parameters can be read through aliases that live in different parts of
@@ -325,8 +317,7 @@ def _resolve_owner_strategy(owner_strategy: Optional[str]) -> str:
     resolved = owner_strategy or os.environ.get("DMUON_OWNER_STRATEGY", "lpt")
     if resolved not in {"lpt", "round_robin", "rank0"}:
         raise ValueError(
-            f"Unsupported owner_strategy: {resolved!r}; "
-            "expected 'lpt', 'round_robin', or 'rank0'."
+            f"Unsupported owner_strategy: {resolved!r}; expected 'lpt', 'round_robin', or 'rank0'."
         )
     return resolved
 
@@ -335,8 +326,7 @@ def _resolve_owner_cost_model(owner_cost_model: Optional[str]) -> str:
     resolved = owner_cost_model or os.environ.get("DMUON_OWNER_COST_MODEL", "optimizer")
     if resolved not in {"optimizer", "numel"}:
         raise ValueError(
-            f"Unsupported owner_cost_model: {resolved!r}; "
-            "expected 'optimizer' or 'numel'."
+            f"Unsupported owner_cost_model: {resolved!r}; expected 'optimizer' or 'numel'."
         )
     return resolved
 
@@ -379,9 +369,7 @@ def _resolve_hook_module(
         return parent_module
 
     if hook_boundary_predicate is not None:
-        module = _find_hook_module(
-            model, target_param, hook_boundary_predicate, strict=strict
-        )
+        module = _find_hook_module(model, target_param, hook_boundary_predicate, strict=strict)
         assert module is not None
         return module
 
@@ -600,9 +588,7 @@ def dedicate_params(
     for param, coord in normalized.items():
         rank_loads[coord] += param.numel()
     loads_list = [
-        rank_loads.get((s, r), 0)
-        for s in range(shard_size)
-        for r in range(replicate_size)
+        rank_loads.get((s, r), 0) for s in range(shard_size) for r in range(replicate_size)
     ]
     max_load = max(loads_list) if loads_list else 0
     min_load = min(loads_list) if loads_list else 0
@@ -637,7 +623,7 @@ def dedicate_params(
         role="fsdp2.replicate",
     )
     device_type = mesh.device_type
-    device = torch.device(device_type, torch.cuda.current_device())
+    device = current_device(device_type)
     comm_ctx = DedicatedCommContext(
         device,
         replicate_group=replicate_group,
@@ -646,9 +632,9 @@ def dedicate_params(
     )
 
     # 4. Group by layer module and create DedicatedParam + DedicatedState
-    layer_to_dparams: dict[
-        tuple[nn.Module, tuple[object, ...]], list[DedicatedParam]
-    ] = defaultdict(list)
+    layer_to_dparams: dict[tuple[nn.Module, tuple[object, ...]], list[DedicatedParam]] = (
+        defaultdict(list)
+    )
     param_to_fqn = {param: name for name, param in model.named_parameters()}
     policies = resolve_param_policies(
         params=normalized.keys(),
@@ -710,9 +696,7 @@ def dedicate_params(
             master_dtype=policy.master_dtype,
             optim_dtype=policy.optim_dtype,
             replicate_group=replicate_group,
-            tp_owner_local_rank=(
-                result.tp_owners[param] if param in result.tp_owners else 0
-            ),
+            tp_owner_local_rank=(result.tp_owners[param] if param in result.tp_owners else 0),
             tp_group=tp_group,
             route_hint=policy.route,
             muon_forward_unshard=policy.muon_forward_unshard or muon_forward_unshard,
@@ -726,9 +710,7 @@ def dedicate_params(
         layer_to_dparams[(layer_module, _policy_group_key(d_param))].append(d_param)
 
     all_states: list[DedicatedState] = []
-    module_fqns = {
-        id(module): name or "<root>" for name, module in model.named_modules()
-    }
+    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     _validate_policy_hook_boundaries(layer_to_dparams, module_fqns)
     for (layer_module, _policy_key), d_params in layer_to_dparams.items():
         group = DedicatedParamGroup(
@@ -879,12 +861,12 @@ def dedicate_params_ddp(
         role="ddp.dp",
     )
     device_type = mesh.device_type
-    device = torch.device(device_type, torch.cuda.current_device())
+    device = current_device(device_type)
     comm_ctx = DedicatedCommContext(device, replicate_group=None)
 
-    layer_to_dparams: dict[
-        tuple[nn.Module, tuple[object, ...]], list[DedicatedParamDDP]
-    ] = defaultdict(list)
+    layer_to_dparams: dict[tuple[nn.Module, tuple[object, ...]], list[DedicatedParamDDP]] = (
+        defaultdict(list)
+    )
     param_to_fqn = {param: name for name, param in model.named_parameters()}
     policies = resolve_param_policies(
         params=normalized.keys(),
@@ -926,9 +908,7 @@ def dedicate_params_ddp(
         layer_to_dparams[(layer_module, _policy_group_key(d_param))].append(d_param)
 
     all_states: list[DedicatedState] = []
-    module_fqns = {
-        id(module): name or "<root>" for name, module in model.named_modules()
-    }
+    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     _validate_policy_hook_boundaries(layer_to_dparams, module_fqns)
     for (layer_module, _policy_key), d_params in layer_to_dparams.items():
         group = DedicatedParamGroupDDP(d_params, comm_ctx)
@@ -938,9 +918,7 @@ def dedicate_params_ddp(
         # ``group.reshard()`` call in post-forward. On DDP groups
         # ``reshard`` is a no-op either way — this just avoids an
         # unnecessary attribute touch.
-        state = DedicatedState(
-            layer_module, group, comm_ctx, reshard_after_forward=False
-        )
+        state = DedicatedState(layer_module, group, comm_ctx, reshard_after_forward=False)
         _attach_dedicated_state(layer_module, state)
         all_states.append(state)
 
@@ -988,9 +966,7 @@ def dedicate_params_ddp_tp(
     ``"shared"`` reuses the caller-provided mesh groups.
     """
     if mesh.ndim != 1:
-        raise ValueError(
-            f"dedicate_params_ddp_tp requires a 1D DP mesh; got ndim={mesh.ndim}."
-        )
+        raise ValueError(f"dedicate_params_ddp_tp requires a 1D DP mesh; got ndim={mesh.ndim}.")
 
     owner_strategy = _resolve_owner_strategy(owner_strategy)
     owner_cost_model = _resolve_owner_cost_model(owner_cost_model)
@@ -1046,16 +1022,16 @@ def dedicate_params_ddp_tp(
         role="ddp_tp.dp",
     )
     device_type = mesh.device_type
-    device = torch.device(device_type, torch.cuda.current_device())
+    device = current_device(device_type)
     comm_ctx = DedicatedCommContext(
         device,
         replicate_group=None,
         tp_buffer_reuse=tp_buffer_reuse,
     )
 
-    layer_to_dparams: dict[
-        tuple[nn.Module, tuple[object, ...]], list[DedicatedParamDDP]
-    ] = defaultdict(list)
+    layer_to_dparams: dict[tuple[nn.Module, tuple[object, ...]], list[DedicatedParamDDP]] = (
+        defaultdict(list)
+    )
     param_to_fqn = {param: name for name, param in model.named_parameters()}
     policies = resolve_param_policies(
         params=normalized.keys(),
@@ -1109,25 +1085,19 @@ def dedicate_params_ddp_tp(
             master_dtype=policy.master_dtype,
             optim_dtype=policy.optim_dtype,
             route_hint=policy.route,
-            tp_owner_local_rank=(
-                result.tp_owners[param] if param in result.tp_owners else 0
-            ),
+            tp_owner_local_rank=(result.tp_owners[param] if param in result.tp_owners else 0),
             tp_group=tp_group,
         )
         d_param._dmuon_policy = policy
         layer_to_dparams[(layer_module, _policy_group_key(d_param))].append(d_param)
 
     all_states: list[DedicatedState] = []
-    module_fqns = {
-        id(module): name or "<root>" for name, module in model.named_modules()
-    }
+    module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
     _validate_policy_hook_boundaries(layer_to_dparams, module_fqns)
     for (layer_module, _policy_key), d_params in layer_to_dparams.items():
         group = DedicatedParamGroupDDP(d_params, comm_ctx)
         group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
-        state = DedicatedState(
-            layer_module, group, comm_ctx, reshard_after_forward=False
-        )
+        state = DedicatedState(layer_module, group, comm_ctx, reshard_after_forward=False)
         _attach_dedicated_state(layer_module, state)
         all_states.append(state)
 

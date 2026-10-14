@@ -52,6 +52,28 @@ Distributed tests take ~2 minutes per run.  Write a small isolated unit test
 first to verify your logic before using the distributed harness as a debug loop
 (see the project memory note on smoke tests).
 
+### Native Ascend distributed tests (requires 4 NPUs)
+
+Use a matching PyTorch, `torch_npu`, and CANN environment and select four
+visible devices. The same mandatory entry provides a native NPU/HCCL gate:
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+    tests/distributed/test_hsdp_correctness.py --device npu \
+    --output-dir /path/to/new-hsdp-proof
+```
+
+This compares the upstream model and optimizer configuration across a 1D
+shard-only mesh and a 2x2 HSDP mesh, using identical initialization and inputs.
+Every rank checks the exact loss, full model state, and optimizer state after
+each update. HSDP saves one canonical rank-0 checkpoint and checks two further
+updates after rebuilding and restoring that checkpoint. No tolerance or
+rank-local state override is used. Four steps per topology plus two replay
+steps provide a ten-call smoke check with `--steps 4 --resume-after 2`.
+The default gate uses ten steps per topology and two replay steps, for 22
+distributed optimizer calls. The CUDA command above remains unchanged.
+
 ### Single-test smoke check pattern
 
 ```python
@@ -89,6 +111,7 @@ Before opening a pull request:
 - [ ] Rebase on `main` (`git fetch origin && git rebase origin/main`)
 - [ ] Unit tests pass (`pytest tests/unit/`)
 - [ ] For distributed changes: `test_hsdp_correctness.py` passes
+- [ ] For native NPU changes: the `--device npu` mandatory gate passes on four NPUs
 - [ ] Public API changes have updated docstrings
 - [ ] Docs updated if behavior or API surface changed
 - [ ] **Bit-identical correctness maintained** — no change to loss values for

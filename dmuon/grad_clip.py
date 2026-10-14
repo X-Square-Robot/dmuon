@@ -8,12 +8,13 @@ DMuon-aware clipping entry point.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import torch
 import torch.distributed as dist
+
+from ._core.device import default_device
 
 try:
     from torch.utils._foreach_utils import (
@@ -44,13 +45,13 @@ class MuonGradClipStats:
     ``total_norm`` is the norm before clipping.  ``max_norm=None`` means the
     call was stats-only and did not scale any gradient.
 
-    DEVICE-TENSOR CONTRACT: ``total_norm`` / ``clip_coef`` / ``clipped`` /
-    ``found_inf`` are 0-dim CUDA tensors, never host scalars. The clip call
-    itself is sync-free; consumers that need python numbers (logging)
-    materialize them in one batched D2H on their own schedule. There is no
-    eager mode: the only reason to read these on the host at clip time would
-    be host-side control flow (inf-skip / dynamic thresholds), which DMuon
-    does not do.
+    ``total_norm`` and ``found_inf`` are 0-dim tensors on the gradients'
+    device; ``found_inf`` has dtype ``torch.bool``. When clipping is enabled,
+    ``clip_coef`` and ``clipped`` are also 0-dim device tensors. In stats-only
+    mode they remain the host constants ``1.0`` and ``False``. The default
+    path performs no host readback; consumers materialize values on their
+    own schedule. Explicit ``error_if_nonfinite=True`` may synchronize to
+    raise an exception.
     """
 
     total_norm: torch.Tensor
@@ -96,8 +97,7 @@ class MuonGradClipStrategy(Protocol):
 
     name: str
 
-    def __call__(self, context: MuonGradClipContext) -> MuonGradClipStats:
-        ...
+    def __call__(self, context: MuonGradClipContext) -> MuonGradClipStats: ...
 
 
 class GlobalNormMuonClipStrategy:
@@ -132,9 +132,7 @@ class GlobalNormMuonClipStrategy:
             clip_coef = clip_coef_clamped.detach()
             # Finiteness must be judged on the NORM: an inf norm drives the
             # coef to 0.0 (finite!), so isfinite(coef) only catches NaN.
-            clipped = torch.isfinite(total_norm_t.detach()) & (
-                clip_coef_t.detach() < 1.0
-            )
+            clipped = torch.isfinite(total_norm_t.detach()) & (clip_coef_t.detach() < 1.0)
         total_norm = total_norm_t.detach()
         found_inf = ~torch.isfinite(total_norm)
 
@@ -384,9 +382,7 @@ def _accumulator_device(
     device = getattr(comm_ctx, "device", None)
     if device is not None:
         return torch.device(device)
-    if torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device("cpu")
+    return default_device()
 
 
 def _all_reduce_if_needed(tensor: torch.Tensor, *, op: dist.ReduceOp) -> None:

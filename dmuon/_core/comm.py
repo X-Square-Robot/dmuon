@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.distributed as dist
 
+from .device import get_device_module
+
 if TYPE_CHECKING:
     from dmuon._core.state import DedicatedState
 
@@ -95,19 +97,18 @@ class DedicatedCommContext:
         user code directly.
         """
         self.device = device
-        self.broadcast_stream = torch.cuda.Stream(device=device, priority=-1)
-        self.sharded_adamw_unshard_stream = torch.cuda.Stream(
-            device=device, priority=-1
-        )
+        self._device_module = get_device_module(device)
+        self.broadcast_stream = self._device_module.Stream(device=device, priority=-1)
+        self.sharded_adamw_unshard_stream = self._device_module.Stream(device=device, priority=-1)
         self.sharded_adamw_unshard_separate_stream_enabled = False
-        self.reduce_stream = torch.cuda.Stream(device=device, priority=-1)
+        self.reduce_stream = self._device_module.Stream(device=device, priority=-1)
         # FSDP2 sets the all-reduce (i.e. replicate-dim) stream at default
         # priority because inter-node AR traffic uses different network
         # resources than intra-node AG/RS.  We follow the same convention so
         # the Phase C scheduler can issue broadcasts on this stream without
         # starving shard-dim collectives.
-        self.replicate_reduce_stream = torch.cuda.Stream(device=device)
-        self.replicate_broadcast_stream = torch.cuda.Stream(device=device)
+        self.replicate_reduce_stream = self._device_module.Stream(device=device)
+        self.replicate_broadcast_stream = self._device_module.Stream(device=device)
         self.replicate_group: Optional[dist.ProcessGroup] = replicate_group
         self.tp_buffer_reuse = self._normalize_tp_buffer_reuse(tp_buffer_reuse)
         if replicate_broadcast_bucket_mb <= 0:
@@ -116,9 +117,7 @@ class DedicatedCommContext:
             self.replicate_broadcast_bucket_bytes = int(
                 float(replicate_broadcast_bucket_mb) * 1024 * 1024
             )
-        self.post_forward_order: list = (
-            []
-        )  # DedicatedParamGroup | DedicatedParamGroupDDP
+        self.post_forward_order: list = []  # DedicatedParamGroup | DedicatedParamGroupDDP
         self.all_states: list[DedicatedState] = []
         self.forward_prefetch_depth = 1
         self.post_backward_final_callback_queued: bool = False
@@ -181,8 +180,7 @@ class DedicatedCommContext:
         mode = aliases.get(mode, mode)
         if mode not in {"off", "all", "gather", "scatter"}:
             raise ValueError(
-                "tp_buffer_reuse must be one of False, True, 'off', "
-                "'gather', 'scatter', or 'all'"
+                "tp_buffer_reuse must be one of False, True, 'off', 'gather', 'scatter', or 'all'"
             )
         return mode
 
@@ -269,12 +267,12 @@ class DedicatedCommContext:
 
         for item in events:
             end = item["end"]
-            if isinstance(end, torch.cuda.Event) and not end.query():
+            if isinstance(end, self._device_module.Event) and not end.query():
                 events_pending += 1
                 continue
             start = item["start"]
-            if not isinstance(start, torch.cuda.Event) or not isinstance(
-                end, torch.cuda.Event
+            if not isinstance(start, self._device_module.Event) or not isinstance(
+                end, self._device_module.Event
             ):
                 events_pending += 1
                 continue
@@ -291,9 +289,7 @@ class DedicatedCommContext:
             group_stats = by_group.setdefault(group, {})
             key = f"{phase}_ms"
             group_stats[key] = float(group_stats.get(key, 0.0)) + elapsed_ms
-            group_stats[f"{phase}_events"] = (
-                int(group_stats.get(f"{phase}_events", 0)) + 1
-            )
+            group_stats[f"{phase}_events"] = int(group_stats.get(f"{phase}_events", 0)) + 1
             if bytes_value:
                 group_stats[f"{phase}_bytes"] = (
                     int(group_stats.get(f"{phase}_bytes", 0)) + bytes_value
@@ -326,9 +322,7 @@ class DedicatedCommContext:
             events.clear()
         return result
 
-    def consume_forward_unshard_profile(
-        self, *, clear: bool = True
-    ) -> dict[str, object]:
+    def consume_forward_unshard_profile(self, *, clear: bool = True) -> dict[str, object]:
         """Return aggregate CUDA-event timings for forward unshard diagnostics."""
 
         event_profile = self._consume_event_profile(
@@ -338,8 +332,7 @@ class DedicatedCommContext:
         events_ready = int(event_profile["events_ready"])
         events_pending = int(event_profile["events_pending"])
         by_group: dict[str, dict[str, object]] = {
-            group: dict(values)
-            for group, values in self._forward_profile_counts.items()
+            group: dict(values) for group, values in self._forward_profile_counts.items()
         }
         for group, profile_stats in event_profile["by_group"].items():
             group_stats = by_group.setdefault(group, {})

@@ -26,6 +26,8 @@ from typing import Sequence
 import torch
 import torch.distributed as dist
 
+from ._core.device import default_device
+
 from .grad_clip import MuonGradClipStats, _iter_muon_grad_entries
 
 
@@ -51,9 +53,10 @@ class GradClipBucketStats:
     """Pre-clip norm and coefficient for one gradient segment.
 
     DEVICE-TENSOR CONTRACT: ``total_norm`` / ``clip_coef`` / ``clipped`` /
-    ``found_inf`` are 0-dim CUDA tensors; the clip path performs no D2H.
-    Consumers materialize them in their own batched readback (the wall-x
-    trainer does one packed copy per logging step).
+    ``found_inf`` are 0-dim tensors on the gradients' device on both the CUDA
+    extension and torch fallback paths. ``clipped`` and ``found_inf`` have
+    dtype ``torch.bool``. The clip path performs no D2H; consumers materialize
+    values in their own readback when needed.
     """
 
     name: str
@@ -146,9 +149,7 @@ def _resolve_device(buckets: Sequence[GradClipBucket]) -> torch.device:
         for grad in bucket.grads:
             if grad is not None:
                 return grad.device
-    if torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device("cpu")
+    return default_device()
 
 
 def _tensor_kernel_eligible(grad: torch.Tensor, device: torch.device) -> bool:
@@ -200,9 +201,7 @@ def _build_metadata(
         "numels": numels,
         "dtypes": dtypes,
         "segments": tensor_segments,
-        "job_tensor_ids": torch.tensor(
-            job_tensor_ids, device=device, dtype=torch.int32
-        ),
+        "job_tensor_ids": torch.tensor(job_tensor_ids, device=device, dtype=torch.int32),
         "job_offsets": torch.tensor(job_offsets, device=device, dtype=torch.int64),
     }
 
@@ -323,9 +322,7 @@ def _apply_segment_reductions(
     """
 
     if not (
-        dist.is_available()
-        and dist.is_initialized()
-        and any(bool(flag) for flag in reduce_flags)
+        dist.is_available() and dist.is_initialized() and any(bool(flag) for flag in reduce_flags)
     ):
         return local_sq
 
@@ -398,14 +395,12 @@ def clip_grad_norm_buckets_(
     """
 
     device = _resolve_device(buckets)
-    ext = _load_fast_clip_extension()
+    ext = _load_fast_clip_extension() if device.type == "cuda" else None
     resolved_chunk_size = _resolve_chunk_size(chunk_size)
     reduce_flags = [1 if bucket.reduce else 0 for bucket in buckets]
 
     # Stage 1 -- local per-bucket squared norm (no collective).
-    local_sq = _segmented_local_sq(
-        buckets, device=device, ext=ext, chunk_size=resolved_chunk_size
-    )
+    local_sq = _segmented_local_sq(buckets, device=device, ext=ext, chunk_size=resolved_chunk_size)
 
     # Stage 2 -- the single, rank-uniform collective.
     global_sq = _apply_segment_reductions(local_sq, reduce_flags, process_group)
@@ -419,14 +414,10 @@ def clip_grad_norm_buckets_(
 
     # Stage 4 -- scale in place (no collective). found_inf never gates this.
     if max_norm is not None:
-        _segmented_scale(
-            buckets, coefs, device=device, ext=ext, chunk_size=resolved_chunk_size
-        )
+        _segmented_scale(buckets, coefs, device=device, ext=ext, chunk_size=resolved_chunk_size)
 
-    # Stage 5 -- stats (single batched D2H).
-    stats = _build_stats(
-        buckets, total_norms, coefs, max_norm=max_norm, fastpath=ext is not None
-    )
+    # Stage 5 -- stats stay on the device; consumers own any host readback.
+    stats = _build_stats(buckets, total_norms, coefs, max_norm=max_norm, fastpath=ext is not None)
     combined_total = torch.linalg.vector_norm(total_norms, 2.0)
     return SegmentedGradClipResult(
         combined_total,
@@ -447,14 +438,19 @@ def try_clip_optimizer_grad_norm_buckets_(
 ) -> SegmentedGradClipResult | None:
     """Fast path for Wall-X style regular/Muon/dedicated-AdamW clipping.
 
-    Returns ``None`` only when the fast-clip CUDA extension is entirely
-    unavailable, letting the caller run its own path.  Extension availability
-    is a property of the install and is therefore uniform across ranks, so this
-    ``None`` decision is rank-consistent and cannot desync collectives.  Once a
-    result is produced, clipping goes through the distributed-safe
-    :func:`clip_grad_norm_buckets_`.
+    Returns ``None`` when the optimizer's communication device is non-CUDA,
+    the CUDA extension is unavailable, or the optimizer does not expose
+    ``_ensure_grads_ready``. The caller can then run its own clipping path.
+    These early returns do not prepare gradients, scale tensors, or issue
+    collectives. Distributed callers must use the same device type, extension
+    availability, and optimizer capabilities on every rank so the fallback
+    decision is consistent. Once a result is produced, clipping goes through
+    the distributed-safe :func:`clip_grad_norm_buckets_`.
     """
 
+    device = getattr(getattr(optimizer, "_comm_ctx", None), "device", None)
+    if device is not None and torch.device(device).type != "cuda":
+        return None
     if _load_fast_clip_extension() is None:
         return None
 

@@ -49,6 +49,26 @@ torchrun --nproc_per_node=4 tests/distributed/test_hsdp_correctness.py
 分布式测试每次约需 2 分钟。先编写小型隔离的单元测试验证逻辑，再使用
 分布式测试环境作为调试循环（参见项目关于冒烟测试的笔记）。
 
+### 原生 Ascend 分布式测试（需要 4 块 NPU）
+
+使用版本匹配的 PyTorch、`torch_npu` 和 CANN 环境，并选择四个可见设备。
+同一个必测入口提供原生 NPU/HCCL 验证：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+    tests/distributed/test_hsdp_correctness.py --device npu \
+    --output-dir /path/to/new-hsdp-proof
+```
+
+该测试使用相同的初始化和输入，在 1D shard-only 与 2x2 HSDP mesh 之间比较
+上游模型和优化器配置。每个 rank 在每次更新后严格检查 loss、完整模型状态与
+优化器状态。HSDP 保存一个标准的 rank-0 检查点，重建模型并恢复该检查点后，
+再检查两次更新。不使用容差或各 rank 的本地状态覆盖。通过
+`--steps 4 --resume-after 2` 可执行每种拓扑四次更新加两次恢复更新，
+共十次优化器调用的冒烟检查。默认验证在每种拓扑执行十次更新，加两次恢复
+更新，共 22 次分布式优化器调用。上面的 CUDA 命令不变。
+
 ### 单测试冒烟验证模式
 
 ```python
@@ -86,6 +106,7 @@ ruff check dmuon/ examples/
 - [ ] 基于 `main` rebase（`git fetch origin && git rebase origin/main`）
 - [ ] 单元测试通过（`pytest tests/unit/`）
 - [ ] 分布式变更：`test_hsdp_correctness.py` 通过
+- [ ] 原生 NPU 变更：四块 NPU 上的 `--device npu` 必测入口通过
 - [ ] 公开 API 变更已更新文档字符串
 - [ ] 行为或 API 接口变更已更新相关文档
 - [ ] **逐比特正确性保持** — 相同随机种子下，1D shard-only、HSDP 和

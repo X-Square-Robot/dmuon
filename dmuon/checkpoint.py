@@ -335,8 +335,7 @@ def _all_gather_fsdp_tensor(
         [local_tensor.shape[0]], dtype=torch.int64, device=local_tensor.device
     )
     all_sizes = [
-        torch.zeros(1, dtype=torch.int64, device=local_tensor.device)
-        for _ in range(world_size)
+        torch.zeros(1, dtype=torch.int64, device=local_tensor.device) for _ in range(world_size)
     ]
     dist.all_gather(all_sizes, local_size, group=dp_group)
     sizes = [s.item() for s in all_sizes]
@@ -361,9 +360,7 @@ def _all_gather_fsdp_tensor(
             )
         padded_shape = list(local_tensor.shape)
         padded_shape[0] = max_size
-        padded = torch.zeros(
-            padded_shape, dtype=local_tensor.dtype, device=local_tensor.device
-        )
+        padded = torch.zeros(padded_shape, dtype=local_tensor.dtype, device=local_tensor.device)
         if local_tensor.shape[0] > 0:
             padded[: local_tensor.shape[0]].copy_(local_tensor)
         gathered = [torch.empty_like(padded) for _ in range(world_size)]
@@ -548,18 +545,14 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
                 )
             continue
         if dp._owned_data is not None:
-            dp._owned_data.copy_(
-                state_dict[fqn].to(device=dp.device, dtype=dp._owned_data.dtype)
-            )
+            dp._owned_data.copy_(state_dict[fqn].to(device=dp.device, dtype=dp._owned_data.dtype))
         # DDP path: sync the live parameter too.
         orig_param = getattr(dp, "_orig_param", None)
-        if (
-            orig_param is not None
-            and getattr(orig_param, "_dedicated_mode", None) in {"ddp", "ddp_tp"}
-        ):
-            orig_param.data.copy_(
-                state_dict[fqn].to(orig_param.dtype).to(orig_param.device)
-            )
+        if orig_param is not None and getattr(orig_param, "_dedicated_mode", None) in {
+            "ddp",
+            "ddp_tp",
+        }:
+            orig_param.data.copy_(state_dict[fqn].to(orig_param.dtype).to(orig_param.device))
 
     # 3. Load symmetric params: manually shard full tensors into FSDP2 DTensors.
     for name, param in model.named_parameters():
@@ -584,9 +577,7 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
                 shard_rank = mesh.get_local_rank(mesh_dim=shard_dim)
                 shard_world = mesh.size(shard_dim)
             full_on_device = full_tensor.to(local.dtype).to(local.device)
-            local.copy_(
-                _padded_local_shard(full_on_device, shard_rank, shard_world, local)
-            )
+            local.copy_(_padded_local_shard(full_on_device, shard_rank, shard_world, local))
         else:
             param.data.copy_(full_tensor.to(param.dtype).to(param.device))
 
@@ -646,9 +637,7 @@ def get_optimizer_state_dict(
         for dp in muon_dps
         if _owns_dedicated_optimizer_state(dp)
     )
-    has_state_tensor = torch.tensor(
-        [int(any_has_state)], device=next(iter(dp_fqns)).device
-    )
+    has_state_tensor = torch.tensor([int(any_has_state)], device=next(iter(dp_fqns)).device)
     dist.all_reduce(has_state_tensor, op=dist.ReduceOp.MAX)
 
     if has_state_tensor.item() > 0:
@@ -663,9 +652,7 @@ def get_optimizer_state_dict(
                 buf = optimizer.state[dp_id]["momentum_buffer"]
             else:
                 buf = None
-            full_buf = _broadcast_state_tensor(
-                buf, dp, cpu_offload=cpu_offload, keep=keep
-            )
+            full_buf = _broadcast_state_tensor(buf, dp, cpu_offload=cpu_offload, keep=keep)
             if keep:
                 dedicated_state[fqn] = {"momentum_buffer": full_buf}
 
@@ -727,11 +714,12 @@ def get_optimizer_state_dict(
         fsdp_entry: dict[str, Any] = {}
         for key, val in state.items():
             if isinstance(val, torch.Tensor) and dp_mesh is not None:
-                gathered = _all_gather_fsdp_tensor(
-                    val, dp_mesh, cpu_offload=cpu_offload, keep=keep
-                )
+                gathered = _all_gather_fsdp_tensor(val, dp_mesh, cpu_offload=cpu_offload, keep=keep)
                 if keep:
                     fsdp_entry[key] = gathered
+            elif isinstance(val, torch.Tensor):
+                if keep:
+                    fsdp_entry[key] = val.cpu() if cpu_offload else val
             else:
                 # Scalar (e.g., step count)
                 if keep:
@@ -742,8 +730,7 @@ def get_optimizer_state_dict(
     # 4. Param group hyperparameters (without tensor refs).
     if keep:
         param_groups = [
-            {k: v for k, v in g.items() if k != "params"}
-            for g in optimizer.param_groups
+            {k: v for k, v in g.items() if k != "params"} for g in optimizer.param_groups
         ]
     else:
         param_groups = []
@@ -756,9 +743,7 @@ def get_optimizer_state_dict(
     }
 
 
-def set_optimizer_state_dict(
-    model: nn.Module, optimizer: Any, state_dict: dict
-) -> None:
+def set_optimizer_state_dict(model: nn.Module, optimizer: Any, state_dict: dict) -> None:
     """Load optimizer state dict into a DMuon Muon optimizer.
 
     Args:
@@ -793,15 +778,10 @@ def set_optimizer_state_dict(
                 opt_state = optimizer.state.setdefault(id(dp), {})
                 if _owns_dedicated_optimizer_state(dp):
                     opt_state["momentum_buffer"] = buf
-                if (
-                    getattr(dp, "tp_group", None) is not None
-                    and dp._owned_data is not None
-                ):
-                    opt_state["tp_local_momentum_buffer"] = (
-                        _tp_local_momentum_from_full(
-                            buf,
-                            dp,
-                        )
+                if getattr(dp, "tp_group", None) is not None and dp._owned_data is not None:
+                    opt_state["tp_local_momentum_buffer"] = _tp_local_momentum_from_full(
+                        buf,
+                        dp,
                     )
 
     # 2. Dedicated AdamW state: restore on local owners.
@@ -866,13 +846,14 @@ def set_optimizer_state_dict(
                         )
                         shard_rank = dp_mesh.get_local_rank(mesh_dim=shard_dim)
                         shard_world = dp_mesh.size(shard_dim)
-                    local_ref = (
-                        p._local_tensor if hasattr(p, "_local_tensor") else p.data
-                    )
+                    local_ref = p._local_tensor if hasattr(p, "_local_tensor") else p.data
                     full_on_device = val.to(local_ref.dtype).to(local_ref.device)
                     opt_state[key] = _padded_local_shard(
                         full_on_device, shard_rank, shard_world, local_ref
                     ).contiguous()
+                elif isinstance(val, torch.Tensor):
+                    # Unsharded AdamW states must follow the live parameter.
+                    opt_state[key] = val.to(device=p.device, dtype=p.dtype)
                 else:
                     opt_state[key] = val
             optimizer.state[p] = opt_state
