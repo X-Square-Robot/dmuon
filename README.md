@@ -17,6 +17,7 @@
 <p align="center">
   <a href="https://x-square-robot.github.io/dmuon/"><img alt="Docs" src="https://img.shields.io/badge/docs-online-4c6ef5"></a>
   <a href="https://pytorch.org/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-FSDP2-EE4C2C?logo=pytorch&logoColor=white"></a>
+  <a href="docs/getting-started/installation.md#ascend-950dt-experimental"><img alt="Ascend 950DT" src="https://img.shields.io/badge/Ascend-950DT-E60012"></a>
   <a href="https://x-square-robot.github.io/dmuon/guides/hsdp/"><img alt="HSDP" src="https://img.shields.io/badge/HSDP-native-6f42c1"></a>
   <a href="https://x-square-robot.github.io/dmuon/guides/tp-support/"><img alt="Tensor Parallel" src="https://img.shields.io/badge/Tensor_Parallel-compatible-blue"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-black"></a>
@@ -41,6 +42,11 @@ into any existing training pipeline in **just 3 lines of code**. Through fine-gr
 tuning, load-balanced work scheduling, and a redesigned distributed communication path, DMuon
 delivers **near-AdamW step time** while keeping Muon's optimization benefits — fully
 plug-and-play, with no changes to your model.
+
+## News
+
+- 2026.10.14
+  - DMuon Ascend is available! Check [DMuon Ascend](docs/getting-started/installation.md#ascend-950dt-experimental) for more details.
 
 ## Install
 

@@ -86,8 +86,32 @@ The compiled artifact is cached in `~/.cache/dmuon/`.
 
 ## Ascend 950DT (experimental)
 
-Install the matching PyTorch and `torch_npu` versions for your CANN release,
-then activate CANN and install the core package:
+DMuon supports native Ascend 950DT execution through `torch_npu` and HCCL.
+Ascend support is part of the same package and shares the optimizer implementation
+and public interfaces with CUDA across DDP, FSDP2, and HSDP.
+
+### Adaptation scope
+
+- **Native runtime:** select devices, streams, events, synchronization, and
+  allocator lifetime handling from the actual tensors and device mesh.
+- **Shared optimizer:** reuse parameter ownership, distributed scheduling,
+  Muon/AdamW mathematics, parameter policies, and gradient clipping.
+- **Gradient accumulation:** preserve microbatch contributions, including sharded
+  AdamW gradients and `no_sync` accumulation with explicit gradient dtypes, and
+  retain asynchronous buffers until their consumers finish.
+- **Checkpoint state:** honor CPU offload for ordinary AdamW tensor states and
+  restore them to the live parameter's device and dtype.
+- **Empty shards:** initialize AdamW state and advance step counters while
+  excluding zero-length shards from foreach kernel launches.
+
+On Ascend, DMuon uses the shared eager PyTorch Newton–Schulz path.
+CUDA-specific SYRK kernels, fast-clip extensions, and CUDA graph replay remain CUDA features.
+
+### Installation
+
+Use Python 3.10 or later and PyTorch 2.6 or later. Choose mutually compatible
+PyTorch, `torch_npu`, and CANN versions for your Ascend environment, then activate
+CANN and install the core package from the repository root:
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -99,9 +123,6 @@ Use `import torch_npu`, `dist.init_process_group("hccl")`, and an
 before calling `dedicate_params`; the DMuon optimizer, parameter policies,
 gradient clipping, and checkpoint APIs use the same interfaces as on CUDA.
 Do not import `torch_npu.contrib.transfer_to_npu` for DMuon.
-
-On Ascend, DMuon uses the shared eager PyTorch Newton–Schulz path.
-CUDA-specific SYRK kernels, fast-clip extensions, and CUDA graph replay remain CUDA features.
 
 ### Native FSDP2 integration
 
@@ -137,8 +158,19 @@ for batch in dataloader:
     optimizer.step()
 ```
 
+### Validation
+
+[PR #19](https://github.com/X-Square-Robot/dmuon/pull/19) records native Ascend
+correctness validation and CUDA regression coverage. The mandatory four-NPU gate
+checks exact loss, full model state, and optimizer state on every rank across a
+1D shard-only mesh and a 2x2 HSDP mesh, followed by continuation from a canonical
+rank-0 disk checkpoint. Additional native checks cover single-device FSDP2/DDP,
+gradient accumulation, asynchronous buffer lifetime, clipping, and rank-local restart.
+
 See the [test instructions](https://github.com/X-Square-Robot/dmuon/blob/main/tests/README.md#ascend-tests-single-npu)
-for single-device and distributed validation commands.
+for single-device and distributed commands, and the
+[contribution guide](../contributing.md#native-ascend-distributed-tests-requires-4-npus)
+for the mandatory native gate.
 
 ---
 
