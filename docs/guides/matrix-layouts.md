@@ -228,28 +228,35 @@ and layout restoration share the broadcast stream. Copies and communication
 may overlap with other work, so their accumulated kernel times do not equal
 their contribution to whole-step time.
 
-### Build and choose the copy backend {#build-and-backends}
+### Installation and defaults {#build-and-backends}
 
-Build in an environment with an installed CUDA-enabled PyTorch and toolkit:
+With CUDA-enabled PyTorch and a CUDA toolkit installed, the layout-copy
+extension builds by default alongside the other optional CUDA extensions.
+Use the normal installation command; no build environment variable is needed:
 
 ```bash
-DMUON_BUILD_LAYOUT_COPY=1 pip install -e . --no-build-isolation
+pip install -e . --no-build-isolation
 ```
 
-The layout-copy extension can be disabled independently with
-`DMUON_BUILD_LAYOUT_COPY=0`. The optional fast-clip extension has its own
-`DMUON_BUILD_FAST_CLIP` switch.
+CUDA is selected automatically for supported FP32, FP16, and BF16 copies when
+the extension is available; otherwise DMuon uses the Torch reference path.
+No backend setting is required for normal training.
 
-| Setting | Meaning |
-|---|---|
-| `DMUON_COPY_BACKEND=auto` | Default: use the CUDA extension for eligible tasks when available; otherwise use the Torch reference. |
-| `DMUON_COPY_BACKEND=torch` | Use the reference copy path for comparison or debugging. |
-| `DMUON_COPY_BACKEND=cuda` | Require the optional CUDA path; raise an error when it is unavailable. |
-| `DMUON_COPY_MAX_CTAS=96` | Default maximum blocks per copy launch; also capped by the device SM count and available tiles. |
+Only set `DMUON_BUILD_LAYOUT_COPY=0` when you explicitly want to disable this
+extension. This does not disable the separate fast-clip extension.
 
-The CUDA copy path supports FP32, FP16, and BF16. The CTA budget limits a copy
-launch; it does not reserve SMs or cap all communication kernels. The default
-was selected on a 132-SM device and can be adjusted for other workloads.
+??? info "Advanced: comparison and performance debugging"
+
+    | Setting | Meaning |
+    |---|---|
+    | `DMUON_COPY_BACKEND=auto` | Default automatic selection described above. |
+    | `DMUON_COPY_BACKEND=torch` | Force the reference path for comparison or debugging. |
+    | `DMUON_COPY_BACKEND=cuda` | Require the CUDA path; raise an error when unavailable. |
+    | `DMUON_COPY_MAX_CTAS=96` | Default maximum blocks per copy launch; also capped by the device SM count and available tiles. |
+
+    The CTA budget limits a copy launch; it does not reserve SMs or cap all
+    communication kernels. The default was selected on a 132-SM device and can
+    be adjusted for other workloads.
 
 ## Scope and checkpoints {#scope-and-checkpoints}
 
