@@ -12,6 +12,7 @@ from torch import nn
 import torch.distributed as dist
 
 from dmuon._core.internal_utils import alloc_storage, free_storage, unsafe_setattr_param
+from dmuon._core.device import get_device_module
 from dmuon._core.layout_copy import CopyExecutor, CopyTask
 from dmuon.matrix_layout import matrix_state_key
 from .param import DedicatedParam
@@ -223,8 +224,10 @@ class MatrixParamGroup:
             if parameter.grad is None:
                 continue
             gradient = parameter.grad
-            if gradient.is_cuda:
-                gradient.record_stream(torch.cuda.current_stream(gradient.device))
+            if gradient.device.type != "cpu":
+                gradient.record_stream(
+                    get_device_module(gradient.device).current_stream(gradient.device)
+                )
             for unit, mapping in zip(units, parent.layout.copy_maps):
                 target, spec = unit._unsharded_param, unit.matrix_spec
                 if not target.requires_grad:

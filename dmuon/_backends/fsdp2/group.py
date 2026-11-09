@@ -304,8 +304,10 @@ def _get_grad_for_reduce(
         grad = p._accumulated_grad
     else:
         grad = p.local_grad_for_reduce(raw_grad.data)
-        if grad.is_cuda:
-            grad.record_stream(torch.cuda.current_stream(grad.device))
+        if grad.device.type != "cpu":
+            # clone/cast below may read a compute-stream allocation from the
+            # reduce stream. Track that reader on CUDA and native NPU alike.
+            grad.record_stream(get_device_module(grad.device).current_stream(grad.device))
         if p._grad_dtype is not None and grad.dtype != p._grad_dtype:
             grad = grad.to(p._grad_dtype)
         elif copy_borrowed and not getattr(p, "_layout_grad_owned", False):
