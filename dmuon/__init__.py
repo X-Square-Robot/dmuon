@@ -50,6 +50,7 @@ from .fast_clip import (
 )
 from .diagnostics import summarize_comm_plan, summarize_param_groups
 from .policy import DMuonParamPolicy
+from .matrix_layout import MatrixLayout
 from .optim import (
     POLAR_EXPRESS_COEFFICIENTS,
     YOU_COEFFICIENTS,
@@ -95,6 +96,7 @@ __all__ = [
     "get_owned_params",
     "DedicatedCommContext",
     "DMuonParamPolicy",
+    "MatrixLayout",
     "clip_grad_norm_",
     "clip_grad_norm_buckets_",
     "try_clip_optimizer_grad_norm_buckets_",

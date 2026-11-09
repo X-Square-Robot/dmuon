@@ -254,7 +254,10 @@ def _iter_muon_grad_entries(optimizer: Any):
             is_tp_full_grad = False
         if grad is None:
             continue
-        name = str(getattr(dp, "param_name", f"dedicated_param_{idx}"))
+        name = str(
+            getattr(dp, "_checkpoint_key", None)
+            or getattr(dp, "param_name", f"dedicated_param_{idx}")
+        )
         yield MuonGradClipEntry(
             name=name,
             grad=grad,

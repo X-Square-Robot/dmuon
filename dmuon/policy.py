@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
+from fnmatch import fnmatchcase
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 import torch
 import torch.nn as nn
+from .matrix_layout import MatrixLayout
 
 
 PolicyLike = Mapping[str, Any] | "DMuonParamPolicy"
@@ -49,6 +51,7 @@ _POLICY_FIELDS = {
     "master_dtype",
     "optim_dtype",
     "muon_forward_unshard",
+    "matrix_layout",
 }
 
 _DTYPE_FIELDS = {
@@ -79,6 +82,7 @@ class DMuonParamPolicy:
     master_dtype: Optional[torch.dtype] = torch.float32
     optim_dtype: Optional[torch.dtype] = torch.float32
     muon_forward_unshard: Optional[str] = None
+    matrix_layout: Optional[MatrixLayout] = None
     matched_overrides: tuple[int, ...] = ()
 
 
@@ -89,8 +93,7 @@ def normalize_route(route: Optional[str]) -> Optional[str]:
     route = _ROUTE_ALIASES.get(route, route)
     if route not in {"muon", "adamw", "sharded_adamw"}:
         raise ValueError(
-            "DMuon route must be one of 'muon', 'adamw', or "
-            f"'sharded_adamw', got {route!r}"
+            "DMuon route must be one of 'muon', 'adamw', or " f"'sharded_adamw', got {route!r}"
         )
     return route
 
@@ -121,6 +124,10 @@ def _normalize_policy_values(values: Mapping[str, Any], *, source: str) -> dict[
             normalized[key] = bool(value)
         elif key == "muon_forward_unshard":
             normalized[key] = None if value is None else str(value).strip().lower()
+        elif key == "matrix_layout":
+            if value is not None and not isinstance(value, MatrixLayout):
+                raise TypeError("matrix_layout must be a MatrixLayout or None")
+            normalized[key] = value
         else:
             normalized[key] = value
     return normalized
@@ -147,7 +154,9 @@ def _coerce_policy(policy: Optional[PolicyLike], *, source: str) -> DMuonParamPo
     return DMuonParamPolicy(**values)
 
 
-def _apply_policy(base: DMuonParamPolicy, override: Mapping[str, Any], *, source: str) -> DMuonParamPolicy:
+def _apply_policy(
+    base: DMuonParamPolicy, override: Mapping[str, Any], *, source: str
+) -> DMuonParamPolicy:
     values = _normalize_policy_values(override, source=source)
     return replace(base, **values)
 
@@ -163,10 +172,15 @@ def _tokens(value: Any) -> tuple[str, ...]:
 
 
 def _override_matches(param_fqn: str, override: Mapping[str, Any]) -> bool:
+    if "name_glob" in override:
+        if "name" in override or "contains" in override:
+            raise ValueError("Use name_glob or legacy name/contains, not both")
+        patterns = _tokens(override["name_glob"])
+        if not patterns:
+            raise ValueError("name_glob requires a nonempty pattern")
+        return any(fnmatchcase(param_fqn, pattern) for pattern in patterns)
     if "name" in override and "contains" in override:
-        raise ValueError(
-            "param_policy override accepts either 'name' or 'contains', not both"
-        )
+        raise ValueError("param_policy override accepts either 'name' or 'contains', not both")
     contains = _tokens(override.get("name", override.get("contains")))
     if not contains:
         return True
@@ -219,14 +233,22 @@ def resolve_param_policies(
         for idx, override in enumerate(raw_overrides):
             if not isinstance(override, Mapping):
                 raise TypeError(f"param_policy.overrides[{idx}] must be a mapping")
-            unknown = set(override) - {"name", "contains", "set"}
+            unknown = set(override) - {"name", "contains", "name_glob", "set"} - _POLICY_FIELDS
             if unknown:
                 raise ValueError(
                     f"param_policy.overrides[{idx}] has unknown selector field(s): "
                     f"{sorted(unknown)}"
                 )
             if "set" not in override:
-                raise ValueError(f"param_policy.overrides[{idx}] is missing required 'set'")
+                values = {key: override[key] for key in _POLICY_FIELDS if key in override}
+                if not values:
+                    raise ValueError(f"param_policy.overrides[{idx}] is missing required 'set'")
+                override = {
+                    key: value for key, value in override.items() if key not in _POLICY_FIELDS
+                }
+                override = {**override, "set": values}
+            elif any(key in override for key in _POLICY_FIELDS):
+                raise ValueError("Use inline policy fields or 'set', not both")
             if not isinstance(override["set"], Mapping):
                 raise TypeError(f"param_policy.overrides[{idx}]['set'] must be a mapping")
             overrides.append(override)

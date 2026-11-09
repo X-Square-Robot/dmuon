@@ -24,6 +24,7 @@ except ImportError:  # Older PyTorch exposes DeviceMesh only from this module.
     from torch.distributed.device_mesh import DeviceMesh
 
 from .tp import get_tp_mesh, is_tp_sharded
+from ..matrix_layout import CompiledMatrixLayout, LogicalMatrix
 
 try:
     from torch.distributed.tensor import DTensor
@@ -49,7 +50,8 @@ class AssignmentResult:
     at hook registration time.
 
     For pre-refactor compatibility the object also behaves as a read-only
-    dict over ``dp_owners`` — legacy callers that did
+    dict over normal parameter keys and, when configured, LogicalMatrix keys.
+    Without explicit layouts, legacy callers that did
     ``assignment[p] / p in assignment / assignment.values()`` keep
     working without touching their sites.
     """
@@ -71,34 +73,43 @@ class AssignmentResult:
     pack_small_params: bool = True
     """Whether small same-layer parameters were packed before assignment."""
 
-    # ---- dict-like delegation over dp_owners (back-compat) ----
+    matrix_owners: dict[LogicalMatrix, OwnerValue] = field(default_factory=dict)
+    """Independent owners for explicitly configured logical matrices."""
+
+    # Normal parameters keep the legacy keys; split parameters have explicit
+    # LogicalMatrix keys because their parent has no single owner.
+
+    def _owners(self):
+        return (
+            self.dp_owners if not self.matrix_owners else {**self.dp_owners, **self.matrix_owners}
+        )
 
     def __getitem__(self, key):  # type: ignore[override]
-        return self.dp_owners[key]
+        return self._owners()[key]
 
     def __contains__(self, key) -> bool:
-        return key in self.dp_owners
+        return key in self.dp_owners or key in self.matrix_owners
 
     def __iter__(self):
-        return iter(self.dp_owners)
+        return iter(self._owners())
 
     def __len__(self) -> int:
-        return len(self.dp_owners)
+        return len(self.dp_owners) + len(self.matrix_owners)
 
     def __bool__(self) -> bool:
-        return bool(self.dp_owners)
+        return bool(self.dp_owners or self.matrix_owners)
 
     def keys(self):
-        return self.dp_owners.keys()
+        return self._owners().keys()
 
     def values(self):
-        return self.dp_owners.values()
+        return self._owners().values()
 
     def items(self):
-        return self.dp_owners.items()
+        return self._owners().items()
 
     def get(self, key, default=None):
-        return self.dp_owners.get(key, default)
+        return self._owners().get(key, default)
 
 
 def _extract_layer_id(param_name: str) -> Optional[str]:
@@ -222,6 +233,7 @@ def compute_balanced_assignment(
     owner_cost_model: OwnerCostModel = "optimizer",
     hsdp_column_balance: bool = True,
     pack_small_params: bool = True,
+    matrix_layouts: Optional[dict[nn.Parameter, CompiledMatrixLayout]] = None,
 ) -> AssignmentResult:
     """Compute a globally balanced dedicated ownership assignment.
 
@@ -280,9 +292,7 @@ def compute_balanced_assignment(
     shard_size = mesh.size()
     replicate_size = replicate_mesh.size() if replicate_mesh is not None else 1
     is_hsdp = replicate_mesh is not None
-    slots: list[OwnerCoord] = [
-        (s, r) for s in range(shard_size) for r in range(replicate_size)
-    ]
+    slots: list[OwnerCoord] = [(s, r) for s in range(shard_size) for r in range(replicate_size)]
 
     if owner_strategy not in {"lpt", "round_robin", "rank0"}:
         raise ValueError(
@@ -312,9 +322,7 @@ def compute_balanced_assignment(
     # Collect candidates grouped by layer
     param_names: dict[nn.Parameter, str] = {}
     param_order: dict[nn.Parameter, int] = {}
-    layer_params: dict[Optional[str], list[tuple[nn.Parameter, str, int, int]]] = (
-        defaultdict(list)
-    )
+    layer_params: dict[Optional[str], list[tuple[nn.Parameter, str, int, int]]] = defaultdict(list)
     for order, (name, param) in enumerate(model.named_parameters()):
         if predicate(name, param):
             param_names[param] = name
@@ -325,11 +333,25 @@ def compute_balanced_assignment(
                 else _extract_layer_id(name)
             )
             tp_sharded = is_tp_sharded(param, dp_mesh_dim_names)
+            layout = (matrix_layouts or {}).get(param)
+            if layout is not None:
+                if tp_sharded:
+                    raise ValueError("Explicit matrix layouts do not yet support TP")
+                for spec in layout.matrices:
+                    matrix = LogicalMatrix(param, name, layout, spec)
+                    param_names[matrix] = f"{name}::matrix[{spec.index}]"
+                    param_order[matrix] = order
+                    numel = matrix.numel()
+                    cost = (
+                        numel
+                        if owner_cost_model == "numel"
+                        else _matrix_optimizer_cost_units("", matrix)
+                    )
+                    layer_params[layer_id].append((matrix, name, numel, cost))
+                continue
             numel = _param_logical_numel(param) if tp_sharded else _param_numel(param)
             cost = (
-                numel
-                if owner_cost_model == "numel"
-                else _matrix_optimizer_cost_units(name, param)
+                numel if owner_cost_model == "numel" else _matrix_optimizer_cost_units(name, param)
             )
             layer_params[layer_id].append((param, name, numel, cost))
 
@@ -345,20 +367,17 @@ def compute_balanced_assignment(
                 alloc_units.append(([p], layer_id, s, c))
             continue
 
-        tp_params = [
-            (p, n, s, c) for p, n, s, c in params if is_tp_sharded(p, dp_mesh_dim_names)
-        ]
+        matrices = [entry for entry in params if isinstance(entry[0], LogicalMatrix)]
+        params = [entry for entry in params if not isinstance(entry[0], LogicalMatrix)]
+        for matrix, _name, size, cost in matrices:
+            alloc_units.append(([matrix], layer_id, size, cost))
+
+        tp_params = [(p, n, s, c) for p, n, s, c in params if is_tp_sharded(p, dp_mesh_dim_names)]
         non_tp_params = [
-            (p, n, s, c)
-            for p, n, s, c in params
-            if not is_tp_sharded(p, dp_mesh_dim_names)
+            (p, n, s, c) for p, n, s, c in params if not is_tp_sharded(p, dp_mesh_dim_names)
         ]
-        small = [
-            (p, n, s, c) for p, n, s, c in non_tp_params if s < SMALL_PARAM_THRESHOLD
-        ]
-        large = [
-            (p, n, s, c) for p, n, s, c in non_tp_params if s >= SMALL_PARAM_THRESHOLD
-        ]
+        small = [(p, n, s, c) for p, n, s, c in non_tp_params if s < SMALL_PARAM_THRESHOLD]
+        large = [(p, n, s, c) for p, n, s, c in non_tp_params if s >= SMALL_PARAM_THRESHOLD]
 
         for p, _n, s, c in tp_params:
             # TP-sharded params stay standalone.  A mixed packed allocation
@@ -430,17 +449,9 @@ def compute_balanced_assignment(
                 candidate_slots,
                 key=lambda s: (
                     s in used_slots,
-                    (
-                        shard_column_cost_loads[s[0]]
-                        if is_hsdp and hsdp_column_balance
-                        else 0
-                    ),
+                    (shard_column_cost_loads[s[0]] if is_hsdp and hsdp_column_balance else 0),
                     rank_cost_loads[s],
-                    (
-                        shard_column_loads[s[0]]
-                        if is_hsdp and hsdp_column_balance
-                        else 0
-                    ),
+                    (shard_column_loads[s[0]] if is_hsdp and hsdp_column_balance else 0),
                     rank_loads[s],
                 ),
             )
@@ -454,6 +465,15 @@ def compute_balanced_assignment(
 
     # Preserve 1D dp_owners shape when no replicate mesh is configured, so
     # existing call sites, tests and checkpoints continue to see plain ints.
+    matrix_assignment = {
+        key: owner for key, owner in assignment.items() if isinstance(key, LogicalMatrix)
+    }
+    assignment = {
+        key: owner for key, owner in assignment.items() if not isinstance(key, LogicalMatrix)
+    }
+    matrix_owners = {
+        key: owner if is_hsdp else owner[0] for key, owner in matrix_assignment.items()
+    }
     dp_owners: dict[nn.Parameter, OwnerValue]
     if not is_hsdp:
         dp_owners = {p: coord[0] for p, coord in assignment.items()}
@@ -515,6 +535,7 @@ def compute_balanced_assignment(
     return AssignmentResult(
         dp_owners=dp_owners,
         tp_owners=tp_owners,
+        matrix_owners=matrix_owners,
         allocation_unit_count=len(alloc_units),
         packed_allocation_unit_count=packed_allocation_unit_count,
         pack_small_params=pack_small_params,

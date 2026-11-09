@@ -2,6 +2,8 @@
 
 import logging
 import os
+import hashlib
+import json
 from collections import defaultdict
 from typing import Callable, Mapping, Optional
 
@@ -19,7 +21,7 @@ from ._core.comm import DedicatedCommContext
 from ._core.device import current_device
 from ._core.internal_utils import unsafe_setattr_param
 from ._core.owner_rank import normalize_owner_rank
-from ._core.partition import _extract_layer_id, compute_balanced_assignment
+from ._core.partition import AssignmentResult, _extract_layer_id, compute_balanced_assignment
 from ._core.process_groups import (
     maybe_isolate_process_group,
     resolve_process_group_policy,
@@ -27,8 +29,57 @@ from ._core.process_groups import (
 from ._core.state import DedicatedState
 from ._core.tp import is_tp_sharded
 from .policy import ParamPolicyFn, resolve_param_policies
+from .matrix_layout import LogicalMatrix
+from ._backends.fsdp2.matrix_group import DedicatedMatrix, PartitionedParameter
 
 logger = logging.getLogger(__name__)
+
+
+def _check_matrix_errors(mesh, replicate_mesh, error):
+    """Propagate invalid local geometry before peers enter plan collectives."""
+    if not torch.distributed.is_initialized():
+        if error is not None:
+            raise error
+        return
+    messages = [str(error)] if error is not None else []
+    for dimension in (mesh, replicate_mesh):
+        if dimension is None:
+            continue
+        group = dimension.get_group()
+        gathered = [None] * group.size()
+        torch.distributed.all_gather_object(gathered, messages, group=group)
+        messages = sorted({message for peer in gathered for message in peer})
+    if messages:
+        raise ValueError("Invalid matrix_layout: " + "; ".join(messages))
+
+
+def _check_matrix_plan(mesh, replicate_mesh, selected, policies, layouts, result):
+    """Agree on geometry/owners before installing a potentially different plan."""
+    if not torch.distributed.is_initialized():
+        return
+    records = [
+        (
+            name,
+            tuple(p.shape),
+            str(p.dtype),
+            str(policies[p]),
+            layouts[p].state() if p in layouts else None,
+        )
+        for p, name in selected.items()
+    ]
+    owners = [(selected[p], None, owner) for p, owner in result.dp_owners.items()]
+    owners.extend((key.fqn, key.matrix.index, owner) for key, owner in result.matrix_owners.items())
+    digest = hashlib.sha256(json.dumps((records, owners), sort_keys=True).encode()).hexdigest()
+    mismatch = False
+    for dimension in (mesh, replicate_mesh):
+        if dimension is None:
+            continue
+        group = dimension.get_group()
+        gathered = [None] * group.size()
+        torch.distributed.all_gather_object(gathered, (digest, mismatch), group=group)
+        mismatch = mismatch or any(value[0] != digest or value[1] for value in gathered)
+    if mismatch:
+        raise RuntimeError("DMuon matrix layout or owner plan differs across ranks")
 
 
 def _find_parent_module(model: nn.Module, target_param: nn.Parameter) -> tuple[nn.Module, str]:
@@ -53,7 +104,7 @@ def _find_parent_modules(
 
     parents: list[tuple[nn.Module, str]] = []
     for _module_name, module in model.named_modules():
-        for param_name, param in module.named_parameters(recurse=False):
+        for param_name, param in module.named_parameters(recurse=False, remove_duplicate=False):
             if param is target_param:
                 parents.append((module, param_name))
     if not parents:
@@ -401,7 +452,7 @@ def dedicate_params(
     param_policy: Optional[Mapping[str, object]] = None,
     param_policy_fn: Optional[ParamPolicyFn] = None,
     process_group_policy: Optional[str] = None,
-) -> dict[nn.Parameter, int]:
+) -> dict | AssignmentResult:
     """Mark parameters for dedicated ownership and register communication hooks.
 
     Parameters satisfying ``predicate`` are assigned to owner ranks via a
@@ -514,10 +565,17 @@ def dedicate_params(
             optimizer/publish work.
         param_policy: Optional structured per-parameter policy. The policy starts
             from ``defaults`` and applies ordered ``overrides`` whose
-            ``name`` tokens match the full parameter name. Supported fields
+            ``name`` tokens match substrings of the full parameter name, or
+            ``name_glob`` patterns match the full FQN with case-sensitive glob
+            semantics. Overrides accept inline policy fields or the existing
+            ``set`` mapping. Supported fields
             include ``route``, ``param_dtype``, ``grad_dtype``, ``output_dtype``,
             ``cast_forward_inputs``, ``master_dtype``, ``optim_dtype``, and
-            ``muon_forward_unshard``. Prefer this over ``route_hint_fn`` for pure
+            ``muon_forward_unshard``, and ``matrix_layout``. A MatrixLayout
+            declares logical 2D Muon update units while preserving the original
+            model's modules, FQNs, and compute parameter shape. Explicit layouts
+            currently require materialized contiguous non-TP parameters and
+            owner-broadcast forward placement. Prefer this over ``route_hint_fn`` for pure
             DMuon integrations that need mixed precision policy.
         param_policy_fn: Optional ``(param_fqn, param) -> policy`` callable for
             dynamic policy decisions. Mutually exclusive with ``param_policy``.
@@ -534,11 +592,12 @@ def dedicate_params(
         mode).  TP owner selection is **not** returned — it is intrinsic
         to each DTensor's TP group and resolved at hook-registration time
         (``DedicatedParam.is_tp_owner``).
+        With explicit layouts, returns AssignmentResult: ``dp_owners`` contains
+        ordinary parameters and ``matrix_owners`` contains LogicalMatrix keys
+        with ``fqn``, ``matrix`` (index/offset/shape), and ``layout`` metadata.
+        There is no single owner entry for a partitioned parent parameter.
     """
-    # 1. Compute balanced assignment (DP LPT + TP owner pass; the result
-    #    carries ``dp_owners`` with the same int / tuple shape as pre-TP
-    #    code plus a sparse ``tp_owners`` dict populated only for the
-    #    subset of params that are TP-sharded DTensors).
+    # Resolve user policy before owner planning: layout determines the update units.
     owner_strategy = _resolve_owner_strategy(owner_strategy)
     owner_cost_model = _resolve_owner_cost_model(owner_cost_model)
     process_group_policy = resolve_process_group_policy(process_group_policy)
@@ -548,10 +607,57 @@ def dedicate_params(
         else bool(hsdp_column_balance)
     )
     pack_small_params = _resolve_owner_pack_small_params(pack_small_params)
+    selected = {p: name for name, p in model.named_parameters() if predicate(name, p)}
+    policies = resolve_param_policies(
+        params=selected,
+        param_to_fqn=selected,
+        compute_dtype=compute_dtype,
+        route_hint_fn=route_hint_fn,
+        param_policy=param_policy,
+        param_policy_fn=param_policy_fn,
+        default_muon_forward_unshard=muon_forward_unshard,
+    )
+    dp_names = set(mesh.mesh_dim_names or ())
+    if replicate_mesh is not None:
+        dp_names.update(replicate_mesh.mesh_dim_names or ())
+    dp_mesh_dim_names = frozenset(dp_names)
+    layouts = {}
+    layout_error = None
+    try:
+        for param, policy in policies.items():
+            if policy.matrix_layout is None:
+                continue
+            if policy.route not in (None, "muon"):
+                raise ValueError(f"{selected[param]}: matrix_layout requires the Muon route")
+            if not param.is_floating_point():
+                raise ValueError("matrix_layout requires real floating-point parameters")
+            if hasattr(param, "_local_tensor"):
+                raise ValueError(
+                    "Explicit matrix layouts must be configured before TP/DTensor placement"
+                )
+            if param.is_meta:
+                raise ValueError(
+                    "Materialize or load original parameters before applying matrix_layout"
+                )
+            if not param.is_contiguous():
+                raise ValueError(
+                    "Explicit matrix layouts currently require contiguous source parameters"
+                )
+            if (policy.muon_forward_unshard or muon_forward_unshard) != "broadcast":
+                raise ValueError(
+                    "Explicit matrix layouts currently require owner-broadcast placement"
+                )
+            layouts[param] = policy.matrix_layout.compile(tuple(param.shape))
+    except (TypeError, ValueError) as error:
+        layout_error = error
+    if param_policy is not None or param_policy_fn is not None:
+        _check_matrix_errors(mesh, replicate_mesh, layout_error)
+    elif layout_error is not None:
+        raise layout_error
     result = compute_balanced_assignment(
         model,
         mesh,
-        predicate,
+        lambda _name, p: p in selected,
         replicate_mesh=replicate_mesh,
         owner_strategy=owner_strategy,
         assignment_group_key_fn=assignment_group_key_fn,
@@ -559,26 +665,32 @@ def dedicate_params(
         owner_cost_model=owner_cost_model,
         hsdp_column_balance=hsdp_column_balance,
         pack_small_params=pack_small_params,
+        matrix_layouts=layouts,
     )
     assignment = result.dp_owners
-    if not assignment:
+    entries = [*assignment.items(), *result.matrix_owners.items()]
+    if param_policy is not None or param_policy_fn is not None:
+        _check_matrix_plan(mesh, replicate_mesh, selected, policies, layouts, result)
+    if not entries:
         logger.warning("dedicate_params: no parameters matched the predicate")
         return assignment
-
-    dp_names: set[str] = set()
-    if mesh.mesh_dim_names:
-        dp_names |= set(mesh.mesh_dim_names)
-    if replicate_mesh is not None and replicate_mesh.mesh_dim_names:
-        dp_names |= set(replicate_mesh.mesh_dim_names)
-    dp_mesh_dim_names = frozenset(dp_names)
-
-    # Normalize every assignment value to a 2D ``(shard, replicate)`` coord.
-    # In shard-only mode (``replicate_mesh is None``) partition.py returns
-    # ints, which get promoted to ``(int, 0)`` — identical behaviour to
-    # pre-Phase-A code paths.
-    normalized: dict[nn.Parameter, tuple[int, int]] = {
-        param: normalize_owner_rank(owner) for param, owner in assignment.items()
-    }
+    normalized = {key: normalize_owner_rank(owner) for key, owner in entries}
+    # Resolve all original model boundaries before replacing any attributes.
+    aliases_by_param = {p: _find_parent_modules(model, p) for p in selected}
+    boundaries = {}
+    for param, aliases in aliases_by_param.items():
+        if len(aliases) > 1 and reshard_after_forward:
+            boundary = _lowest_common_ancestor_module(model, [m for m, _n in aliases])
+        else:
+            boundary = _resolve_hook_module(
+                model,
+                param,
+                param_fqn=selected[param],
+                hook_boundary_predicate=hook_boundary_predicate,
+                hook_boundary_resolver=hook_boundary_resolver,
+                strict=hook_boundary_strict,
+            )
+        boundaries[param] = boundary
 
     # Log assignment summary
     shard_size = mesh.size()
@@ -608,8 +720,8 @@ def dedicate_params(
     )
 
     # 2. Mark parameters
-    for param, coord in normalized.items():
-        param._dedicated_owner_rank = coord
+    for param in selected:
+        param._dedicated_owner_rank = None if param in layouts else normalized[param]
 
     # 3. Create shared communication context
     dp_group = maybe_isolate_process_group(
@@ -635,79 +747,81 @@ def dedicate_params(
     layer_to_dparams: dict[tuple[nn.Module, tuple[object, ...]], list[DedicatedParam]] = (
         defaultdict(list)
     )
-    param_to_fqn = {param: name for name, param in model.named_parameters()}
-    policies = resolve_param_policies(
-        params=normalized.keys(),
-        param_to_fqn=param_to_fqn,
-        compute_dtype=compute_dtype,
-        route_hint_fn=route_hint_fn,
-        param_policy=param_policy,
-        param_policy_fn=param_policy_fn,
-        default_muon_forward_unshard=muon_forward_unshard,
-    )
+    param_to_fqn = selected
+    parents = {}
 
-    for param, coord in normalized.items():
-        policy = policies[param]
-        parent_modules = _find_parent_modules(model, param)
-        parent_module, param_name = parent_modules[0]
-        if len(parent_modules) > 1 and reshard_after_forward:
-            layer_module = _lowest_common_ancestor_module(
-                model, [module for module, _name in parent_modules]
-            )
-        else:
-            layer_module = _resolve_hook_module(
-                model,
-                param,
-                param_fqn=param_to_fqn[param],
-                hook_boundary_predicate=hook_boundary_predicate,
-                hook_boundary_resolver=hook_boundary_resolver,
-                strict=hook_boundary_strict,
-            )
-        if is_tp_sharded(param, dp_mesh_dim_names) and param not in result.tp_owners:
-            raise RuntimeError(
-                f"{param_name}: TP-sharded dedicated parameter is missing "
-                "from AssignmentResult.tp_owners"
-            )
-        tp_group = None
-        if is_tp_sharded(param, dp_mesh_dim_names):
-            source_tp_group = _param_tp_group(param)
-            if source_tp_group is None:
-                raise RuntimeError(
-                    f"{param_to_fqn[param]}: TP-sharded dedicated parameter "
-                    "has no DTensor TP process group"
-                )
-            tp_group = maybe_isolate_process_group(
-                source_tp_group,
-                policy=process_group_policy,
-                role="fsdp2.tp",
-            )
-        d_param = DedicatedParam(
-            param=param,
-            module=parent_module,
-            param_name=param_name,
-            owner_rank=coord,
-            dp_group=dp_group,
-            device=device,
-            compute_dtype=policy.param_dtype,
-            param_dtype=policy.param_dtype,
-            grad_dtype=policy.grad_dtype,
-            output_dtype=policy.output_dtype,
-            cast_forward_inputs=policy.cast_forward_inputs,
-            master_dtype=policy.master_dtype,
-            optim_dtype=policy.optim_dtype,
-            replicate_group=replicate_group,
-            tp_owner_local_rank=(result.tp_owners[param] if param in result.tp_owners else 0),
-            tp_group=tp_group,
-            route_hint=policy.route,
-            muon_forward_unshard=policy.muon_forward_unshard or muon_forward_unshard,
+    # Initialize one original parameter at a time, packing each source once.
+    # In particular, do not materialize a full reordered tensor per NS matrix.
+    by_source = defaultdict(list)
+    for key, coord in normalized.items():
+        source_param = key.source if isinstance(key, LogicalMatrix) else key
+        by_source[source_param].append((key, coord))
+    for source_param, source_entries in by_source.items():
+        initial_matrices = (
+            layouts[source_param].pack(source_param.detach()) if source_param in layouts else None
         )
-        d_param._dmuon_policy = policy
-        aliases = [(module, name) for module, name in parent_modules[1:]]
-        if aliases:
-            d_param._alias_modules = aliases
-            for alias_module, alias_name in aliases:
-                unsafe_setattr_param(alias_module, alias_name, d_param._placeholder)
-        layer_to_dparams[(layer_module, _policy_group_key(d_param))].append(d_param)
+        for key, coord in source_entries:
+            param = key.source if isinstance(key, LogicalMatrix) else key
+            policy = policies[param]
+            parent_modules = aliases_by_param[param]
+            parent_module, param_name = parent_modules[0]
+            layer_module = boundaries[param]
+            if is_tp_sharded(param, dp_mesh_dim_names) and param not in result.tp_owners:
+                raise RuntimeError(
+                    f"{param_name}: TP-sharded dedicated parameter is missing "
+                    "from AssignmentResult.tp_owners"
+                )
+            tp_group = None
+            if is_tp_sharded(param, dp_mesh_dim_names):
+                source_tp_group = _param_tp_group(param)
+                if source_tp_group is None:
+                    raise RuntimeError(
+                        f"{param_to_fqn[param]}: TP-sharded dedicated parameter "
+                        "has no DTensor TP process group"
+                    )
+                tp_group = maybe_isolate_process_group(
+                    source_tp_group,
+                    policy=process_group_policy,
+                    role="fsdp2.tp",
+                )
+            kwargs = dict(
+                owner_rank=coord,
+                dp_group=dp_group,
+                device=device,
+                compute_dtype=policy.param_dtype,
+                param_dtype=policy.param_dtype,
+                grad_dtype=policy.grad_dtype,
+                output_dtype=policy.output_dtype,
+                cast_forward_inputs=policy.cast_forward_inputs,
+                master_dtype=policy.master_dtype,
+                optim_dtype=policy.optim_dtype,
+                replicate_group=replicate_group,
+                tp_owner_local_rank=result.tp_owners.get(param, 0),
+                tp_group=tp_group,
+                route_hint=policy.route,
+                muon_forward_unshard=policy.muon_forward_unshard or muon_forward_unshard,
+            )
+            if isinstance(key, LogicalMatrix):
+                if param not in parents:
+                    parents[param] = PartitionedParameter(
+                        param, selected[param], layouts[param], parent_modules, device
+                    )
+                spec = key.matrix
+                source = initial_matrices[spec.offset : spec.offset + spec.numel].view(spec.shape)
+                d_param = DedicatedMatrix(source, parents[param], spec, **kwargs)
+            else:
+                d_param = DedicatedParam(
+                    param=param, module=parent_module, param_name=param_name, **kwargs
+                )
+                aliases = parent_modules[1:]
+                if aliases:
+                    d_param._alias_modules = aliases
+                    for alias_module, alias_name in aliases:
+                        unsafe_setattr_param(alias_module, alias_name, d_param._placeholder)
+            d_param._dmuon_policy = policy
+            layer_to_dparams[(layer_module, _policy_group_key(d_param))].append(d_param)
+
+        del initial_matrices
 
     all_states: list[DedicatedState] = []
     module_fqns = {id(module): name or "<root>" for name, module in model.named_modules()}
@@ -730,7 +844,7 @@ def dedicate_params(
     # Store comm_ctx on model for external access (e.g., reset in training loop)
     model._dedicated_comm_ctx = comm_ctx
 
-    return assignment
+    return result if result.matrix_owners else assignment
 
 
 def dedicate_params_ddp(
@@ -875,6 +989,10 @@ def dedicate_params_ddp(
         param_policy=param_policy,
         param_policy_fn=param_policy_fn,
     )
+    if any(policy.matrix_layout is not None for policy in policies.values()):
+        raise ValueError(
+            "matrix_layout currently requires the FSDP2/HSDP dedicate_params entry point"
+        )
 
     for param, coord in normalized.items():
         policy = policies[param]
@@ -1040,6 +1158,10 @@ def dedicate_params_ddp_tp(
         param_policy=param_policy,
         param_policy_fn=param_policy_fn,
     )
+    if any(policy.matrix_layout is not None for policy in policies.values()):
+        raise ValueError(
+            "matrix_layout currently requires the FSDP2/HSDP dedicate_params entry point"
+        )
 
     for param, coord in normalized.items():
         policy = policies[param]

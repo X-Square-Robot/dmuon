@@ -6,7 +6,7 @@ synchronization instead of CPU-blocking work.wait().
 """
 
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from typing import NamedTuple, Optional
 
 import torch
@@ -16,8 +16,10 @@ from dmuon._core.comm import DedicatedCommContext
 from dmuon._core.dynamo import dynamo_disable
 from dmuon._core.device import get_device_module
 from dmuon._core.owner_rank import OwnerCoord
+from dmuon._core.layout_copy import CopyExecutor, CopyTask
 
 from .param import DedicatedParam
+from .matrix_group import MatrixParamGroup
 
 
 @contextmanager
@@ -156,6 +158,10 @@ def _owner_broadcast_enabled(p: DedicatedParam) -> bool:
     return not _sharded_adamw_enabled(p) and not _sharded_muon_forward_enabled(p)
 
 
+def _owner_packed_enabled(p: DedicatedParam) -> bool:
+    return _owner_broadcast_enabled(p) and getattr(p, "matrix_parent", None) is None
+
+
 def _uniform_param_attr(params: list[DedicatedParam], attr: str):
     values = {getattr(p, attr, None) for p in params}
     if len(values) > 1:
@@ -268,6 +274,18 @@ class ShardedMuonPublishState(NamedTuple):
     event: torch.cuda.Event
 
 
+def _raw_grad(p):
+    prepared = getattr(p, "_layout_grad", None)
+    return prepared if prepared is not None else p._unsharded_param.grad
+
+
+def _clear_raw_grad(p):
+    p._unsharded_param.grad = None
+    if hasattr(p, "_layout_grad"):
+        p._layout_grad = None
+        p._layout_grad_owned = False
+
+
 def _get_grad_for_reduce(
     p: DedicatedParam, *, merge_accumulated: bool = False, copy_borrowed: bool = False
 ) -> Optional[torch.Tensor]:
@@ -277,7 +295,7 @@ def _get_grad_for_reduce(
     no_sync accumulator, copy an uncast local gradient because it may be a
     borrowed TP view; transfer an already cast tensor without a second copy.
     """
-    raw_grad = p._unsharded_param.grad
+    raw_grad = _raw_grad(p)
     if raw_grad is None:
         if not merge_accumulated or p._accumulated_grad is None:
             return None
@@ -286,9 +304,11 @@ def _get_grad_for_reduce(
         grad = p._accumulated_grad
     else:
         grad = p.local_grad_for_reduce(raw_grad.data)
+        if grad.is_cuda:
+            grad.record_stream(torch.cuda.current_stream(grad.device))
         if p._grad_dtype is not None and grad.dtype != p._grad_dtype:
             grad = grad.to(p._grad_dtype)
-        elif copy_borrowed:
+        elif copy_borrowed and not getattr(p, "_layout_grad_owned", False):
             grad = grad.clone()
         if merge_accumulated and p._accumulated_grad is not None:
             grad.add_(p._accumulated_grad)
@@ -443,9 +463,9 @@ class DedicatedParamGroup:
         # ``dp_group`` is the shard group (in Phase B the replicate coord is
         # handled separately via ``replicate_group``).
         self._total_numel_by_owner: dict[OwnerCoord, int] = {
-            owner: sum(p.numel for p in owner_params if _owner_broadcast_enabled(p))
+            owner: sum(p.numel for p in owner_params if _owner_packed_enabled(p))
             for owner, owner_params in self._by_owner.items()
-            if any(_owner_broadcast_enabled(p) for p in owner_params)
+            if any(_owner_packed_enabled(p) for p in owner_params)
         }
         if self._dp_group is not None:
             self._global_owner_ranks: dict[OwnerCoord, int] = {
@@ -471,6 +491,15 @@ class DedicatedParamGroup:
 
         self._packed_buf_by_owner: dict[OwnerCoord, torch.Tensor] = {}
         self._copy_in_dsts_by_owner: dict[OwnerCoord, list[torch.Tensor]] = {}
+        self._copy_executor = CopyExecutor(
+            device=self.device,
+            dtypes=(self._comm_dtype, *(p._master_dtype or p._orig_dtype for p in params)),
+        )
+        self._matrix_params = (
+            MatrixParamGroup(params, dtype=self._comm_dtype, device=self.device)
+            if any(getattr(p, "matrix_parent", None) is not None for p in params)
+            else None
+        )
         if self._comm_dtype is not None:
             for owner, total_numel in self._total_numel_by_owner.items():
                 packed = torch.empty(total_numel, dtype=self._comm_dtype, device=self.device)
@@ -480,7 +509,7 @@ class DedicatedParamGroup:
                 offset = 0
                 dsts: list[torch.Tensor] = []
                 for p in self._by_owner[owner]:
-                    if not _owner_broadcast_enabled(p):
+                    if not _owner_packed_enabled(p):
                         continue
                     p.bind_to_packed_buffer(packed, offset)
                     dsts.append(packed[offset : offset + p.numel])
@@ -500,11 +529,10 @@ class DedicatedParamGroup:
     ):
         """Dispatch broadcasts on broadcast_stream. Does NOT wait.
 
-        Phase 2: each owner has one persistent packed buffer; params are
-        as_strided views into it. We alloc the packed buf's storage, owner
-        fills from its ``_owned_data``, one NCCL broadcast per owner (all
-        coalesced into a single NCCL kernel) distributes the data. No
-        scatter — views automatically see the storage.
+        Ordinary parameters view persistent owner buffers. One batched copy-in
+        fills owner data before broadcasts. Explicit matrix layouts also use
+        direct native intervals when possible; otherwise a group-level unpack
+        restores native order on broadcast_stream before the ready event.
 
         Phase C: even though ``_pre_forward`` already called
         ``_pre_forward_wait``, this method can also be entered through
@@ -688,6 +716,9 @@ class DedicatedParamGroup:
             int(packed_buf.numel() * packed_buf.element_size())
             for packed_buf in self._packed_buf_by_owner.values()
         )
+        matrices = getattr(self, "_matrix_params", None)
+        if matrices is not None:
+            owner_broadcast_bytes += matrices.payload_bytes
         owner_broadcast_max_bucket_bytes = max(
             (
                 int(packed_buf.numel() * packed_buf.element_size())
@@ -738,31 +769,32 @@ class DedicatedParamGroup:
                 ):
                     alloc_storage(packed_buf)
 
-            # Phase 3 / B: batch owner copy-in with torch._foreach_copy_.
-            # The shard-dim broadcast runs independently inside each replicate
-            # row's shard_group, so the sender for a given owner_coord is
-            # whichever rank in this row matches ``owner_shard`` — regardless
-            # of ``owner_replicate``.  We therefore copy-in every packed
-            # buffer whose ``owner_shard`` matches this rank's shard index;
-            # that includes the global owner (``owner_coord == my coord``) and
-            # every replicate-row peer that shares the same shard column.
-            for owner_coord, dsts in self._copy_in_dsts_by_owner.items():
-                if owner_coord[0] != local_shard_rank:
-                    continue
-                srcs = [
-                    p._owned_data.view(-1)
-                    for p in self._by_owner[owner_coord]
-                    if _owner_broadcast_enabled(p)
-                ]
-                with (
-                    torch.no_grad(),
-                    torch.autograd._unsafe_preserve_version_counter(
-                        self._packed_buf_by_owner[owner_coord]
-                    ),
-                ):
-                    torch._foreach_copy_(dsts, srcs)
+            # One batch includes ordinary parameters and logical matrices.
+            if matrices is not None:
+                matrices.allocate()
+            tasks = []
+            for owner, destinations in self._copy_in_dsts_by_owner.items():
+                if owner[0] == local_shard_rank:
+                    sources = [
+                        p._owned_data for p in self._by_owner[owner] if _owner_packed_enabled(p)
+                    ]
+                    tasks.extend(
+                        CopyTask(source, destination)
+                        for source, destination in zip(sources, destinations)
+                    )
+            if matrices is not None:
+                tasks.extend(matrices.copy_in_tasks(local_shard_rank))
+            with ExitStack() as stack:
+                for buffer in self._packed_buf_by_owner.values():
+                    stack.enter_context(torch.autograd._unsafe_preserve_version_counter(buffer))
+                if matrices is not None:
+                    for buffer in matrices.packed_buffers.values():
+                        stack.enter_context(torch.autograd._unsafe_preserve_version_counter(buffer))
+                self._copy_executor.run(tasks, validate=False)
+            if matrices is not None:
+                matrices.broadcast(dp_group, self._global_owner_ranks, self.device)
 
-            if owner_broadcast_bytes:
+            if self._packed_buf_by_owner:
                 owner_start = None
                 owner_end = None
                 if self.comm_ctx.record_forward_profile:
@@ -797,6 +829,8 @@ class DedicatedParamGroup:
                         bytes=owner_broadcast_bytes,
                         prefetch=prefetch,
                     )
+            if matrices is not None:
+                matrices.unpack()  # ready event below includes this entire batch
         if sharded_adamw_params or sharded_muon_params:
             # DMuon-managed sharded AdamW base params: every shard rank owns a
             # flat shard and all-gathers the full forward view.  A separate
@@ -916,6 +950,8 @@ class DedicatedParamGroup:
         # Finalize: set unsharded params on modules
         for p in self.params:
             p.finish_unshard()
+        if getattr(self, "_matrix_params", None) is not None:
+            self._matrix_params.publish()
 
         self._broadcast_event = None
         self._sharded_adamw_unshard_event = None
@@ -938,6 +974,11 @@ class DedicatedParamGroup:
         ``unshard()`` to short-circuit on the ``_broadcast_event is not None``
         guard and leaving ``_unsharded_param`` views pointing at freed storage.
         """
+        release_requires_wait = (
+            self._is_unsharded
+            or self._broadcast_event is not None
+            or self._sharded_adamw_unshard_event is not None
+        )
         if self._broadcast_event is not None:
             # Drain and discard — the prefetched unshard was not consumed.
             self._device_module.current_stream().wait_event(self._broadcast_event)
@@ -945,8 +986,23 @@ class DedicatedParamGroup:
         if self._sharded_adamw_unshard_event is not None:
             self._device_module.current_stream().wait_event(self._sharded_adamw_unshard_event)
             self._sharded_adamw_unshard_event = None
+        if release_requires_wait:
+            # Storage was allocated on an unshard stream but read on compute.
+            # Protect it at release, not just at the next unshard: VMM reclaim
+            # and asynchronous frees may synchronize only the allocation stream.
+            # Previously enqueued prefetches stay ahead of this GPU-side wait.
+            compute = self._device_module.current_stream()
+            broadcast = self.comm_ctx.broadcast_stream
+            if broadcast != compute:
+                broadcast.wait_stream(compute)
+            if getattr(self.comm_ctx, "sharded_adamw_unshard_separate_stream_enabled", False):
+                sharded = self.comm_ctx.sharded_adamw_unshard_stream
+                if sharded != broadcast and sharded != compute:
+                    sharded.wait_stream(compute)
         for p in self.params:
             p.reshard()
+        if getattr(self, "_matrix_params", None) is not None:
+            self._matrix_params.release()
         from dmuon._core.internal_utils import free_storage
 
         for packed_buf in self._packed_buf_by_owner.values():
@@ -1003,16 +1059,23 @@ class DedicatedParamGroup:
           ``_partial_reduce_by_param[id(p)]`` until the gate flips back.
         """
         if not self.reduce_grads_enabled:
-            # no_sync: accumulate full gradients locally (no communication)
-            for p in self.params:
-                if not p._is_unsharded or p._unsharded_param.grad is None:
-                    continue
-                grad = _get_grad_for_reduce(p, copy_borrowed=p._accumulated_grad is None)
-                if p._accumulated_grad is not None:
-                    p._accumulated_grad.add_(grad)
-                else:
-                    p._accumulated_grad = grad
-                p._unsharded_param.grad = None
+            stream = self.comm_ctx.reduce_stream
+            stream.wait_stream(self._device_module.current_stream())
+            with self._device_module.stream(stream):
+                if getattr(self, "_matrix_params", None) is not None:
+                    self._matrix_params.split_gradients()
+                for p in self.params:
+                    if not p._is_unsharded or _raw_grad(p) is None:
+                        continue
+                    grad = _get_grad_for_reduce(p, copy_borrowed=p._accumulated_grad is None)
+                    if p._accumulated_grad is not None:
+                        p._accumulated_grad.add_(grad)
+                    else:
+                        p._accumulated_grad = grad
+                    _clear_raw_grad(p)
+            # Make accumulators visible to root callbacks/zero_grad/next step,
+            # while retaining the normal asynchronous post-backward contract.
+            self._stage1_reduce_event = stream.record_event()
             return
 
         # Flush any pending reduce from a previous backward (gradient accumulation
@@ -1049,12 +1112,14 @@ class DedicatedParamGroup:
         # dangle the post-reduce view.
         with _profile_range(f"dmuon.stage1_shard_reduce.{group_name}"):
             with self._device_module.stream(reduce_stream):
+                if getattr(self, "_matrix_params", None) is not None:
+                    self._matrix_params.split_gradients()
                 normal_work = [
                     p
                     for p in self.params
                     if not _sharded_adamw_enabled(p)
                     and p._is_unsharded
-                    and (p._unsharded_param.grad is not None or p._accumulated_grad is not None)
+                    and (_raw_grad(p) is not None or p._accumulated_grad is not None)
                 ]
                 if normal_work:
                     with dist._coalescing_manager(group=dp_group, device=self.device):
@@ -1070,7 +1135,7 @@ class DedicatedParamGroup:
                                 op=dist.ReduceOp.AVG,
                                 group=dp_group,
                             )
-                            p._unsharded_param.grad = None
+                            _clear_raw_grad(p)
                             self._pending_reduce.append((grad.view(-1), [p]))
                             # Only the shard-owner rank holds the post-Stage-1 grad
                             # and therefore participates in Stage-2.
@@ -1082,7 +1147,7 @@ class DedicatedParamGroup:
                     for p in self.params
                     if _sharded_adamw_enabled(p)
                     and p._is_unsharded
-                    and (p._unsharded_param.grad is not None or p._accumulated_grad is not None)
+                    and (_raw_grad(p) is not None or p._accumulated_grad is not None)
                 ]
                 if sharded_work:
                     with dist._coalescing_manager(group=dp_group, device=self.device):
@@ -1108,7 +1173,7 @@ class DedicatedParamGroup:
                                 op=dist.ReduceOp.AVG,
                                 group=dp_group,
                             )
-                            p._unsharded_param.grad = None
+                            _clear_raw_grad(p)
                             self._pending_reduce.append((sharded_grad, [p]))
                             if has_replicate:
                                 sharded_stage2_pending.append((sharded_grad, p))
@@ -1298,6 +1363,7 @@ class DedicatedParamGroup:
         owner; sharded AdamW grads are accumulated locally on every rank.
         """
         if self._post_reduce_event is None and self._replicate_reduce_state is None:
+            self.wait_for_stage1_reduce(stream)
             return None
 
         target_stream = stream if stream is not None else self._device_module.current_stream()
