@@ -14,6 +14,9 @@ The `"adamw"` and `"sharded_adamw"` routes both run AdamW. They differ only in h
 
 Large terminal AdamW parameters are different. Input embeddings are read at the beginning of the forward pass, and output heads such as `lm_head` produce gradients near the end of backward. If a single owner rank handles those tensors through broadcast and reduce, the owner can become a front-of-forward or tail-of-backward bottleneck. Routing those tensors to `"sharded_adamw"` spreads both the forward all-gather and the backward reduce-scatter across all ranks.
 
+For fused QKV or stacked experts, attach a `matrix_layout` to the policy to
+choose independent update matrices. See [Matrix Layouts](matrix-layouts.md).
+
 ## Control Surface
 
 Policy control has two steps. First, `predicate` decides which parameters enter

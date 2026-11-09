@@ -84,6 +84,28 @@ This pulls in:
 Build time is typically 1–3 minutes on first use (JIT compilation).
 The compiled artifact is cached in `~/.cache/dmuon/`.
 
+## Optional: Batched Layout Copies
+
+The layout-copy CUDA extension batches parameter conversion and layout
+restoration at wrapping boundaries. It is separate from the SYRK and fast-clip
+kernels. See [Matrix Layouts](../guides/matrix-layouts.md#cuda-copy).
+
+```bash
+DMUON_BUILD_LAYOUT_COPY=1 pip install -e . --no-build-isolation
+```
+
+Build in the environment containing your CUDA-enabled PyTorch and CUDA toolkit.
+Set `DMUON_BUILD_LAYOUT_COPY=0` to disable only this extension. To skip both
+optional compiled extensions:
+
+```bash
+DMUON_BUILD_LAYOUT_COPY=0 DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation
+```
+
+The default `DMUON_COPY_BACKEND=auto` uses the Torch reference when the CUDA copy
+extension is unavailable. `DMUON_COPY_BACKEND=cuda` requires the extension and
+raises an error when it cannot be used.
+
 ## Ascend 950DT (experimental)
 
 DMuon supports native Ascend 950DT execution through `torch_npu` and HCCL.

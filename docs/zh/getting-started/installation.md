@@ -82,6 +82,25 @@ pip install -e ".[syrk]"
 
 首次使用时 JIT 编译通常需要 1–3 分钟，编译产物缓存在 `~/.cache/dmuon/`。
 
+## 可选：批量布局搬运
+
+layout-copy CUDA 扩展在 wrapping 边界合并参数转换和布局还原，
+与 SYRK、fast-clip kernel 分开。用法见[矩阵布局](../guides/matrix-layouts.md)。
+
+```bash
+DMUON_BUILD_LAYOUT_COPY=1 pip install -e . --no-build-isolation
+```
+
+请在已安装 CUDA 版 PyTorch、并有 CUDA toolkit 的环境中编译。
+`DMUON_BUILD_LAYOUT_COPY=0` 只禁用此扩展。跳过两个可选编译扩展：
+
+```bash
+DMUON_BUILD_LAYOUT_COPY=0 DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation
+```
+
+默认 `DMUON_COPY_BACKEND=auto` 在扩展不可用时使用 Torch 参考路径。
+`DMUON_COPY_BACKEND=cuda` 则要求扩展可用，否则明确报错。
+
 ## Ascend 950DT（实验性支持）
 
 安装与 CANN 版本匹配的 PyTorch 和 `torch_npu`，然后激活 CANN 并安装核心包：

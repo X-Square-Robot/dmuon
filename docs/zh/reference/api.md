@@ -1,13 +1,9 @@
 # API 文档
 
-!!! tip "TL;DR"
-    DMuon 公开五个功能区：**初始化**（`dedicate_params`、`install_patch`）、
-    **优化器**（`Muon`、`NewtonSchulz`、NS 函数与常量）、**状态管理**
-    （`no_sync`、`wait_all_reduces`、replicate-broadcast 工具函数、
-    `DedicatedCommContext`）、**诊断**（`summarize_param_groups`、
-    `summarize_comm_plan`、`collect_forward_unshard_profile`）以及**检查点**
-    （`get/set_model/optimizer_state_dict`）。
-    从 `dedicate_params` + `Muon` 开始；需要精细控制时再使用其余接口。
+!!! tip "从这里开始"
+    使用 `dedicate_params` 配置所有权，再创建 `Muon` 优化器。
+    当融合参数需要按独立矩阵更新时，使用 `MatrixLayout`。
+    下文按初始化、矩阵布局、优化器、状态管理、诊断和检查点组织接口。
 
 ---
 
@@ -78,6 +74,25 @@ data-parallel group 内部还有 Tensor Parallelism 的场景。
 构建 DMuon 环境，否则无需手动调用。
 
 ::: dmuon.install_patch
+
+---
+
+## 矩阵布局
+
+`MatrixLayout` 在现有参数内声明独立的 Muon 更新矩阵。
+[矩阵布局指南](../guides/matrix-layouts.md) 包含 MoE 策略、融合 QKV 的选择、
+交错布局和可选 CUDA 搬运路径的用法。
+
+::: dmuon.MatrixLayout
+    options:
+      members:
+        - whole
+        - view
+        - rows
+        - permute
+        - reshape
+        - split
+        - compile
 
 ---
 

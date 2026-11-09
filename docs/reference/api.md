@@ -1,14 +1,10 @@
 # API Reference
 
-!!! tip "TL;DR"
-    DMuon exposes five surface areas: **setup** (`dedicate_params`, `install_patch`),
-    **optimizer** (`Muon`, `NewtonSchulz`, NS functions and constants), **state
-    management** (`no_sync`, `wait_all_reduces`, replicate-broadcast helpers,
-    `DedicatedCommContext`), **diagnostics** (`summarize_param_groups`,
-    `summarize_comm_plan`, `collect_forward_unshard_profile`), and **checkpointing**
-    (`get/set_model/optimizer_state_dict`).
-    Start with `dedicate_params` + `Muon`; reach for the rest when you need fine-grained
-    control.
+!!! tip "Start here"
+    Set up ownership with `dedicate_params` and create a `Muon` optimizer.
+    Use `MatrixLayout` when a fused parameter needs independent matrix updates.
+    The sections below cover setup, layouts, optimization, runtime state,
+    diagnostics, and checkpoints.
 
 ---
 
@@ -82,6 +78,25 @@ directly unless you are constructing a DMuon environment without the normal
 import path.
 
 ::: dmuon.install_patch
+
+---
+
+## Matrix layouts
+
+`MatrixLayout` declares independent Muon update matrices inside an existing
+parameter. See [Matrix Layouts](../guides/matrix-layouts.md) for MoE policies,
+fused QKV choices, interleaved layouts, and the optional CUDA copy path.
+
+::: dmuon.MatrixLayout
+    options:
+      members:
+        - whole
+        - view
+        - rows
+        - permute
+        - reshape
+        - split
+        - compile
 
 ---
 

@@ -1,20 +1,20 @@
 # DMuon
 
-**Dedicated ownership for matrix optimizers on PyTorch DDP, FSDP2, and HSDP.**
-
-*One owner. One Newton-Schulz. Zero optimizer all-gather.*
-
----
+<p class="dmuon-lead">Dedicated ownership for matrix optimizers on PyTorch DDP, FSDP2, and HSDP.</p>
 
 <div class="dmuon-hero" markdown>
 
-DMuon assigns each matrix parameter to a single **owner rank**. The owner stores the full parameter, reduces gradients from peers, and runs Newton-Schulz alone — eliminating the all-gather and redundant compute that make naive FSDP2+Muon 3–4× slower than AdamW.
+<p class="dmuon-eyebrow">PYTORCH · MATRIX OPTIMIZATION</p>
+<p class="dmuon-hero-title">One owner per logical matrix.</p>
 
-Scale from a single node to multi-node HSDP clusters with a two-line API change. The 2D mesh, two-stage reduce, and async forward-hidden broadcast are all handled internally.
+Run each Muon matrix update on its owner rank. Choose optimizer routes,
+wrapping boundaries, and matrix layouts independently, using your existing
+PyTorch model.
+
+[Get started](getting-started/quickstart.md){ .md-button .md-button--primary }
+[Explore matrix layouts](guides/matrix-layouts.md){ .md-button }
 
 </div>
-
----
 
 ## What DMuon Can Do
 
@@ -75,12 +75,14 @@ Scale from a single node to multi-node HSDP clusters with a two-line API change.
     TP compatibility via Gram Newton-Schulz (O(d_model²) communication)
     keeps DMuon usable with column/row-parallel tensor parallelism.
 
-??? abstract "MoE — Mixture-of-Experts with expert-parallel layouts"
+??? abstract "MoE — Stacked experts and fused weights"
 
-    Hook boundaries can be set to align with expert modules using
-    `hook_boundary_predicate`. Each expert's projection parameters are
-    independently assigned to an owner rank; balanced partition ensures
-    no single rank becomes a straggler across expert groups.
+    Use `MatrixLayout` to specify independent expert, gate/up, or attention-head
+    updates while preserving the model's modules and parameter shapes. Select
+    layouts with parameter policies and keep communication grouped at decoder
+    hook boundaries.
+
+    [Configure matrix layouts](guides/matrix-layouts.md).
 
 ---
 
@@ -155,11 +157,11 @@ The 128GPU rows cover FSDP-Z2, FSDP-Z3, HSDP-Z2, and HSDP-Z3.
 
     [:octicons-arrow-right-24: Quick Start](getting-started/quickstart.md)
 
--   :material-head-lightbulb:{ .lg .middle } **Core Concepts**
+-   :material-view-grid-outline:{ .lg .middle } **Matrix Layouts**
 
-    Dedicated ownership, Z2/Z3 modes, hook boundaries, and HSDP design.
+    Configure fused QKV, per-head updates, and stacked MoE experts.
 
-    [:octicons-arrow-right-24: Core Concepts](getting-started/concepts.md)
+    [:octicons-arrow-right-24: Matrix Layouts](guides/matrix-layouts.md)
 
 -   :material-server-network:{ .lg .middle } **HSDP Guide**
 
@@ -168,9 +170,3 @@ The 128GPU rows cover FSDP-Z2, FSDP-Z3, HSDP-Z2, and HSDP-Z3.
     [:octicons-arrow-right-24: HSDP Guide](guides/hsdp.md)
 
 </div>
-
----
-
-DMuon builds on dedicated ownership pioneered by ZeRO-1 (Rajbhandari et al., 2020) and Distributed Shampoo (Shi et al., 2023). Gram Newton-Schulz kernel adapted from Dao et al., 2026.
-
-GitHub: [X-Square-Robot/dmuon](https://github.com/X-Square-Robot/dmuon) &nbsp;·&nbsp; arXiv preprint: [TBD]
