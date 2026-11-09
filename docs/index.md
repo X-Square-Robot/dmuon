@@ -16,6 +16,29 @@ PyTorch model.
 
 </div>
 
+## News
+
+<div class="grid cards" markdown>
+
+-   :material-view-grid-outline:{ .lg .middle } **Matrix layouts for fused weights and MoE**
+
+    <small>November 9, 2026</small>
+
+    Configure QKV, per-head, and per-expert Muon updates without changing
+    your model. Batched CUDA copies combine layout conversion and dtype casting.
+
+    [:octicons-arrow-right-24: Matrix layout guide](guides/matrix-layouts.md)
+
+-   :material-chip:{ .lg .middle } **DMuon Ascend is available**
+
+    <small>October 14, 2026</small>
+
+    Experimental native Ascend 950DT support through the same public API.
+
+    [:octicons-arrow-right-24: Ascend installation](getting-started/installation.md#ascend-950dt-experimental)
+
+</div>
+
 ## What DMuon Can Do
 
 ??? abstract "LLM Pretraining — Llama, Qwen, Mistral on FSDP2/HSDP"
