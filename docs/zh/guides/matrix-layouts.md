@@ -213,27 +213,32 @@ compute stream 在使用参数前等待 ready event。预取与布局还原沿�
 stream，可以与其他工作重叠，因此拷贝和通信 kernel 的累计时长不等于它们对
 整步耗时的贡献。
 
-### 编译与后端选择 {#build-and-backends}
+### 安装与默认行为 {#build-and-backends}
 
-在已安装 CUDA 版 PyTorch、并有 CUDA toolkit 的环境中编译：
+已安装 CUDA 版 PyTorch 和 CUDA toolkit 时，布局搬运扩展会随其他可选 CUDA
+扩展默认编译。使用普通安装命令即可，无需设置编译环境变量：
 
 ```bash
-DMUON_BUILD_LAYOUT_COPY=1 pip install -e . --no-build-isolation
+pip install -e . --no-build-isolation
 ```
 
-`DMUON_BUILD_LAYOUT_COPY=0` 可以单独禁用此扩展。
-另一个可选 fast-clip 扩展由 `DMUON_BUILD_FAST_CLIP` 独立控制。
+扩展可用时自动对支持的 FP32、FP16、BF16 搬运使用 CUDA；否则使用 Torch
+参考路径。正常训练无需手动选择后端。
 
-| 设置 | 含义 |
-|---|---|
-| `DMUON_COPY_BACKEND=auto` | 默认；扩展可用且任务符合条件时使用 CUDA，否则使用 Torch 参考路径。 |
-| `DMUON_COPY_BACKEND=torch` | 使用参考搬运路径，便于对照与调试。 |
-| `DMUON_COPY_BACKEND=cuda` | 要求使用可选 CUDA 路径，不可用时明确报错。 |
-| `DMUON_COPY_MAX_CTAS=96` | 每次 copy launch 默认最多 96 个 block，实际还受设备 SM 数和任务 tile 数限制。 |
+只有明确不需要此扩展时，才设置 `DMUON_BUILD_LAYOUT_COPY=0` 单独禁用；这不影响
+另一个可选 fast-clip 扩展。
 
-CUDA 搬运支持 FP32、FP16 和 BF16。CTA 预算限制单次 copy launch，不代表预留
-对应数量的 SM，也不限制所有通信 kernel。默认预算在 132-SM 设备上选取，
-其他设备和负载可以自行调整。
+??? info "高级选项：对照测试与性能调试"
+
+    | 设置 | 含义 |
+    |---|---|
+    | `DMUON_COPY_BACKEND=auto` | 默认，按上述规则自动选择后端。 |
+    | `DMUON_COPY_BACKEND=torch` | 强制使用参考路径，便于对照与调试。 |
+    | `DMUON_COPY_BACKEND=cuda` | 要求使用 CUDA 路径，不可用时明确报错。 |
+    | `DMUON_COPY_MAX_CTAS=96` | 每次 copy launch 默认最多 96 个 block，实际还受设备 SM 数和任务 tile 数限制。 |
+
+    CTA 预算限制单次 copy launch，不代表预留对应数量的 SM，也不限制所有通信
+    kernel。默认预算在 132-SM 设备上选取，其他设备和负载可以自行调整。
 
 ## 支持范围与检查点 {#scope-and-checkpoints}
 

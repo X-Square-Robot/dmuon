@@ -84,27 +84,21 @@ This pulls in:
 Build time is typically 1–3 minutes on first use (JIT compilation).
 The compiled artifact is cached in `~/.cache/dmuon/`.
 
-## Optional: Batched Layout Copies
+## Batched Layout Copies
 
 The layout-copy CUDA extension batches parameter conversion and layout
-restoration at wrapping boundaries. It is separate from the SYRK and fast-clip
-kernels. See [Matrix Layouts](../guides/matrix-layouts.md#cuda-copy).
+restoration at wrapping boundaries. With CUDA-enabled PyTorch and a CUDA toolkit
+installed, it builds by default alongside the other optional CUDA extensions:
 
 ```bash
-DMUON_BUILD_LAYOUT_COPY=1 pip install -e . --no-build-isolation
+pip install -e . --no-build-isolation
 ```
 
-Build in the environment containing your CUDA-enabled PyTorch and CUDA toolkit.
-Set `DMUON_BUILD_LAYOUT_COPY=0` to disable only this extension. To skip both
-optional compiled extensions:
-
-```bash
-DMUON_BUILD_LAYOUT_COPY=0 DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation
-```
-
-The default `DMUON_COPY_BACKEND=auto` uses the Torch reference when the CUDA copy
-extension is unavailable. `DMUON_COPY_BACKEND=cuda` requires the extension and
-raises an error when it cannot be used.
+No build or backend environment variable is required for normal use. Only set
+`DMUON_BUILD_LAYOUT_COPY=0` when you explicitly want to disable this extension;
+fast-clip is controlled independently. DMuon automatically falls back to Torch
+when the CUDA copy extension is unavailable. See
+[Matrix Layouts](../guides/matrix-layouts.md#build-and-backends) for advanced options.
 
 ## Ascend 950DT (experimental)
 

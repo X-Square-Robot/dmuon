@@ -8,7 +8,7 @@ The optional CUDA copy extension batches each wrapping group's local copies.
 DMUON_COPY_MAX_CTAS=96 (default) caps each copy launch, not all communication SMs.
 The actual grid is also capped by the device SM count and available copy tiles.
 DMUON_COPY_BACKEND=torch selects the reference; cuda requires the extension.
-Build independently with DMUON_BUILD_LAYOUT_COPY=1; 0 disables this extension.
+Built by default with CUDA; set DMUON_BUILD_LAYOUT_COPY=0 only to disable it.
 """
 
 import dmuon
