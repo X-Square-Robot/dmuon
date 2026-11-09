@@ -45,8 +45,10 @@ plug-and-play, with no changes to your model.
 
 ## News
 
-- 2026.10.14
-  - DMuon Ascend is available! Check [DMuon Ascend](docs/getting-started/installation.md#ascend-950dt-experimental) for more details.
+| Date | Update |
+|:---|:---|
+| **2026.11.09** | **Matrix layouts for fused weights and MoE.** Configure QKV, per-head, and per-expert Muon updates without changing your model. Batched CUDA copies combine layout conversion and dtype casting. [Guide](https://x-square-robot.github.io/dmuon/guides/matrix-layouts/) · [Examples](examples/matrix_layouts.py) |
+| **2026.10.14** | **DMuon Ascend is available.** Experimental native Ascend 950DT support through the same public API. [Installation guide](docs/getting-started/installation.md#ascend-950dt-experimental) |
 
 ## Install
 

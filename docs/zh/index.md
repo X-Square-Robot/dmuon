@@ -15,6 +15,29 @@
 
 </div>
 
+## 最新动态
+
+<div class="grid cards" markdown>
+
+-   :material-view-grid-outline:{ .lg .middle } **融合权重与 MoE 的矩阵布局支持**
+
+    <small>2026 年 11 月 9 日</small>
+
+    沿用现有模型，配置 QKV、逐 head 和逐专家的 Muon 更新。
+    批量 CUDA 搬运将布局转换和 dtype 转换合并处理。
+
+    [:octicons-arrow-right-24: 矩阵布局指南](guides/matrix-layouts.md)
+
+-   :material-chip:{ .lg .middle } **DMuon Ascend 已发布**
+
+    <small>2026 年 10 月 14 日</small>
+
+    原生 Ascend 950DT 实验性支持，沿用相同的公开 API。
+
+    [:octicons-arrow-right-24: Ascend 安装说明](getting-started/installation.md#ascend-950dt)
+
+</div>
+
 ## DMuon 能做什么
 
 ??? abstract "LLM 预训练 — 在 FSDP2/HSDP 上训练 Llama、Qwen、Mistral"
