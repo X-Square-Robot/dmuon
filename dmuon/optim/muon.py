@@ -354,6 +354,9 @@ class Muon(Optimizer):
         module_to_fqn = {id(mod): name for name, mod in model.named_modules()}
         result: dict[int, str] = {}
         for dp in dedicated_params:
+            if getattr(dp, "_checkpoint_key", None) is not None:
+                result[id(dp)] = dp._checkpoint_key
+                continue
             raw_name = getattr(dp, "param_name", None) or getattr(
                 getattr(dp, "_orig_param", None), "_dmuon_name", "<unnamed>"
             )
@@ -757,6 +760,32 @@ class Muon(Optimizer):
         if isinstance(user_param_groups, dict):
             raise TypeError("dmuon.Muon param_groups must be a list of dicts, not a dict")
         semantic_groups = list(user_param_groups)
+        # A user selects the original model parameter; all its logical NS
+        # matrices inherit that semantic parameter group's hyperparameters.
+        parents = {
+            id(dp.matrix_parent): dp.matrix_parent
+            for dp in self._all_dedicated_params
+            if getattr(dp, "matrix_parent", None) is not None
+        }
+        parent_refs = {
+            id(ref): parent for parent in parents.values() for ref in parent.parameter_refs()
+        }
+        if parents:
+            expanded = []
+            for group in semantic_groups:
+                if not isinstance(group, dict) or "params" not in group:
+                    expanded.append(group)
+                    continue
+                refs = []
+                for ref in self._normalize_group_params(group["params"]):
+                    parent = parent_refs.get(id(ref))
+                    refs.extend(
+                        [unit._placeholder for unit in parent.units]
+                        if parent is not None
+                        else [ref]
+                    )
+                expanded.append({**group, "params": refs})
+            semantic_groups = expanded
         if not semantic_groups:
             raise ValueError("dmuon.Muon param_groups must not be empty")
 
@@ -824,6 +853,10 @@ class Muon(Optimizer):
                             {"dmuon_route": getattr(dp, "_dmuon_route", "muon")}
                         )
                     )
+                    if getattr(dp, "matrix_parent", None) is not None and dedicated_route != "muon":
+                        raise ValueError(
+                            "A logical matrix parameter group must retain the Muon route"
+                        )
                     # A param constructed on the sharded_adamw route owns only a
                     # rank-local shard (``_sharded_adamw_data``) and has no full
                     # ``_owned_data`` copy.  Moving it to another route here would
@@ -936,6 +969,12 @@ class Muon(Optimizer):
             if not getattr(param, "requires_grad", False):
                 continue
             param_id = id(param)
+            if param_id in parent_refs:
+                if any(
+                    ("dedicated", id(unit)) not in assigned for unit in parent_refs[param_id].units
+                ):
+                    missing.append(name)
+                continue
             if param_id in param_to_dp:
                 key = ("dedicated", id(param_to_dp[param_id]))
             elif param_id in adamw_param_by_id:
@@ -1898,10 +1937,17 @@ class Muon(Optimizer):
                 p.grad.zero_()
         for dp in self._all_dedicated_params:
             dp._reduced_grad = None
+            if hasattr(dp, "_layout_grad"):
+                dp._layout_grad = None
+                dp._layout_grad_owned = False
             if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
                 dp._sharded_adamw_grad = None
             dp._accumulated_grad = None
         for state in self._comm_ctx.all_states:
+            matrices = getattr(state.group, "_matrix_params", None)
+            if matrices is not None:
+                for parent in matrices.entries:
+                    parent._unsharded_param.grad = None
             # Replicate-gated Stage-1 partials never flushed by a Stage-2 reduce.
             partials = getattr(state.group, "_partial_reduce_by_param", None)
             if partials:

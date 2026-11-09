@@ -53,8 +53,7 @@ def _normalize_dmuon_route_hint(route: Optional[str]) -> str:
     route = aliases.get(route, route)
     if route not in {"muon", "adamw", "sharded_adamw"}:
         raise ValueError(
-            "DMuon route hint must be one of 'muon', 'adamw', or "
-            f"'sharded_adamw', got {route!r}"
+            "DMuon route hint must be one of 'muon', 'adamw', or " f"'sharded_adamw', got {route!r}"
         )
     return route
 
@@ -74,8 +73,7 @@ def _normalize_muon_forward_unshard(mode: Optional[str]) -> str:
     mode = aliases.get(mode, mode)
     if mode not in {"broadcast", "all_gather"}:
         raise ValueError(
-            "DMuon Muon forward unshard mode must be 'broadcast' or "
-            f"'all_gather', got {mode!r}"
+            "DMuon Muon forward unshard mode must be 'broadcast' or " f"'all_gather', got {mode!r}"
         )
     return mode
 
@@ -143,6 +141,7 @@ class DedicatedParam:
         tp_group: Optional[dist.ProcessGroup] = None,
         route_hint: Optional[str] = None,
         muon_forward_unshard: str = "broadcast",
+        _install_placeholder: bool = True,
     ):
         self.module = module
         self.param_name = param_name
@@ -153,7 +152,7 @@ class DedicatedParam:
         self.owner_rank: OwnerCoord = coord
         self.owner_shard: int = coord[0]
         self.owner_replicate: int = coord[1]
-        self.dp_group = dp_group          # shard group (1D in Phase A)
+        self.dp_group = dp_group  # shard group (1D in Phase A)
         self.replicate_group = replicate_group  # None until Phase B wires HSDP
         self.device = device
 
@@ -162,9 +161,7 @@ class DedicatedParam:
         # reduces to the previous shard-only check; Phase B will enable the
         # second-dim check once ``replicate_group`` is wired through.
         shard_hit = dp_group.rank() == self.owner_shard
-        replicate_hit = (
-            replicate_group is None or replicate_group.rank() == self.owner_replicate
-        )
+        replicate_hit = replicate_group is None or replicate_group.rank() == self.owner_replicate
         self.is_owner = shard_hit and replicate_hit
 
         # Convert dp-local owner_rank to global rank for NCCL collectives.
@@ -204,9 +201,7 @@ class DedicatedParam:
         self._compute_dtype = self._param_dtype  # legacy alias
         self._requires_grad = param.requires_grad
         self._dmuon_route: str = _normalize_dmuon_route_hint(route_hint)
-        self._muon_forward_unshard: str = _normalize_muon_forward_unshard(
-            muon_forward_unshard
-        )
+        self._muon_forward_unshard: str = _normalize_muon_forward_unshard(muon_forward_unshard)
         self._tp_group_override = tp_group
 
         # Cached attrs (were @property, now computed once).
@@ -231,9 +226,7 @@ class DedicatedParam:
             self._tp_owner_global_rank: Optional[int] = dist.get_global_rank(
                 self.tp_group, self._tp_owner_local_rank
             )
-            self.is_tp_owner: bool = (
-                self.tp_group.rank() == self._tp_owner_local_rank
-            )
+            self.is_tp_owner: bool = self.tp_group.rank() == self._tp_owner_local_rank
         else:
             self._tp_owner_local_rank = 0
             self._tp_owner_global_rank = None
@@ -263,10 +256,14 @@ class DedicatedParam:
         is_in_owner_shard_column = dp_group.rank() == self.owner_shard
         if is_in_owner_shard_column and self._dmuon_route != "sharded_adamw":
             master_dtype = self._master_dtype or self._orig_dtype
-            self._owned_data = local_data.detach().to(
-                device=device,
-                dtype=master_dtype,
-            ).clone()
+            self._owned_data = (
+                local_data.detach()
+                .to(
+                    device=device,
+                    dtype=master_dtype,
+                )
+                .clone()
+            )
         else:
             self._owned_data = None
 
@@ -355,16 +352,14 @@ class DedicatedParam:
         self._tp_wd_factor: float = 1.0
 
         # Set module to sharded state
-        unsafe_setattr_param(self.module, self.param_name, self._placeholder)
+        if _install_placeholder:
+            unsafe_setattr_param(self.module, self.param_name, self._placeholder)
 
     def uses_sharded_adamw(self) -> bool:
         return self._dmuon_route == "sharded_adamw"
 
     def uses_sharded_muon_forward(self) -> bool:
-        return (
-            self._dmuon_route == "muon"
-            and self._muon_forward_unshard == "all_gather"
-        )
+        return self._dmuon_route == "muon" and self._muon_forward_unshard == "all_gather"
 
     def _init_sharded_storage_common(
         self,
@@ -394,16 +389,13 @@ class DedicatedParam:
             )
         elif valid and not allow_meta_source:
             raise NotImplementedError(
-                f"{self.param_name}: cannot initialize sharded storage from a "
-                "meta tensor"
+                f"{self.param_name}: cannot initialize sharded storage from a " "meta tensor"
             )
 
         full_padded_numel = chunk * shard_world
         comm_dtype = self._param_dtype or self._orig_dtype
         scratch_dtype = scratch_dtype or comm_dtype
-        full_padded = torch.empty(
-            full_padded_numel, dtype=comm_dtype, device=self.device
-        )
+        full_padded = torch.empty(full_padded_numel, dtype=comm_dtype, device=self.device)
         comm_shard = torch.empty(chunk, dtype=comm_dtype, device=self.device)
         full_comm = torch.empty(
             full_padded_numel,
@@ -445,9 +437,7 @@ class DedicatedParam:
             wrapped = _from_local_no_grad(view, self._tp_spec)
         else:
             wrapped = view
-        self._unsharded_param = nn.Parameter(
-            wrapped, requires_grad=self._requires_grad
-        )
+        self._unsharded_param = nn.Parameter(wrapped, requires_grad=self._requires_grad)
         from dmuon._core.internal_utils import free_storage
 
         free_storage(self._sharded_adamw_full_padded)
@@ -484,16 +474,12 @@ class DedicatedParam:
             wrapped = _from_local_no_grad(view, self._tp_spec)
         else:
             wrapped = view
-        self._unsharded_param = nn.Parameter(
-            wrapped, requires_grad=self._requires_grad
-        )
+        self._unsharded_param = nn.Parameter(wrapped, requires_grad=self._requires_grad)
         from dmuon._core.internal_utils import free_storage
 
         free_storage(self._sharded_muon_full_padded)
 
-    def bind_to_packed_buffer(
-        self, packed_buf: torch.Tensor, storage_offset: int
-    ) -> None:
+    def bind_to_packed_buffer(self, packed_buf: torch.Tensor, storage_offset: int) -> None:
         """Install ``_unsharded_param`` as an as_strided view into the group's
         packed broadcast buffer at ``storage_offset``.
 
@@ -619,9 +605,8 @@ class DedicatedParam:
     def local_grad_for_reduce(self, grad: torch.Tensor) -> torch.Tensor:
         """Convert a parameter grad to the TP-local tensor reduce expects."""
         if self.is_dtensor and DTensor is not None and isinstance(grad, DTensor):
-            if (
-                self._tp_spec is not None
-                and tuple(grad._spec.placements) != tuple(self._tp_spec.placements)
+            if self._tp_spec is not None and tuple(grad._spec.placements) != tuple(
+                self._tp_spec.placements
             ):
                 grad = grad.redistribute(placements=self._tp_spec.placements)
             grad = grad._local_tensor

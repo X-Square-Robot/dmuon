@@ -14,6 +14,9 @@ Pure DMuon 指所有可训练参数都可以进入 DMuon 的 ownership runtime�
 
 末端的大 AdamW 参数不同。输入 embedding 在 forward 开头被读取，`lm_head` 这类输出头的梯度通常出现在 backward 尾部。如果这些大张量由单个 owner 通过 broadcast 和 reduce 处理，这个 owner 容易成为 forward 开头或 backward 末尾的短板。把这些张量路由到 `"sharded_adamw"` 可以让 forward all-gather 和 backward reduce-scatter 由所有 rank 分担。
 
+对于融合 QKV 或堆叠专家，可在参数策略中附加 `matrix_layout`，选择独立更新的
+逻辑矩阵。完整用法见[矩阵布局](matrix-layouts.md)。
+
 ## 控制入口
 
 策略控制分两步。第一步，`predicate` 决定哪些参数进入 DMuon runtime。

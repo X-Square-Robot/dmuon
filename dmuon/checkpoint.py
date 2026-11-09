@@ -23,6 +23,7 @@ Usage::
     dmuon.set_optimizer_state_dict(model, optimizer, ckpt["optim"])
 """
 
+import math
 import warnings
 from typing import Any
 
@@ -31,7 +32,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ._backends.fsdp2 import DedicatedParam
-from .utils import get_dedicated_params, wait_all_replicate_broadcasts
+from .utils import get_dedicated_params, wait_all_replicate_broadcasts, iter_dedicated_states
 
 try:
     from torch.distributed.tensor import DTensor as _DTensor
@@ -51,10 +52,40 @@ def _compute_dedicated_fqns(model: nn.Module) -> dict[DedicatedParam, str]:
     module_to_fqn = {id(mod): name for name, mod in model.named_modules()}
     result = {}
     for dp in get_dedicated_params(model):
+        if getattr(dp, "_checkpoint_key", None) is not None:
+            result[dp] = dp._checkpoint_key
+            continue
         prefix = module_to_fqn.get(id(dp.module), "")
         fqn = f"{prefix}.{dp.param_name}" if prefix else dp.param_name
         result[dp] = fqn
     return result
+
+
+def _matrix_parents(model):
+    return {
+        id(dp.matrix_parent): dp.matrix_parent
+        for dp in get_dedicated_params(model)
+        if getattr(dp, "matrix_parent", None) is not None
+    }
+
+
+def _parent_fqns(model, parent):
+    prefixes = {id(module): name for name, module in model.named_modules()}
+    return [
+        f"{prefixes[id(module)]}.{name}" if prefixes[id(module)] else name
+        for module, name in parent.aliases
+    ]
+
+
+def _model_dedicated_fqns(model, dp_fqns):
+    names = {fqn for dp, fqn in dp_fqns.items() if getattr(dp, "matrix_parent", None) is None}
+    for parent in _matrix_parents(model).values():
+        names.update(_parent_fqns(model, parent))
+    return names
+
+
+def _layout_state(model):
+    return {parent.fqn: parent.layout.state() for parent in _matrix_parents(model).values()}
 
 
 # ---- Broadcast / all-gather helpers ----
@@ -446,11 +477,12 @@ def get_model_state_dict(
     wait_all_replicate_broadcasts(model)
 
     dp_fqns = _compute_dedicated_fqns(model)
-    dedicated_fqn_set = set(dp_fqns.values())
+    dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
     dp_mesh = _get_dp_mesh(model)
 
     keep = (not rank0_only) or (dist.get_rank() == 0)
     sd: dict[str, torch.Tensor] = {}
+    assembled = {}
 
     # 1. Dedicated params.
     #    FSDP2 path: broadcast from owner (every shard-peer holds _owned_data;
@@ -460,6 +492,19 @@ def get_model_state_dict(
     #    the policy's forward dtype.  Save the master copy when available and
     #    only fall back to the live parameter for legacy objects.
     for dp, fqn in dp_fqns.items():
+        parent = getattr(dp, "matrix_parent", None)
+        if parent is not None:
+            tensor = _broadcast_from_owner(dp, cpu_offload=cpu_offload, keep=keep)
+            if keep:
+                if parent not in assembled:
+                    assembled[parent] = torch.empty(
+                        math.prod(parent.layout.source_shape),
+                        dtype=tensor.dtype,
+                        device=tensor.device,
+                    )
+                spec = dp.matrix_spec
+                assembled[parent][spec.offset : spec.offset + spec.numel].copy_(tensor.view(-1))
+            continue
         mode = getattr(
             dp._orig_param if hasattr(dp, "_orig_param") else None,
             "_dedicated_mode",
@@ -503,6 +548,10 @@ def get_model_state_dict(
                 t = param.data
                 sd[name] = t.cpu() if cpu_offload else t.clone()
 
+    for parent, packed in assembled.items():
+        tensor = parent.layout.unpack(packed)
+        for name in _parent_fqns(model, parent):
+            sd[name] = tensor
     return sd
 
 
@@ -521,8 +570,29 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
     """
     # 1. Identify dedicated param FQNs.
     dp_fqns = _compute_dedicated_fqns(model)
+    parents = _matrix_parents(model)
+    parent_tensors = {}
+    for parent in parents.values():
+        tensor = next(
+            (state_dict[name] for name in _parent_fqns(model, parent) if name in state_dict), None
+        )
+        if tensor is not None:
+            if tuple(tensor.shape) != parent.layout.source_shape:
+                raise ValueError(f"{parent.fqn}: checkpoint original parameter shape differs")
+            parent_tensors[parent] = tensor
     fqn_to_dp = {fqn: dp for dp, fqn in dp_fqns.items()}
-    dedicated_fqn_set = set(fqn_to_dp.keys())
+    dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
+
+    # Pack one original parameter at a time and load its local matrices. The
+    # full checkpoint remains in native model order; optimizer storage does not.
+    for parent, tensor in parent_tensors.items():
+        packed = parent.layout.pack(tensor)
+        for dp in parent.units:
+            if dp._owned_data is not None:
+                spec = dp.matrix_spec
+                piece = packed[spec.offset : spec.offset + spec.numel].view(spec.shape)
+                dp._owned_data.copy_(piece.to(device=dp.device, dtype=dp._owned_data.dtype))
+        del packed
 
     # 2. Load dedicated params.
     #    FSDP2 path: copy from state_dict into every rank that holds
@@ -531,6 +601,9 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
     #    ``nn.Parameter`` — copy the state into both so subsequent forwards
     #    see the loaded value and the next NS step reads from it.
     for fqn, dp in fqn_to_dp.items():
+        parent = getattr(dp, "matrix_parent", None)
+        if parent is not None:
+            continue
         if fqn not in state_dict:
             continue
         if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
@@ -581,6 +654,13 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
         else:
             param.data.copy_(full_tensor.to(param.dtype).to(param.device))
 
+    if parents:
+        # Discard old compute copies, including still-live ZeRO-2 slots, so
+        # the next forward reads the newly loaded owner weights.
+        for state in iter_dedicated_states(model):
+            if getattr(state.group, "_matrix_params", None) is not None:
+                state.group.reshard()
+
 
 # ---- Optimizer state dict ----
 
@@ -618,7 +698,7 @@ def get_optimizer_state_dict(
     wait_all_replicate_broadcasts(model)
 
     dp_fqns = _compute_dedicated_fqns(model)
-    dedicated_fqn_set = set(dp_fqns.values())
+    dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
 
     keep = (not rank0_only) or (dist.get_rank() == 0)
 
@@ -630,18 +710,23 @@ def get_optimizer_state_dict(
     muon_dps = [dp for dp in all_dedicated if id(dp) in dp_to_muon_group]
     dedicated_state: dict[str, dict[str, Any]] = {}
 
-    # Check if any owner has momentum state (optimizer.step called at least once).
-    # Use a flag broadcast to coordinate: if no owner has state, skip all broadcasts.
-    any_has_state = any(
-        id(dp) in optimizer.state and "momentum_buffer" in optimizer.state[id(dp)]
+    # State presence is per matrix: sparse routing and unused projections can
+    # leave some owners without momentum after other matrices have stepped.
+    # Never broadcast an uninitialized placeholder for those absent entries.
+    local_has_state = [
+        id(dp) in optimizer.state
+        and "momentum_buffer" in optimizer.state[id(dp)]
+        and _owns_dedicated_optimizer_state(dp)
         for dp in muon_dps
-        if _owns_dedicated_optimizer_state(dp)
+    ]
+    has_state_tensor = torch.tensor(
+        local_has_state, dtype=torch.int32, device=next(iter(dp_fqns)).device
     )
-    has_state_tensor = torch.tensor([int(any_has_state)], device=next(iter(dp_fqns)).device)
-    dist.all_reduce(has_state_tensor, op=dist.ReduceOp.MAX)
-
-    if has_state_tensor.item() > 0:
-        for dp in muon_dps:
+    if muon_dps:
+        dist.all_reduce(has_state_tensor, op=dist.ReduceOp.MAX)
+        for dp, has_state in zip(muon_dps, has_state_tensor.tolist()):
+            if not has_state:
+                continue
             fqn = dp_fqns[dp]
             dp_id = id(dp)
             if (
@@ -679,6 +764,8 @@ def get_optimizer_state_dict(
                 dp,
                 int(local_state.get("step", 0) or 0) if local_state else None,
             )
+            if step == 0:
+                continue
             entry: dict[str, Any] = {"step": step}
             for key in ("exp_avg", "exp_avg_sq"):
                 tensor = local_state.get(key) if local_state else None
@@ -735,12 +822,16 @@ def get_optimizer_state_dict(
     else:
         param_groups = []
 
-    return {
+    result = {
         "fsdp": fsdp_state,
         "dedicated": dedicated_state,
         "dedicated_adamw": dedicated_adamw_state,
         "param_groups": param_groups,
     }
+    layouts = _layout_state(model)
+    if layouts and keep:
+        result["matrix_layouts"] = layouts
+    return result
 
 
 def set_optimizer_state_dict(model: nn.Module, optimizer: Any, state_dict: dict) -> None:
@@ -752,8 +843,13 @@ def set_optimizer_state_dict(model: nn.Module, optimizer: Any, state_dict: dict)
         state_dict: Optimizer state dict as produced by
             :func:`get_optimizer_state_dict`.
     """
+    expected_layouts = _layout_state(model)
+    if state_dict.get("matrix_layouts", {}) != expected_layouts:
+        raise ValueError(
+            "Optimizer checkpoint matrix layouts differ from the configured NS boundaries"
+        )
     dp_fqns = _compute_dedicated_fqns(model)
-    dedicated_fqn_set = set(dp_fqns.values())
+    dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
 
     # 1. Dedicated Muon state: load momentum_buffer on owner.
     if "dedicated" in state_dict:

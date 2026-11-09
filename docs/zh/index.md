@@ -1,20 +1,19 @@
 # DMuon
 
-**面向 PyTorch DDP、FSDP2 和 HSDP 的矩阵优化器专属所有权方案。**
-
-*一个所有者。一次 Newton-Schulz。零优化器 all-gather。*
-
----
+<p class="dmuon-lead">面向 PyTorch DDP、FSDP2 和 HSDP 的矩阵优化器专属所有权方案。</p>
 
 <div class="dmuon-hero" markdown>
 
-DMuon 为每个矩阵参数指定唯一的**所有者 rank**。所有者存储完整参数，从其他 rank 汇聚梯度，并独立运行 Newton-Schulz——彻底消除了让朴素 FSDP2+Muon 比 AdamW 慢 3–4 倍的 all-gather 和冗余计算。
+<p class="dmuon-eyebrow">PYTORCH · 矩阵优化</p>
+<p class="dmuon-hero-title">每张逻辑矩阵，一个 owner。</p>
 
-从单节点到多节点 HSDP 集群，只需两行 API 变更。二维 Mesh、两阶段 reduce 以及异步 forward 隐藏广播均由内部自动处理。
+由 owner rank 执行对应的 Muon 矩阵更新。独立选择优化器路由、wrapping
+边界和矩阵布局，沿用现有 PyTorch 模型。
+
+[快速开始](getting-started/quickstart.md){ .md-button .md-button--primary }
+[配置矩阵布局](guides/matrix-layouts.md){ .md-button }
 
 </div>
-
----
 
 ## DMuon 能做什么
 
@@ -72,11 +71,12 @@ DMuon 为每个矩阵参数指定唯一的**所有者 rank**。所有者存储�
     boundary 纳入 DMuon。通过 Gram Newton-Schulz（O(d_model²) 通信量）
     实现 TP 兼容，可与列/行并行张量并行配合使用。
 
-??? abstract "MoE — 专家并行布局下的混合专家模型"
+??? abstract "MoE — 堆叠专家和融合权重"
 
-    使用 `hook_boundary_predicate` 将 Hook 边界与专家模块对齐。
-    每个专家的投影参数独立分配给一个所有者 rank；均衡划分确保
-    各专家组间不出现掉队 rank。
+    使用 `MatrixLayout` 声明逐专家、gate/up 或逐 head 更新，保留原模型的
+    模块和参数形状。通过参数策略选择布局，在 decoder Hook 边界组织通信。
+
+    [配置矩阵布局](guides/matrix-layouts.md)。
 
 ---
 
@@ -150,11 +150,11 @@ DMuon 为每个矩阵参数指定唯一的**所有者 rank**。所有者存储�
 
     [:octicons-arrow-right-24: 快速开始](getting-started/quickstart.md)
 
--   :material-head-lightbulb:{ .lg .middle } **核心概念**
+-   :material-view-grid-outline:{ .lg .middle } **矩阵布局**
 
-    专属所有权、Z2/Z3 模式、Hook 边界与 HSDP 设计。
+    配置融合 QKV、逐 head 更新和堆叠 MoE 专家。
 
-    [:octicons-arrow-right-24: 核心概念](getting-started/concepts.md)
+    [:octicons-arrow-right-24: 矩阵布局](guides/matrix-layouts.md)
 
 -   :material-server-network:{ .lg .middle } **HSDP 指南**
 
@@ -163,10 +163,3 @@ DMuon 为每个矩阵参数指定唯一的**所有者 rank**。所有者存储�
     [:octicons-arrow-right-24: HSDP 指南](guides/hsdp.md)
 
 </div>
-
----
-
-DMuon 建立在 ZeRO-1（Rajbhandari 等，2020）和 Distributed Shampoo（Shi 等，2023）
-所开创的专属所有权原语之上。Gram Newton-Schulz 核改编自 Dao 等，2026。
-
-GitHub：[X-Square-Robot/dmuon](https://github.com/X-Square-Robot/dmuon) &nbsp;·&nbsp; arXiv 预印本：[TBD]
