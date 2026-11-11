@@ -382,6 +382,173 @@ def test_model_load_invalidates_live_compute_slot(cpu_transport):
     assert torch.count_nonzero(model(hidden)) == 0
 
 
+@pytest.mark.parametrize("eval_context", [torch.no_grad, torch.inference_mode])
+@pytest.mark.parametrize(
+    "route,placement,layout",
+    [
+        ("muon", "broadcast", None),
+        ("adamw", "broadcast", None),
+        ("sharded_adamw", "broadcast", None),
+        ("muon", "all_gather", None),
+        ("muon", "broadcast", MatrixLayout.whole()),
+        ("muon", "broadcast", MatrixLayout.view(3, 4, 8)),
+        (
+            "muon", "broadcast",
+            MatrixLayout.view(2, 3, 2, 8).permute(1, 0, 2, 3).reshape(3, 4, 8),
+        ),
+    ],
+)
+def test_model_load_refreshes_zero2_eval_copies(
+    cpu_transport, monkeypatch, eval_context, route, placement, layout
+):
+    # Real copy-in, placement, checkpoint and forward hooks; only the one-rank
+    # transport and device streams are stubbed, like the other integration tests.
+    transfers = []
+
+    def gather(output, source, **_kwargs):
+        transfers.append("gather")
+        output.copy_(source)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
+    monkeypatch.setattr(
+        torch.distributed, "reduce_scatter_tensor",
+        lambda output, source, **_kwargs: output.copy_(source),
+    )
+    model = Model(torch.ones(12, 8)).eval()
+    policy = dict(route=route, param_dtype=torch.bfloat16, grad_dtype=torch.bfloat16,
+                  master_dtype=torch.float32)
+    if layout is not None:
+        policy["matrix_layout"] = layout
+    dmuon.dedicate_params(
+        model, Mesh(), lambda _n, _p: True, reshard_after_forward=False,
+        compute_dtype=torch.bfloat16, process_group_policy="shared",
+        muon_forward_unshard=placement, param_policy={"defaults": policy},
+    )
+    group = model._dedicated_comm_ctx.all_states[0].group
+    hidden = torch.ones(3, 8, dtype=torch.bfloat16)
+    target = torch.full((12, 8), 2.0)
+    with eval_context():
+        old = model(hidden).clone()
+    assert group._is_unsharded
+    dmuon.set_model_state_dict(model, {"weight": target})
+    assert not group._is_unsharded
+    torch.testing.assert_close(
+        dmuon.get_model_state_dict(model, rank0_only=False)["weight"],
+        target, rtol=0, atol=0,
+    )
+    with eval_context():
+        actual = model(hidden).clone()
+        expected = nn.functional.linear(hidden, target.to(torch.bfloat16))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert not torch.equal(actual, old)
+        counts = len(cpu_transport), len(transfers)
+        torch.testing.assert_close(model(hidden), expected, rtol=0, atol=0)
+        assert (len(cpu_transport), len(transfers)) == counts
+    assert not model._dedicated_comm_ctx.all_states[0].reshard_after_forward
+    group.reshard()
+
+
+def test_model_load_partial_only_invalidates_affected_group(cpu_transport):
+    model = nn.Sequential(nn.Linear(8, 8, bias=False), nn.Linear(8, 8, bias=False)).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(1.)
+    dmuon.dedicate_params(
+        model, Mesh(), lambda _n, _p: True, reshard_after_forward=False,
+        compute_dtype=torch.bfloat16, process_group_policy="shared",
+        hook_boundary_predicate=lambda module: isinstance(module, nn.Linear),
+    )
+    groups = [state.group for state in model._dedicated_comm_ctx.all_states]
+    hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+    with torch.no_grad():
+        model(hidden)
+        assert all(group._is_unsharded for group in groups)
+        dmuon.set_model_state_dict(model, {"0.weight": torch.full((8, 8), 2.)})
+        assert not groups[0]._is_unsharded
+        assert groups[1]._is_unsharded
+        count = len(cpu_transport)
+        torch.testing.assert_close(model(hidden), torch.full((2, 8), 128., dtype=torch.bfloat16))
+        assert len(cpu_transport) == count + 1
+        count = len(cpu_transport)
+        dmuon.set_model_state_dict(model, {})
+        assert all(group._is_unsharded for group in groups)
+        model(hidden)
+        assert len(cpu_transport) == count
+    for group in groups:
+        group.reshard()
+
+
+@pytest.mark.parametrize("layout", [None, MatrixLayout.whole(), MatrixLayout.view(3, 4, 8)])
+def test_model_load_reads_live_checkpoint_views_before_releasing_storage(cpu_transport, layout):
+    model = Model(torch.ones(12, 8)).eval()
+    policy = {} if layout is None else {"matrix_layout": layout}
+    dmuon.dedicate_params(
+        model, Mesh(), lambda _n, _p: True, reshard_after_forward=False,
+        compute_dtype=torch.bfloat16, process_group_policy="shared",
+        param_policy={"defaults": policy},
+    )
+    with torch.no_grad():
+        hidden = torch.ones(2, 8, dtype=torch.bfloat16)
+        expected = model(hidden).clone()
+        # Deliberately no clone: these checkpoint bytes share live storage.
+        checkpoint = {"weight": model.weight.detach()}
+        for dp in dmuon.get_dedicated_params(model):
+            dp._owned_data.fill_(3.)
+        dmuon.set_model_state_dict(model, checkpoint)
+        torch.testing.assert_close(model(hidden), expected, rtol=0, atol=0)
+    model._dedicated_comm_ctx.all_states[0].group.reshard()
+
+
+def test_model_load_drains_old_publish_and_prefetch_before_writing(cpu_transport, monkeypatch):
+    class PendingEvent:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def finish(self):
+            if self.callback is not None:
+                callback, self.callback = self.callback, None
+                callback()
+
+    def wait_event(_stream, event):
+        if isinstance(event, PendingEvent):
+            event.finish()
+
+    monkeypatch.setattr(Stream, "wait_event", wait_event)
+    model = Model(torch.ones(4, 4)).eval()
+    dmuon.dedicate_params(
+        model, Mesh(), lambda _n, _p: True, reshard_after_forward=False,
+        compute_dtype=torch.bfloat16, process_group_policy="shared",
+    )
+    group = model._dedicated_comm_ctx.all_states[0].group
+    dp = dmuon.get_dedicated_params(model)[0]
+    group.unshard(prefetch=True)
+    assert group._broadcast_event is not None and not group._is_unsharded
+    trace = []
+
+    def finish_old_publish():
+        trace.append("publish")
+        dp._owned_data.fill_(3.)
+
+    def finish_old_prefetch():
+        trace.append("prefetch")
+        assert torch.all(dp._owned_data == 3.)  # checkpoint has not overwritten it yet
+
+    group._replicate_broadcast_state = SimpleNamespace(
+        event=PendingEvent(finish_old_publish), replicate_input=dp._owned_data,
+    )
+    group._broadcast_event = PendingEvent(finish_old_prefetch)
+    dmuon.set_model_state_dict(model, {"weight": torch.full((4, 4), 2.)})
+    assert trace == ["publish", "prefetch"]
+    assert group._replicate_broadcast_state is None and group._broadcast_event is None
+    assert torch.all(dp._owned_data == 2.)
+    with torch.no_grad():
+        torch.testing.assert_close(
+            model(torch.ones(2, 4, dtype=torch.bfloat16)),
+            torch.full((2, 4), 8., dtype=torch.bfloat16), rtol=0, atol=0,
+        )
+    group.reshard()
+
+
 def test_layout_clip_counts_each_gradient_once(cpu_transport):
     model, optimizer = _installed_model(MatrixLayout.view(3, 4, 8), shape=(12, 8))
     reference = dmuon.get_model_state_dict(model)["weight"].requires_grad_()

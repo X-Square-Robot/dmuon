@@ -39,6 +39,14 @@ try:
 except ImportError:
     _DTensor = None
 
+try:
+    from torch.distributed.fsdp import FSDPModule as _FSDPModule
+except ImportError:
+    try:
+        from torch.distributed._composable.fsdp import FSDPModule as _FSDPModule
+    except ImportError:
+        _FSDPModule = None
+
 
 # ---- FQN computation ----
 
@@ -447,6 +455,59 @@ def _get_dp_mesh(model: nn.Module):
 # ---- Model state dict ----
 
 
+def _reshard_fsdp_modules(modules):
+    """Finish existing prefetches before restoring persistent FSDP parameters."""
+    if _FSDPModule is None:
+        return
+    fsdp_modules = [module for module in modules if isinstance(module, _FSDPModule)]
+    for module in reversed(fsdp_modules):
+        group = module._get_fsdp_state()._fsdp_param_group
+        if group is not None and group._all_gather_result is not None:
+            # reshard() alone leaves the pending all-gather alive. Consume it
+            # before freeing compute storage, so it cannot overwrite a later
+            # checkpoint load. Do not initiate a new unshard for idle groups.
+            module.unshard()
+        module.reshard()
+
+
+def _reshard_fsdp_for_model_load(model, state_dict, dedicated_fqns):
+    """Return checkpoint inputs safe to read after releasing FSDP compute views."""
+    if _FSDPModule is None:
+        return state_dict
+    fsdp_modules = [module for module in model.modules() if isinstance(module, _FSDPModule)]
+    if not fsdp_modules:
+        return state_dict
+    symmetric_params = {
+        name: param for name, param in model.named_parameters() if name not in dedicated_fqns
+    }
+    if not symmetric_params.keys() & state_dict.keys():
+        return state_dict
+
+    def storage_key(tensor):
+        if _DTensor is not None and isinstance(tensor, _DTensor):
+            tensor = tensor._local_tensor
+        if tensor.is_meta or tensor.layout != torch.strided:
+            return None
+        storage = tensor.untyped_storage()
+        if not storage.nbytes():
+            return None
+        return tensor.device, storage.data_ptr()
+
+    # A state-dict value can be a detached view of an unsharded parameter.
+    # Protect every input sharing symmetric parameter storage before reshard
+    # releases it; the input may target a different or dedicated parameter.
+    live_storages = {key for param in symmetric_params.values() if (key := storage_key(param))}
+    protected = {}
+    with torch.no_grad():
+        for name, tensor in state_dict.items():
+            if isinstance(tensor, torch.Tensor) and storage_key(tensor) in live_storages:
+                protected[name] = tensor.detach().clone()
+    if protected:
+        state_dict = {**state_dict, **protected}
+    _reshard_fsdp_modules(fsdp_modules)
+    return state_dict
+
+
 def get_model_state_dict(
     model: nn.Module, *, cpu_offload: bool = True, rank0_only: bool = True
 ) -> dict[str, torch.Tensor]:
@@ -475,6 +536,9 @@ def get_model_state_dict(
     # Phase C.3: drain any pending async replicate broadcast so every
     # owner's ``_owned_data`` reflects the latest optimizer update.
     wait_all_replicate_broadcasts(model)
+    # ZeRO-2 eval can leave BF16 compute views registered on the module.
+    # Export persistent shards, including their original dtype and precision.
+    _reshard_fsdp_modules(model.modules())
 
     dp_fqns = _compute_dedicated_fqns(model)
     dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
@@ -564,6 +628,12 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
     The state dict should contain full (unsharded) tensors, as produced by
     :func:`get_model_state_dict` or a single-GPU ``model.state_dict()``.
 
+    Loading invalidates the affected groups' existing compute copies. The next
+    forward rebuilds them from the loaded weights using the original unshard
+    and prefetch policy, including after forward-only ZeRO-2 evaluation.
+    FSDP2-managed parameters are restored into their persistent shards, with
+    checkpoint inputs that alias live compute views protected before reshard.
+
     Args:
         model: Model with ``dedicate_params`` and ``fully_shard`` applied.
         state_dict: Full state dict mapping FQN to unsharded tensors.
@@ -582,6 +652,32 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
             parent_tensors[parent] = tensor
     fqn_to_dp = {fqn: dp for dp, fqn in dp_fqns.items()}
     dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
+
+    loaded_params = {
+        dp
+        for dp, fqn in dp_fqns.items()
+        if fqn in state_dict or getattr(dp, "matrix_parent", None) in parent_tensors
+    }
+    loaded_groups = []
+    if loaded_params:
+        # Finish old TP/replicate publications before overwriting master data.
+        # Drain old forward prefetches too, but retain compute storage until
+        # all checkpoint reads finish: an input tensor may alias a live view.
+        wait_all_replicate_broadcasts(model)
+        seen_groups = set()
+        for state in iter_dedicated_states(model):
+            group = state.group
+            if id(group) not in seen_groups and any(dp in loaded_params for dp in group.params):
+                group.wait_for_unshard()
+                loaded_groups.append(group)
+                seen_groups.add(id(group))
+
+    state_dict = _reshard_fsdp_for_model_load(model, state_dict, dedicated_fqn_set)
+    # Parent tensors may also have aliased a released FSDP compute view.
+    for parent in parent_tensors:
+        parent_tensors[parent] = next(
+            state_dict[name] for name in _parent_fqns(model, parent) if name in state_dict
+        )
 
     # Pack one original parameter at a time and load its local matrices. The
     # full checkpoint remains in native model order; optimizer storage does not.
@@ -654,12 +750,15 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
         else:
             param.data.copy_(full_tensor.to(param.dtype).to(param.device))
 
-    if parents:
-        # Discard old compute copies, including still-live ZeRO-2 slots, so
-        # the next forward reads the newly loaded owner weights.
-        for state in iter_dedicated_states(model):
-            if getattr(state.group, "_matrix_params", None) is not None:
-                state.group.reshard()
+    # Allocated compute storage does not imply fresh content. Discard ordinary
+    # and MatrixLayout copies alike; the next forward uses loaded master data.
+    for group in loaded_groups:
+        group.reshard()
+    for dp in loaded_params:
+        if getattr(dp, "uses_sharded_muon_forward", lambda: False)():
+            # Republish the loaded owner tensor before the next all-gather;
+            # the old rank-local forward shards also contain cached data.
+            dp._sharded_muon_initialized = False
 
 
 # ---- Optimizer state dict ----
@@ -696,6 +795,8 @@ def get_optimizer_state_dict(
     # is the same rank that writes ``_owned_data`` at step end; draining
     # pending async broadcast makes both consistent with the snapshot.
     wait_all_replicate_broadcasts(model)
+    # Optimizer states are keyed by persistent parameters, not compute views.
+    _reshard_fsdp_modules(model.modules())
 
     dp_fqns = _compute_dedicated_fqns(model)
     dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
@@ -719,10 +820,10 @@ def get_optimizer_state_dict(
         and _owns_dedicated_optimizer_state(dp)
         for dp in muon_dps
     ]
-    has_state_tensor = torch.tensor(
-        local_has_state, dtype=torch.int32, device=next(iter(dp_fqns)).device
-    )
     if muon_dps:
+        has_state_tensor = torch.tensor(
+            local_has_state, dtype=torch.int32, device=muon_dps[0].device
+        )
         dist.all_reduce(has_state_tensor, op=dist.ReduceOp.MAX)
         for dp, has_state in zip(muon_dps, has_state_tensor.tolist()):
             if not has_state:
@@ -750,12 +851,15 @@ def get_optimizer_state_dict(
         for dp in dedicated_adamw_dps
         if _owns_dedicated_adamw_optimizer_state(dp)
     )
-    has_adamw_state_tensor = torch.tensor(
-        [int(any_has_adamw_state)], device=next(iter(dp_fqns)).device
-    )
-    dist.all_reduce(has_adamw_state_tensor, op=dist.ReduceOp.MAX)
+    has_adamw_state = False
+    if dedicated_adamw_dps:
+        has_adamw_state_tensor = torch.tensor(
+            [int(any_has_adamw_state)], device=dedicated_adamw_dps[0].device
+        )
+        dist.all_reduce(has_adamw_state_tensor, op=dist.ReduceOp.MAX)
+        has_adamw_state = has_adamw_state_tensor.item() > 0
 
-    if has_adamw_state_tensor.item() > 0:
+    if has_adamw_state:
         for dp in dedicated_adamw_dps:
             fqn = dp_fqns[dp]
             owns_state = _owns_dedicated_adamw_optimizer_state(dp)
@@ -848,6 +952,8 @@ def set_optimizer_state_dict(model: nn.Module, optimizer: Any, state_dict: dict)
         raise ValueError(
             "Optimizer checkpoint matrix layouts differ from the configured NS boundaries"
         )
+    if state_dict.get("fsdp"):
+        _reshard_fsdp_modules(model.modules())
     dp_fqns = _compute_dedicated_fqns(model)
     dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
 
