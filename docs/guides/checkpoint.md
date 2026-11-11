@@ -51,6 +51,14 @@ This restores:
 - **Optimizer state** — momentum buffers (Muon) and Adam moments (AdamW)
 - **Step counters** — for correct AdamW bias correction
 
+Reloading the same model after forward-only ZeRO-2 evaluation also restores
+FSDP2-managed parameters into their persistent master shards. A checkpoint
+tensor may alias a live gathered compute view; such inputs are protected before
+that view is released. Checking the immediate prediction alone is insufficient:
+the persistent model state must match too, since subsequent updates use it.
+This normalization occurs only when loading symmetric parameters and does not
+change steady-state ZeRO-2 residency or optimizer synchronization.
+
 ## Load Pretrained (No Optimizer State)
 
 Loading a pretrained model (without optimizer state) works the same way:

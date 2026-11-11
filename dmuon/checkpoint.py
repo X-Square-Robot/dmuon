@@ -39,6 +39,14 @@ try:
 except ImportError:
     _DTensor = None
 
+try:
+    from torch.distributed.fsdp import FSDPModule as _FSDPModule
+except ImportError:
+    try:
+        from torch.distributed._composable.fsdp import FSDPModule as _FSDPModule
+    except ImportError:
+        _FSDPModule = None
+
 
 # ---- FQN computation ----
 
@@ -447,6 +455,45 @@ def _get_dp_mesh(model: nn.Module):
 # ---- Model state dict ----
 
 
+def _reshard_fsdp_for_model_load(model, state_dict, dedicated_fqns):
+    """Return checkpoint inputs safe to read after releasing FSDP compute views."""
+    if _FSDPModule is None:
+        return state_dict
+    fsdp_modules = [module for module in model.modules() if isinstance(module, _FSDPModule)]
+    if not fsdp_modules:
+        return state_dict
+    symmetric_params = {
+        name: param for name, param in model.named_parameters() if name not in dedicated_fqns
+    }
+    if not symmetric_params.keys() & state_dict.keys():
+        return state_dict
+
+    def storage_key(tensor):
+        if _DTensor is not None and isinstance(tensor, _DTensor):
+            tensor = tensor._local_tensor
+        if tensor.is_meta or tensor.layout != torch.strided:
+            return None
+        storage = tensor.untyped_storage()
+        if not storage.nbytes():
+            return None
+        return tensor.device, storage.data_ptr()
+
+    # A state-dict value can be a detached view of an unsharded parameter.
+    # Protect every input sharing symmetric parameter storage before reshard
+    # releases it; the input may target a different or dedicated parameter.
+    live_storages = {key for param in symmetric_params.values() if (key := storage_key(param))}
+    protected = {}
+    with torch.no_grad():
+        for name, tensor in state_dict.items():
+            if isinstance(tensor, torch.Tensor) and storage_key(tensor) in live_storages:
+                protected[name] = tensor.detach().clone()
+    if protected:
+        state_dict = {**state_dict, **protected}
+    for module in reversed(fsdp_modules):
+        module.reshard()
+    return state_dict
+
+
 def get_model_state_dict(
     model: nn.Module, *, cpu_offload: bool = True, rank0_only: bool = True
 ) -> dict[str, torch.Tensor]:
@@ -567,6 +614,8 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
     Loading invalidates the affected groups' existing compute copies. The next
     forward rebuilds them from the loaded weights using the original unshard
     and prefetch policy, including after forward-only ZeRO-2 evaluation.
+    FSDP2-managed parameters are restored into their persistent shards, with
+    checkpoint inputs that alias live compute views protected before reshard.
 
     Args:
         model: Model with ``dedicate_params`` and ``fully_shard`` applied.
@@ -588,7 +637,8 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
     dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
 
     loaded_params = {
-        dp for dp, fqn in dp_fqns.items()
+        dp
+        for dp, fqn in dp_fqns.items()
         if fqn in state_dict or getattr(dp, "matrix_parent", None) in parent_tensors
     }
     loaded_groups = []
@@ -604,6 +654,13 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
                 group.wait_for_unshard()
                 loaded_groups.append(group)
                 seen_groups.add(id(group))
+
+    state_dict = _reshard_fsdp_for_model_load(model, state_dict, dedicated_fqn_set)
+    # Parent tensors may also have aliased a released FSDP compute view.
+    for parent in parent_tensors:
+        parent_tensors[parent] = next(
+            state_dict[name] for name in _parent_fqns(model, parent) if name in state_dict
+        )
 
     # Pack one original parameter at a time and load its local matrices. The
     # full checkpoint remains in native model order; optimizer storage does not.
