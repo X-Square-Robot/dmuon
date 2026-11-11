@@ -56,8 +56,14 @@ FSDP2-managed parameters into their persistent master shards. A checkpoint
 tensor may alias a live gathered compute view; such inputs are protected before
 that view is released. Checking the immediate prediction alone is insufficient:
 the persistent model state must match too, since subsequent updates use it.
-This normalization occurs only when loading symmetric parameters and does not
-change steady-state ZeRO-2 residency or optimizer synchronization.
+Saving after evaluation also reads persistent master shards, preserving FP32
+precision even when the live compute views are BF16. Save/load completes any
+already pending FSDP prefetch before releasing compute storage, so a stale
+all-gather cannot overwrite newly loaded weights. Optimizer save/load likewise
+resolves state against persistent parameters, including when called separately.
+These transitions occur at checkpoint boundaries; normal training retains its
+ZeRO-2 residency and synchronization policy. A dedicated-only model load does
+not reshard unrelated FSDP parameters.
 
 ## Load Pretrained (No Optimizer State)
 

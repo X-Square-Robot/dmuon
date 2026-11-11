@@ -5,12 +5,13 @@ Run: torchrun --standalone --nproc_per_node=4 tests/distributed/test_zero2_eval_
 
 import os
 import sys
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -29,11 +30,76 @@ class Probe(nn.Module):
 
 
 def canonical_state(model):
-    # Normalize only symmetric FSDP state; leave dedicated compute copies live.
-    for module in model.modules():
-        if isinstance(module, FSDPModule):
-            module.reshard()
     return dmuon.get_model_state_dict(model, rank0_only=False)
+
+
+def run_fsdp_boundary_case(device, mesh, dtype):
+    """Exercise real FSDP boundaries; also runnable on CPU/Gloo with PyTorch 2.10."""
+    model = nn.Linear(4, 4, bias=False, device=device)
+    with torch.no_grad():
+        model.weight.fill_(0.123456)
+    fully_shard(
+        model,
+        mesh=mesh,
+        reshard_after_forward=False,
+        mp_policy=MixedPrecisionPolicy(param_dtype=dtype),
+    )
+    hidden = torch.ones(2, 4, device=device)
+    master = model.weight
+    group = model._get_fsdp_state()._fsdp_param_group
+    model.eval()
+    with torch.no_grad():
+        model(hidden)
+    saved = dmuon.get_model_state_dict(model, cpu_offload=False, rank0_only=False)
+    assert saved["weight"].dtype == torch.float32
+    torch.testing.assert_close(
+        saved["weight"], torch.full_like(saved["weight"], 0.123456), rtol=0, atol=0
+    )
+
+    model.unshard(async_op=True)
+    assert group._all_gather_result is not None
+    dmuon.set_model_state_dict(model, {"weight": torch.full((4, 4), 2.0, device=device)})
+    assert group._all_gather_result is None
+    # Check the next forward before any getter could incidentally reshard.
+    with torch.no_grad():
+        actual = model(hidden)
+    torch.testing.assert_close(actual, torch.full_like(actual, 8), rtol=0, atol=0)
+
+    # Standalone optimizer save/load must resolve persistent parameter IDs too.
+    optimizer = SimpleNamespace(
+        _fsdp_params=[master],
+        param_groups=[],
+        state={master: {"exp_avg": torch.ones_like(master._local_tensor), "step": 3}},
+    )
+    optim_sd = dmuon.get_optimizer_state_dict(
+        model,
+        optimizer,
+        cpu_offload=False,
+        rank0_only=False,
+    )
+    assert optim_sd["fsdp"]["weight"]["step"] == 3
+    assert optim_sd["fsdp"]["weight"]["exp_avg"].shape == (4, 4)
+    with torch.no_grad():
+        model(hidden)
+    optimizer.state.clear()
+    dmuon.set_optimizer_state_dict(model, optimizer, optim_sd)
+    assert master in optimizer.state
+    torch.testing.assert_close(
+        optimizer.state[master]["exp_avg"], torch.ones_like(master._local_tensor), rtol=0, atol=0
+    )
+
+    model.unshard(async_op=True)
+    assert group._all_gather_result is not None
+    saved = dmuon.get_model_state_dict(model, cpu_offload=False, rank0_only=True)
+    assert group._all_gather_result is None
+    if dist.get_rank() == 0:
+        torch.testing.assert_close(
+            saved["weight"], torch.full_like(saved["weight"], 2), rtol=0, atol=0
+        )
+        print(f"PASS FSDP pending prefetch, master export, optimizer IDs: {dtype=}")
+    else:
+        assert saved == {}
+    dist.barrier()
 
 
 def reference(hidden, state, device, dtype):
@@ -153,6 +219,7 @@ def main():
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     mesh = init_device_mesh("cuda", (dist.get_world_size(),))
     for dtype in (torch.float32, torch.bfloat16):
+        run_fsdp_boundary_case(device, mesh, dtype)
         for replicate_async in (False, True):
             for matrix_layout in (False, True):
                 run_case(device, mesh, dtype, replicate_async, matrix_layout)
