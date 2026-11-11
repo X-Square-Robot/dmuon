@@ -104,7 +104,12 @@ class NSGraphCache:
             with torch.cuda.stream(side):
                 ns_fn(sg.stage_in)
             torch.cuda.current_stream().wait_stream(side)
-            with torch.cuda.graph(graph, pool=self._pool):
+            # NS consumes only persistent GPU buffers on this thread. Keep
+            # capture-thread checks while allowing independent DataLoader
+            # pinning/event queries on background threads.
+            with torch.cuda.graph(
+                graph, pool=self._pool, capture_error_mode="thread_local"
+            ):
                 sg.update_out = ns_fn(sg.stage_in)
             sg.graph = graph
             _logger.info(

@@ -309,6 +309,13 @@ single `replay()`.
 bit-identical to eager (same kernels and coefficients -- only the launch
 mechanism changes), so it is safe to leave enabled.
 
+**Pinned-memory loading.** NS capture uses `capture_error_mode="thread_local"`.
+Its inputs and outputs are persistent GPU buffers, independent of CPU batches,
+so a DataLoader pin-memory thread may allocate or query events concurrently.
+You can keep `pin_memory=True`. The capture thread itself still rejects
+operations forbidden by CUDA Graph capture, such as device synchronization.
+This setting applies only to NS capture, not to a whole training-step graph.
+
 **Shape-stability assumption.**  Capture is keyed on `(shape, dtype, device)`.
 Standard training reuses a small stable set of NS shapes, so each is captured
 once.  A workload that churns NS input shapes every step would re-capture

@@ -290,6 +290,12 @@ shape 把 NS 计算捕获成一张 CUDA graph 并在后续步复用，把每次�
 **默认开启；用 `DMUON_NS_CUDA_GRAPH=0` 关闭。** 重放与 eager 逐位一致
 （相同 kernel 与系数，只是发射方式变了），因此可以放心保持开启。
 
+**锁页内存加载。** NS 捕获使用 `capture_error_mode="thread_local"`。
+输入和输出都是持久 GPU buffer，与 CPU batch 无关，因此 DataLoader 的后台锁页
+线程可以同时分配内存或查询事件，调用方可保留 `pin_memory=True`。捕获线程自身
+仍不能执行 CUDA Graph 禁止的操作，例如设备同步。此设置只作用于 NS 捕获，
+不改变整个训练步骤的 graph 捕获模式。
+
 **Shape 稳定性假设。** 捕获以 `(shape, dtype, device)` 为键。标准训练复用一小
 组稳定的 NS shape，因此每个只捕获一次。若某工作负载每步都在变动 NS 输入
 shape，则会不断重新捕获——这种情况请设 `DMUON_NS_CUDA_GRAPH=0`。
