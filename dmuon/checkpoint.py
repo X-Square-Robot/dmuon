@@ -564,6 +564,10 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
     The state dict should contain full (unsharded) tensors, as produced by
     :func:`get_model_state_dict` or a single-GPU ``model.state_dict()``.
 
+    Loading invalidates the affected groups' existing compute copies. The next
+    forward rebuilds them from the loaded weights using the original unshard
+    and prefetch policy, including after forward-only ZeRO-2 evaluation.
+
     Args:
         model: Model with ``dedicate_params`` and ``fully_shard`` applied.
         state_dict: Full state dict mapping FQN to unsharded tensors.
@@ -582,6 +586,24 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
             parent_tensors[parent] = tensor
     fqn_to_dp = {fqn: dp for dp, fqn in dp_fqns.items()}
     dedicated_fqn_set = _model_dedicated_fqns(model, dp_fqns)
+
+    loaded_params = {
+        dp for dp, fqn in dp_fqns.items()
+        if fqn in state_dict or getattr(dp, "matrix_parent", None) in parent_tensors
+    }
+    loaded_groups = []
+    if loaded_params:
+        # Finish old TP/replicate publications before overwriting master data.
+        # Drain old forward prefetches too, but retain compute storage until
+        # all checkpoint reads finish: an input tensor may alias a live view.
+        wait_all_replicate_broadcasts(model)
+        seen_groups = set()
+        for state in iter_dedicated_states(model):
+            group = state.group
+            if id(group) not in seen_groups and any(dp in loaded_params for dp in group.params):
+                group.wait_for_unshard()
+                loaded_groups.append(group)
+                seen_groups.add(id(group))
 
     # Pack one original parameter at a time and load its local matrices. The
     # full checkpoint remains in native model order; optimizer storage does not.
@@ -654,12 +676,15 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
         else:
             param.data.copy_(full_tensor.to(param.dtype).to(param.device))
 
-    if parents:
-        # Discard old compute copies, including still-live ZeRO-2 slots, so
-        # the next forward reads the newly loaded owner weights.
-        for state in iter_dedicated_states(model):
-            if getattr(state.group, "_matrix_params", None) is not None:
-                state.group.reshard()
+    # Allocated compute storage does not imply fresh content. Discard ordinary
+    # and MatrixLayout copies alike; the next forward uses loaded master data.
+    for group in loaded_groups:
+        group.reshard()
+    for dp in loaded_params:
+        if getattr(dp, "uses_sharded_muon_forward", lambda: False)():
+            # Republish the loaded owner tensor before the next all-gather;
+            # the old rank-local forward shards also contain cached data.
+            dp._sharded_muon_initialized = False
 
 
 # ---- Optimizer state dict ----
