@@ -36,6 +36,17 @@ experiment is explicitly measuring the no-overlap behavior.
 
 ---
 
+### OwnershipDomain
+
+Replica topology (`shard_mesh`, optional `replicate_mesh`) and post-reduction
+gradient scaling (`grad_reduce_op`, `grad_scale`) for one parameter subset in
+multi-parallelism setups (EP, PP, CP, TP, mixed HSDP).  See
+[Ownership Domains](../guides/ownership-domains.md).
+
+::: dmuon.OwnershipDomain
+
+---
+
 ### dedicate_params_ddp
 
 DDP-path setup for dedicated parameters when the data-parallel model is
@@ -249,9 +260,23 @@ Compatibility alias for `wait_all_replicate_broadcasts()`.
 
 ### clip_grad_norm_
 
-Clip gradients for DMuon-owned Muon parameters.
+Clip gradients for DMuon-owned parameters.  Pass a `dmuon.Muon` optimizer
+(`mode=None`) for legacy Muon-only clipping, or pass a wrapped `nn.Module`
+(or set `mode="global"` / `"per_algorithm"`) for multi-domain clipping across
+all uniquely-owned Muon, AdamW, and `sharded_adamw` gradients.
 
 ::: dmuon.clip_grad_norm_
+
+---
+
+### clip_model_grad_norm_
+
+Multi-domain L2 gradient clipping entry point for a model wrapped with
+`dedicate_params()`.  Supports `mode="global"` and `mode="per_algorithm"` with
+an explicit `norm_reduce_group` (defaults to `WORLD`).  See
+[Ownership Domains](../guides/ownership-domains.md#multi-domain-clipping).
+
+::: dmuon.clip_model_grad_norm_
 
 ---
 
