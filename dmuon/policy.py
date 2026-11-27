@@ -8,6 +8,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 import torch
 import torch.nn as nn
+from .domain import normalize_domain_name
 from .matrix_layout import MatrixLayout
 
 
@@ -52,6 +53,7 @@ _POLICY_FIELDS = {
     "optim_dtype",
     "muon_forward_unshard",
     "matrix_layout",
+    "domain",
 }
 
 _DTYPE_FIELDS = {
@@ -83,6 +85,7 @@ class DMuonParamPolicy:
     optim_dtype: Optional[torch.dtype] = torch.float32
     muon_forward_unshard: Optional[str] = None
     matrix_layout: Optional[MatrixLayout] = None
+    domain: Optional[str] = None
     matched_overrides: tuple[int, ...] = ()
 
 
@@ -128,6 +131,10 @@ def _normalize_policy_values(values: Mapping[str, Any], *, source: str) -> dict[
             if value is not None and not isinstance(value, MatrixLayout):
                 raise TypeError("matrix_layout must be a MatrixLayout or None")
             normalized[key] = value
+        elif key == "domain":
+            normalized[key] = normalize_domain_name(
+                value, allow_none=True, source=f"{source}.domain"
+            )
         else:
             normalized[key] = value
     return normalized
