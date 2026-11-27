@@ -159,6 +159,19 @@ for step in range(start_step, total_steps):
 }
 ```
 
+## 多域与 PP × EP 检查点
+
+当模型使用多个 [`OwnershipDomain`](ownership-domains.md) 拓扑（例如流水线并行 + 专家并行）时，直接以 `rank0_only=False` 调用相同的公开 API：
+
+```python
+model_sd = dmuon.get_model_state_dict(model, cpu_offload=True, rank0_only=False)
+optim_sd = dmuon.get_optimizer_state_dict(model, optimizer, cpu_offload=True, rank0_only=False)
+```
+
+- 所有 collective 严格限定在每个参数所属的 `(dp_group, replicate_group[, tp_group])` 内，**不包含任何隐式 `WORLD` collective**；
+- 参数数量不同的 PP stage 以及持有不同本地专家的 EP lane 可独立导出与恢复，不会发生跨阶段死锁；
+- 尚未产生梯度的冷专家不会落入 `optim_sd["dedicated"]` / `optim_sd["dedicated_adamw"]`，恢复后状态与连续训练逐位一致。
+
 ## 跨拓扑恢复
 
 当前 DMuon 检查点格式假设恢复时 `(shard_size, replicate_size)` 不变。跨拓扑恢复在 v1 中尚不支持，列入路线图。

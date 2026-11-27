@@ -33,6 +33,16 @@ fence，除非实验目标就是测 no-overlap 行为。
 
 ---
 
+### OwnershipDomain
+
+描述多并行场景（EP、PP、CP、TP、混合 HSDP）下某一类参数的副本拓扑
+（`shard_mesh`、可选 `replicate_mesh`）与归约后梯度缩放（`grad_reduce_op`、
+`grad_scale`）。详见 [所有权域（多并行）](../guides/ownership-domains.md)。
+
+::: dmuon.OwnershipDomain
+
+---
+
 ### dedicate_params_ddp
 
 DDP 路径下的 dedicated parameter 初始化入口，用于 data-parallel 模型保持
@@ -245,9 +255,22 @@ event 在下一次前向传播开始时被消费。
 
 ### clip_grad_norm_
 
-裁剪 DMuon-owned Muon 参数的梯度。
+裁剪 DMuon 管理的梯度。传入 `dmuon.Muon` 优化器且 `mode=None` 时保持原有仅裁剪
+Muon 梯度的行为；传入经 `dedicate_params()` 包装的 `nn.Module`（或显式指定
+`mode="global"` / `"per_algorithm"`）时，跨所有域裁剪全部唯一持有的 Muon、
+AdamW 与 `sharded_adamw` 梯度。
 
 ::: dmuon.clip_grad_norm_
+
+---
+
+### clip_model_grad_norm_
+
+面向多并行域模型的 L2 梯度裁剪入口，支持 `mode="global"` 与
+`mode="per_algorithm"` 以及自定义 `norm_reduce_group`（默认 `WORLD`）。
+详见 [所有权域（多并行）](../guides/ownership-domains.md#multi-domain-clipping)。
+
+::: dmuon.clip_model_grad_norm_
 
 ---
 

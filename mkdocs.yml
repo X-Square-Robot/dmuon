@@ -86,6 +86,7 @@ plugins:
             Training: 训练流程
             Pure DMuon Routing: Pure DMuon 路由
             Matrix Layouts: 矩阵布局
+            Ownership Domains: 所有权域（多并行）
             HSDP (Multi-Node): HSDP 训练（多机）
             Custom Hook Boundaries: 自定义 Hook 边界
             Z2 vs Z3 Modes: Z2 与 Z3 模式
@@ -153,6 +154,7 @@ nav:
     - Training: guides/training.md
     - Pure DMuon Routing: guides/pure-dmuon-routing.md
     - Matrix Layouts: guides/matrix-layouts.md
+    - Ownership Domains: guides/ownership-domains.md
     - HSDP (Multi-Node): guides/hsdp.md
     - Custom Hook Boundaries: guides/custom-hook-boundaries.md
     - Z2 vs Z3 Modes: guides/z2-z3-modes.md

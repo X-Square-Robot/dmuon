@@ -281,6 +281,56 @@ def _broadcast_dedicated_adamw_step(dp: DedicatedParam, step: int | None) -> int
     return int(buf.item())
 
 
+def _all_reduce_per_domain_max(
+    dps: list[DedicatedParam],
+    local_values: list[int],
+    *,
+    include_tp: bool,
+) -> list[int]:
+    """Synchronize integer presence/step flags strictly within each param's domain.
+
+    Buckets parameters by ``(dp_group, replicate_group[, tp_group])`` and runs
+    one batched ``MAX`` all-reduce per axis within each bucket.  This avoids
+    any implicit ``WORLD`` collective, so pipeline stages with different
+    parameter counts and expert-parallel lanes with different local experts
+    never deadlock or exchange cross-stage metadata.
+    """
+    if not dps:
+        return []
+    if len(dps) != len(local_values):
+        raise ValueError("dps and local_values must have the same length")
+
+    buckets: dict[
+        tuple[int, int, int],
+        tuple[Any, Any, Any, torch.device, list[int]],
+    ] = {}
+    for idx, dp in enumerate(dps):
+        dp_group = getattr(dp, "dp_group", None)
+        rep_group = getattr(dp, "replicate_group", None)
+        tp_group = getattr(dp, "tp_group", None) if include_tp else None
+        key = (id(dp_group), id(rep_group), id(tp_group))
+        if key not in buckets:
+            buckets[key] = (dp_group, rep_group, tp_group, dp.device, [])
+        buckets[key][4].append(idx)
+
+    resolved = list(local_values)
+    for dp_group, rep_group, tp_group, device, indices in buckets.values():
+        buf = torch.tensor(
+            [local_values[i] for i in indices],
+            dtype=torch.int64,
+            device=device,
+        )
+        if tp_group is not None:
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=tp_group)
+        if rep_group is not None:
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=rep_group)
+        if dp_group is not None:
+            dist.all_reduce(buf, op=dist.ReduceOp.MAX, group=dp_group)
+        for idx, value in zip(indices, buf.tolist()):
+            resolved[idx] = int(value)
+    return resolved
+
+
 def _owns_dedicated_adamw_optimizer_state(dp: DedicatedParam) -> bool:
     if getattr(dp, "_dmuon_route", None) == "sharded_adamw":
         return getattr(dp, "_sharded_adamw_data", None) is not None
@@ -813,19 +863,21 @@ def get_optimizer_state_dict(
 
     # State presence is per matrix: sparse routing and unused projections can
     # leave some owners without momentum after other matrices have stepped.
-    # Never broadcast an uninitialized placeholder for those absent entries.
+    # Synchronize strictly within each parameter's ownership domain (dp/rep/tp)
+    # so PP stages and EP lanes with distinct parameter sets stay independent.
     local_has_state = [
-        id(dp) in optimizer.state
-        and "momentum_buffer" in optimizer.state[id(dp)]
-        and _owns_dedicated_optimizer_state(dp)
+        int(
+            id(dp) in optimizer.state
+            and "momentum_buffer" in optimizer.state[id(dp)]
+            and _owns_dedicated_optimizer_state(dp)
+        )
         for dp in muon_dps
     ]
     if muon_dps:
-        has_state_tensor = torch.tensor(
-            local_has_state, dtype=torch.int32, device=muon_dps[0].device
+        synced_has_state = _all_reduce_per_domain_max(
+            muon_dps, local_has_state, include_tp=True
         )
-        dist.all_reduce(has_state_tensor, op=dist.ReduceOp.MAX)
-        for dp, has_state in zip(muon_dps, has_state_tensor.tolist()):
+        for dp, has_state in zip(muon_dps, synced_has_state):
             if not has_state:
                 continue
             fqn = dp_fqns[dp]
@@ -842,34 +894,28 @@ def get_optimizer_state_dict(
             if keep:
                 dedicated_state[fqn] = {"momentum_buffer": full_buf}
 
-    # 2. Dedicated AdamW state: broadcast local owner state.
+    # 2. Dedicated AdamW state: broadcast local owner state per domain.
     dedicated_adamw_state: dict[str, dict[str, Any]] = {}
     dp_to_adamw_group = getattr(optimizer, "_dp_to_adamw_group_idx", {})
     dedicated_adamw_dps = [dp for dp in all_dedicated if id(dp) in dp_to_adamw_group]
-    any_has_adamw_state = any(
-        id(dp) in optimizer.state
-        for dp in dedicated_adamw_dps
-        if _owns_dedicated_adamw_optimizer_state(dp)
-    )
-    has_adamw_state = False
     if dedicated_adamw_dps:
-        has_adamw_state_tensor = torch.tensor(
-            [int(any_has_adamw_state)], device=dedicated_adamw_dps[0].device
+        local_steps = [
+            (
+                int(optimizer.state.get(id(dp), {}).get("step", 0) or 0)
+                if _owns_dedicated_adamw_optimizer_state(dp)
+                else 0
+            )
+            for dp in dedicated_adamw_dps
+        ]
+        synced_steps = _all_reduce_per_domain_max(
+            dedicated_adamw_dps, local_steps, include_tp=False
         )
-        dist.all_reduce(has_adamw_state_tensor, op=dist.ReduceOp.MAX)
-        has_adamw_state = has_adamw_state_tensor.item() > 0
-
-    if has_adamw_state:
-        for dp in dedicated_adamw_dps:
+        for dp, step in zip(dedicated_adamw_dps, synced_steps):
+            if step <= 0:
+                continue
             fqn = dp_fqns[dp]
             owns_state = _owns_dedicated_adamw_optimizer_state(dp)
             local_state = optimizer.state.get(id(dp), {}) if owns_state else {}
-            step = _broadcast_dedicated_adamw_step(
-                dp,
-                int(local_state.get("step", 0) or 0) if local_state else None,
-            )
-            if step == 0:
-                continue
             entry: dict[str, Any] = {"step": step}
             for key in ("exp_avg", "exp_avg_sq"):
                 tensor = local_state.get(key) if local_state else None

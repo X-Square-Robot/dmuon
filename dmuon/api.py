@@ -28,6 +28,7 @@ from ._core.process_groups import (
 )
 from ._core.state import DedicatedState
 from ._core.tp import is_tp_sharded
+from .domain import OwnershipDomain, resolve_ownership_domains
 from .policy import ParamPolicyFn, resolve_param_policies
 from .matrix_layout import LogicalMatrix
 from ._backends.fsdp2.matrix_group import DedicatedMatrix, PartitionedParameter
@@ -154,6 +155,7 @@ def _attach_dedicated_state(module: nn.Module, state: DedicatedState) -> None:
 
 def _policy_group_key(d_param) -> tuple[object, ...]:
     return (
+        getattr(d_param, "domain_name", None),
         getattr(d_param, "_param_dtype", None),
         getattr(d_param, "_grad_dtype", None),
         getattr(d_param, "_output_dtype", None),
@@ -430,8 +432,8 @@ def _resolve_hook_module(
 
 def dedicate_params(
     model: nn.Module,
-    mesh: DeviceMesh,
-    predicate: Callable[[str, nn.Parameter], bool],
+    mesh: Optional[DeviceMesh] = None,
+    predicate: Optional[Callable[[str, nn.Parameter], bool]] = None,
     compute_dtype: torch.dtype = None,
     reshard_after_forward: bool = True,
     replicate_mesh: Optional[DeviceMesh] = None,
@@ -452,6 +454,8 @@ def dedicate_params(
     param_policy: Optional[Mapping[str, object]] = None,
     param_policy_fn: Optional[ParamPolicyFn] = None,
     process_group_policy: Optional[str] = None,
+    domains: Optional[Mapping[str, OwnershipDomain]] = None,
+    default_domain: Optional[str] = None,
 ) -> dict | AssignmentResult:
     """Mark parameters for dedicated ownership and register communication hooks.
 
@@ -585,6 +589,15 @@ def dedicate_params(
             cannot interleave with DMuon async communication on the same NCCL
             communicator. ``"shared"`` preserves historical behavior and uses
             the caller-provided mesh groups directly.
+        domains: Optional mapping of domain names to :class:`OwnershipDomain`
+            specifications for models whose parameters span multiple replica
+            topologies (e.g., dense parameters replicated across ``dp×cp×ep``
+            and local MoE experts replicated across ``dp×cp`` with
+            ``grad_scale=1.0 / ep_size``). Mutually exclusive with ``mesh``
+            and ``replicate_mesh``.
+        default_domain: Optional fallback domain name within ``domains`` used
+            for selected parameters whose resolved policy leaves ``domain`` as
+            ``None``.
 
     Returns:
         Assignment dict mapping each dedicated parameter to its DP owner
@@ -597,6 +610,18 @@ def dedicate_params(
         with ``fqn``, ``matrix`` (index/offset/shape), and ``layout`` metadata.
         There is no single owner entry for a partitioned parent parameter.
     """
+    if predicate is None:
+        raise TypeError("dedicate_params() missing required argument 'predicate'")
+
+    is_legacy_single_domain = domains is None
+    resolved_domains, resolved_default_domain = resolve_ownership_domains(
+        mesh=mesh,
+        replicate_mesh=replicate_mesh,
+        domains=domains,
+        default_domain=default_domain,
+    )
+    ordered_domain_names = sorted(resolved_domains)
+
     # Resolve user policy before owner planning: layout determines the update units.
     owner_strategy = _resolve_owner_strategy(owner_strategy)
     owner_cost_model = _resolve_owner_cost_model(owner_cost_model)
@@ -617,60 +642,121 @@ def dedicate_params(
         param_policy_fn=param_policy_fn,
         default_muon_forward_unshard=muon_forward_unshard,
     )
-    dp_names = set(mesh.mesh_dim_names or ())
-    if replicate_mesh is not None:
-        dp_names.update(replicate_mesh.mesh_dim_names or ())
-    dp_mesh_dim_names = frozenset(dp_names)
-    layouts = {}
-    layout_error = None
-    try:
-        for param, policy in policies.items():
-            if policy.matrix_layout is None:
-                continue
-            if policy.route not in (None, "muon"):
-                raise ValueError(f"{selected[param]}: matrix_layout requires the Muon route")
-            if not param.is_floating_point():
-                raise ValueError("matrix_layout requires real floating-point parameters")
-            if hasattr(param, "_local_tensor"):
-                raise ValueError(
-                    "Explicit matrix layouts must be configured before TP/DTensor placement"
-                )
-            if param.is_meta:
-                raise ValueError(
-                    "Materialize or load original parameters before applying matrix_layout"
-                )
-            if not param.is_contiguous():
-                raise ValueError(
-                    "Explicit matrix layouts currently require contiguous source parameters"
-                )
-            if (policy.muon_forward_unshard or muon_forward_unshard) != "broadcast":
-                raise ValueError(
-                    "Explicit matrix layouts currently require owner-broadcast placement"
-                )
-            layouts[param] = policy.matrix_layout.compile(tuple(param.shape))
-    except (TypeError, ValueError) as error:
-        layout_error = error
-    if param_policy is not None or param_policy_fn is not None:
-        _check_matrix_errors(mesh, replicate_mesh, layout_error)
-    elif layout_error is not None:
-        raise layout_error
-    result = compute_balanced_assignment(
-        model,
-        mesh,
-        lambda _name, p: p in selected,
-        replicate_mesh=replicate_mesh,
-        owner_strategy=owner_strategy,
-        assignment_group_key_fn=assignment_group_key_fn,
-        max_owners_per_group=max_owners_per_group,
-        owner_cost_model=owner_cost_model,
-        hsdp_column_balance=hsdp_column_balance,
+
+    param_domains: dict[nn.Parameter, OwnershipDomain] = {}
+    selected_by_domain: dict[str, dict[nn.Parameter, str]] = {
+        name: {} for name in ordered_domain_names
+    }
+    for param, fqn in selected.items():
+        policy = policies[param]
+        domain_name = policy.domain if policy.domain is not None else resolved_default_domain
+        if domain_name is None:
+            raise ValueError(
+                f"{fqn}: parameter has no assigned ownership domain. "
+                "Pass default_domain or specify policy 'domain' for every selected parameter."
+            )
+        if domain_name not in resolved_domains:
+            available = ", ".join(ordered_domain_names)
+            raise ValueError(
+                f"{fqn}: unknown ownership domain {domain_name!r}; "
+                f"available domains are: {available}"
+            )
+        domain = resolved_domains[domain_name]
+        param_domains[param] = domain
+        selected_by_domain[domain_name][param] = fqn
+
+    dp_mesh_dim_names_by_domain: dict[str, frozenset[str]] = {}
+    layouts: dict[nn.Parameter, object] = {}
+    combined_dp_owners: dict[nn.Parameter, object] = {}
+    combined_tp_owners: dict[nn.Parameter, int] = {}
+    combined_matrix_owners: dict[LogicalMatrix, object] = {}
+    total_alloc_units = 0
+    total_packed_units = 0
+    domain_results: dict[str, AssignmentResult] = {}
+
+    for domain_name in ordered_domain_names:
+        domain = resolved_domains[domain_name]
+        domain_selected = selected_by_domain[domain_name]
+        domain_policies = {p: policies[p] for p in domain_selected}
+        dp_names = set(domain.shard_mesh.mesh_dim_names or ())
+        if domain.replicate_mesh is not None:
+            dp_names.update(domain.replicate_mesh.mesh_dim_names or ())
+        dp_mesh_dim_names_by_domain[domain_name] = frozenset(dp_names)
+
+        domain_layouts = {}
+        layout_error = None
+        try:
+            for param, policy in domain_policies.items():
+                if policy.matrix_layout is None:
+                    continue
+                if policy.route not in (None, "muon"):
+                    raise ValueError(f"{selected[param]}: matrix_layout requires the Muon route")
+                if not param.is_floating_point():
+                    raise ValueError("matrix_layout requires real floating-point parameters")
+                if hasattr(param, "_local_tensor"):
+                    raise ValueError(
+                        "Explicit matrix layouts must be configured before TP/DTensor placement"
+                    )
+                if param.is_meta:
+                    raise ValueError(
+                        "Materialize or load original parameters before applying matrix_layout"
+                    )
+                if not param.is_contiguous():
+                    raise ValueError(
+                        "Explicit matrix layouts currently require contiguous source parameters"
+                    )
+                if (policy.muon_forward_unshard or muon_forward_unshard) != "broadcast":
+                    raise ValueError(
+                        "Explicit matrix layouts currently require owner-broadcast placement"
+                    )
+                domain_layouts[param] = policy.matrix_layout.compile(tuple(param.shape))
+        except (TypeError, ValueError) as error:
+            layout_error = error
+        if param_policy is not None or param_policy_fn is not None:
+            _check_matrix_errors(domain.shard_mesh, domain.replicate_mesh, layout_error)
+        elif layout_error is not None:
+            raise layout_error
+
+        domain_result = compute_balanced_assignment(
+            model,
+            domain.shard_mesh,
+            lambda _name, p, _sel=domain_selected: p in _sel,
+            replicate_mesh=domain.replicate_mesh,
+            owner_strategy=owner_strategy,
+            assignment_group_key_fn=assignment_group_key_fn,
+            max_owners_per_group=max_owners_per_group,
+            owner_cost_model=owner_cost_model,
+            hsdp_column_balance=hsdp_column_balance,
+            pack_small_params=pack_small_params,
+            matrix_layouts=domain_layouts,
+        )
+        if param_policy is not None or param_policy_fn is not None:
+            _check_matrix_plan(
+                domain.shard_mesh,
+                domain.replicate_mesh,
+                domain_selected,
+                domain_policies,
+                domain_layouts,
+                domain_result,
+            )
+        domain_results[domain_name] = domain_result
+        layouts.update(domain_layouts)
+        combined_dp_owners.update(domain_result.dp_owners)
+        combined_tp_owners.update(domain_result.tp_owners)
+        combined_matrix_owners.update(domain_result.matrix_owners)
+        total_alloc_units += domain_result.allocation_unit_count
+        total_packed_units += domain_result.packed_allocation_unit_count
+
+    result = AssignmentResult(
+        dp_owners=combined_dp_owners,
+        tp_owners=combined_tp_owners,
+        matrix_owners=combined_matrix_owners,
+        allocation_unit_count=total_alloc_units,
+        packed_allocation_unit_count=total_packed_units,
         pack_small_params=pack_small_params,
-        matrix_layouts=layouts,
     )
     assignment = result.dp_owners
     entries = [*assignment.items(), *result.matrix_owners.items()]
-    if param_policy is not None or param_policy_fn is not None:
-        _check_matrix_plan(mesh, replicate_mesh, selected, policies, layouts, result)
     if not entries:
         logger.warning("dedicate_params: no parameters matched the predicate")
         return assignment
@@ -692,53 +778,80 @@ def dedicate_params(
             )
         boundaries[param] = boundary
 
-    # Log assignment summary
-    shard_size = mesh.size()
-    replicate_size = replicate_mesh.size() if replicate_mesh is not None else 1
-    total_slots = shard_size * replicate_size
-    rank_loads: dict[tuple[int, int], int] = defaultdict(int)
-    for param, coord in normalized.items():
-        rank_loads[coord] += param.numel()
-    loads_list = [
-        rank_loads.get((s, r), 0) for s in range(shard_size) for r in range(replicate_size)
-    ]
-    max_load = max(loads_list) if loads_list else 0
-    min_load = min(loads_list) if loads_list else 0
-    imbalance = (max_load - min_load) / max(max_load, 1)
-    mode = "HSDP" if replicate_mesh is not None else "shard-only"
-    tp_count = len(result.tp_owners)
-    tp_tag = f", TP-sharded={tp_count}" if tp_count else ""
-    logger.info(
-        f"dedicate_params[{mode}]: {len(normalized)} params over {total_slots} "
-        f"owner slots (shard={shard_size}, replicate={replicate_size}), "
-        f"owner_strategy={owner_strategy}, owner_cost_model={owner_cost_model}, "
-        f"process_group_policy={process_group_policy}, "
-        f"pack_small_params={pack_small_params}, "
-        f"allocation_units={result.allocation_unit_count}, "
-        f"packed_units={result.packed_allocation_unit_count}, "
-        f"imbalance={imbalance:.1%}, loads={loads_list}{tp_tag}"
-    )
+    # Log assignment summary per domain
+    for domain_name in ordered_domain_names:
+        domain = resolved_domains[domain_name]
+        domain_result = domain_results[domain_name]
+        domain_entries = [*domain_result.dp_owners.items(), *domain_result.matrix_owners.items()]
+        if not domain_entries:
+            continue
+        shard_size = domain.shard_mesh.size()
+        replicate_size = domain.replicate_mesh.size() if domain.replicate_mesh is not None else 1
+        total_slots = shard_size * replicate_size
+        rank_loads: dict[tuple[int, int], int] = defaultdict(int)
+        for key, owner in domain_entries:
+            rank_loads[normalize_owner_rank(owner)] += key.numel()
+        loads_list = [
+            rank_loads.get((s, r), 0) for s in range(shard_size) for r in range(replicate_size)
+        ]
+        max_load = max(loads_list) if loads_list else 0
+        min_load = min(loads_list) if loads_list else 0
+        imbalance = (max_load - min_load) / max(max_load, 1)
+        mode = "HSDP" if domain.replicate_mesh is not None else "shard-only"
+        tp_count = len(domain_result.tp_owners)
+        tp_tag = f", TP-sharded={tp_count}" if tp_count else ""
+        domain_tag = "" if is_legacy_single_domain else f"domain={domain_name}, "
+        logger.info(
+            f"dedicate_params[{mode}]: {domain_tag}{len(domain_entries)} params over {total_slots} "
+            f"owner slots (shard={shard_size}, replicate={replicate_size}), "
+            f"owner_strategy={owner_strategy}, owner_cost_model={owner_cost_model}, "
+            f"process_group_policy={process_group_policy}, "
+            f"pack_small_params={pack_small_params}, "
+            f"allocation_units={domain_result.allocation_unit_count}, "
+            f"packed_units={domain_result.packed_allocation_unit_count}, "
+            f"imbalance={imbalance:.1%}, loads={loads_list}{tp_tag}"
+        )
 
     # 2. Mark parameters
     for param in selected:
         param._dedicated_owner_rank = None if param in layouts else normalized[param]
 
-    # 3. Create shared communication context
-    dp_group = maybe_isolate_process_group(
-        mesh.get_group(),
-        policy=process_group_policy,
-        role="fsdp2.dp",
+    # 3. Create per-domain process groups in deterministic order across all
+    #    domains (including domains with zero local params, e.g. a PP stage
+    #    without MoE layers) so isolated PG creation stays lockstep on WORLD,
+    #    then build a single shared DedicatedCommContext for the whole model.
+    dp_groups_by_domain: dict[str, object] = {}
+    replicate_groups_by_domain: dict[str, object] = {}
+    for domain_name in ordered_domain_names:
+        domain = resolved_domains[domain_name]
+        dp_role = "fsdp2.dp" if is_legacy_single_domain else f"fsdp2.dp.{domain_name}"
+        rep_role = (
+            "fsdp2.replicate" if is_legacy_single_domain else f"fsdp2.replicate.{domain_name}"
+        )
+        dp_groups_by_domain[domain_name] = maybe_isolate_process_group(
+            domain.shard_mesh.get_group(),
+            policy=process_group_policy,
+            role=dp_role,
+        )
+        replicate_groups_by_domain[domain_name] = maybe_isolate_process_group(
+            domain.replicate_mesh.get_group() if domain.replicate_mesh is not None else None,
+            policy=process_group_policy,
+            role=rep_role,
+        )
+
+    unique_replicate_groups = []
+    for rep_group in replicate_groups_by_domain.values():
+        if not any(existing is rep_group for existing in unique_replicate_groups):
+            unique_replicate_groups.append(rep_group)
+    comm_ctx_replicate_group = (
+        unique_replicate_groups[0] if len(unique_replicate_groups) == 1 else None
     )
-    replicate_group = maybe_isolate_process_group(
-        replicate_mesh.get_group() if replicate_mesh is not None else None,
-        policy=process_group_policy,
-        role="fsdp2.replicate",
-    )
-    device_type = mesh.device_type
+
+    device_type = resolved_domains[ordered_domain_names[0]].shard_mesh.device_type
     device = current_device(device_type)
     comm_ctx = DedicatedCommContext(
         device,
-        replicate_group=replicate_group,
+        replicate_group=comm_ctx_replicate_group,
         tp_buffer_reuse=tp_buffer_reuse,
         replicate_broadcast_bucket_mb=replicate_broadcast_bucket_mb,
     )
@@ -763,6 +876,8 @@ def dedicate_params(
         for key, coord in source_entries:
             param = key.source if isinstance(key, LogicalMatrix) else key
             policy = policies[param]
+            domain = param_domains[param]
+            dp_mesh_dim_names = dp_mesh_dim_names_by_domain[domain.name]
             parent_modules = aliases_by_param[param]
             parent_module, param_name = parent_modules[0]
             layer_module = boundaries[param]
@@ -786,7 +901,7 @@ def dedicate_params(
                 )
             kwargs = dict(
                 owner_rank=coord,
-                dp_group=dp_group,
+                dp_group=dp_groups_by_domain[domain.name],
                 device=device,
                 compute_dtype=policy.param_dtype,
                 param_dtype=policy.param_dtype,
@@ -795,11 +910,14 @@ def dedicate_params(
                 cast_forward_inputs=policy.cast_forward_inputs,
                 master_dtype=policy.master_dtype,
                 optim_dtype=policy.optim_dtype,
-                replicate_group=replicate_group,
+                replicate_group=replicate_groups_by_domain[domain.name],
                 tp_owner_local_rank=result.tp_owners.get(param, 0),
                 tp_group=tp_group,
                 route_hint=policy.route,
                 muon_forward_unshard=policy.muon_forward_unshard or muon_forward_unshard,
+                domain_name=domain.name,
+                grad_reduce_op=domain.grad_reduce_op,
+                grad_scale=domain.grad_scale,
             )
             if isinstance(key, LogicalMatrix):
                 if param not in parents:
@@ -832,7 +950,10 @@ def dedicate_params(
             comm_ctx,
             delay_stage2_to_optimizer=delay_stage2_to_optimizer,
         )
-        group._debug_name = module_fqns.get(id(layer_module), "<unknown>")
+        base_name = module_fqns.get(id(layer_module), "<unknown>")
+        group._debug_name = (
+            base_name if is_legacy_single_domain else f"{base_name}[{group._domain_name}]"
+        )
         state = DedicatedState(layer_module, group, comm_ctx, reshard_after_forward)
         _attach_dedicated_state(layer_module, state)
         all_states.append(state)
@@ -992,6 +1113,10 @@ def dedicate_params_ddp(
     if any(policy.matrix_layout is not None for policy in policies.values()):
         raise ValueError(
             "matrix_layout currently requires the FSDP2/HSDP dedicate_params entry point"
+        )
+    if any(policy.domain is not None for policy in policies.values()):
+        raise ValueError(
+            "param_policy 'domain' currently requires the FSDP2/HSDP dedicate_params entry point"
         )
 
     for param, coord in normalized.items():
@@ -1161,6 +1286,10 @@ def dedicate_params_ddp_tp(
     if any(policy.matrix_layout is not None for policy in policies.values()):
         raise ValueError(
             "matrix_layout currently requires the FSDP2/HSDP dedicate_params entry point"
+        )
+    if any(policy.domain is not None for policy in policies.values()):
+        raise ValueError(
+            "param_policy 'domain' currently requires the FSDP2/HSDP dedicate_params entry point"
         )
 
     for param, coord in normalized.items():

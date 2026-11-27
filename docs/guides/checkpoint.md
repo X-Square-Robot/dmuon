@@ -162,6 +162,21 @@ The optimizer state dict has DMuon-specific structure with separate sections:
 }
 ```
 
+## Multi-Domain & PP × EP Checkpointing
+
+When a model uses multiple [`OwnershipDomain`](ownership-domains.md) topologies
+(such as Pipeline Parallelism + Expert Parallelism), call the same public APIs
+with `rank0_only=False`:
+
+```python
+model_sd = dmuon.get_model_state_dict(model, cpu_offload=True, rank0_only=False)
+optim_sd = dmuon.get_optimizer_state_dict(model, optimizer, cpu_offload=True, rank0_only=False)
+```
+
+- All collectives run strictly inside each parameter's `(dp_group, replicate_group[, tp_group])` — **no implicit `WORLD` collectives**.
+- Pipeline stages with different parameter counts and EP lanes with different local experts export and restore without deadlocking.
+- Cold experts without gradients are omitted from `optim_sd["dedicated"]` / `optim_sd["dedicated_adamw"]` and remain clean on resume.
+
 ## Cross-Topology Restore
 
 The current DMuon checkpoint format assumes you resume with the same `(shard_size, replicate_size)`. Changing topology on resume is not supported in v1; it is a roadmap item.

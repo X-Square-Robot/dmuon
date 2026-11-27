@@ -46,9 +46,11 @@ from .fast_clip import (
     GradClipBucketStats,
     SegmentedGradClipResult,
     clip_grad_norm_buckets_,
+    clip_model_grad_norm_,
     try_clip_optimizer_grad_norm_buckets_,
 )
 from .diagnostics import summarize_comm_plan, summarize_param_groups
+from .domain import OwnershipDomain
 from .policy import DMuonParamPolicy
 from .matrix_layout import MatrixLayout
 from .optim import (
@@ -96,9 +98,11 @@ __all__ = [
     "get_owned_params",
     "DedicatedCommContext",
     "DMuonParamPolicy",
+    "OwnershipDomain",
     "MatrixLayout",
     "clip_grad_norm_",
     "clip_grad_norm_buckets_",
+    "clip_model_grad_norm_",
     "try_clip_optimizer_grad_norm_buckets_",
     "register_muon_grad_clip_strategy",
     "MuonGradClipStats",

@@ -20,6 +20,16 @@ PyTorch model.
 
 <div class="grid cards" markdown>
 
+-   :material-lan:{ .lg .middle } **Native multi-parallelism with `OwnershipDomain`**
+
+    <small>November 27, 2026</small>
+
+    Combine DP, HSDP, CP, EP, PP, and TP in one `dedicate_params()` call with
+    per-domain `grad_scale`, domain-local checkpointing, and global or
+    per-algorithm gradient clipping.
+
+    [:octicons-arrow-right-24: Ownership domains guide](guides/ownership-domains.md)
+
 -   :material-view-grid-outline:{ .lg .middle } **Matrix layouts for fused weights and MoE**
 
     <small>November 9, 2026</small>

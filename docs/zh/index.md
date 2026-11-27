@@ -19,6 +19,15 @@
 
 <div class="grid cards" markdown>
 
+-   :material-lan:{ .lg .middle } **`OwnershipDomain` 原生多并行支持**
+
+    <small>2026 年 11 月 27 日</small>
+
+    单次 `dedicate_params()` 调用即可原生组合 DP、HSDP、CP、EP、PP 与 TP，
+    内置按域 `grad_scale`、无 WORLD collective 检查点以及全局/分算法梯度裁剪。
+
+    [:octicons-arrow-right-24: 所有权域指南](guides/ownership-domains.md)
+
 -   :material-view-grid-outline:{ .lg .middle } **融合权重与 MoE 的矩阵布局支持**
 
     <small>2026 年 11 月 9 日</small>

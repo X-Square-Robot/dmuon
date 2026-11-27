@@ -21,14 +21,16 @@ import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import import_module
-from typing import Sequence
+from typing import Literal, Sequence
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from ._core.device import default_device
 
 from .grad_clip import MuonGradClipStats, _iter_muon_grad_entries
+from .utils import get_comm_ctx, get_dedicated_params, wait_all_reduces
 
 
 _DTYPE_CODES = {
@@ -223,7 +225,7 @@ def _split_by_kernel_eligibility(
     torch_pairs: list[tuple[torch.Tensor, int]] = []
     for segment, bucket in enumerate(buckets):
         for grad in bucket.grads:
-            if grad is None:
+            if grad is None or grad.numel() == 0:
                 continue
             if ext is not None and _tensor_kernel_eligible(grad, device):
                 kernel_tensors.append(grad)
@@ -383,6 +385,7 @@ def clip_grad_norm_buckets_(
     *,
     process_group=None,
     chunk_size: int | None = None,
+    device: torch.device | None = None,
 ) -> SegmentedGradClipResult:
     """Clip gradient buckets with segment-local, distributed-safe semantics.
 
@@ -394,13 +397,18 @@ def clip_grad_norm_buckets_(
     every rank in lockstep.
     """
 
-    device = _resolve_device(buckets)
-    ext = _load_fast_clip_extension() if device.type == "cuda" else None
+    if max_norm is not None and float(max_norm) < 0:
+        raise ValueError(f"max_norm must be non-negative, got {max_norm}")
+
+    resolved_device = torch.device(device) if device is not None else _resolve_device(buckets)
+    ext = _load_fast_clip_extension() if resolved_device.type == "cuda" else None
     resolved_chunk_size = _resolve_chunk_size(chunk_size)
     reduce_flags = [1 if bucket.reduce else 0 for bucket in buckets]
 
     # Stage 1 -- local per-bucket squared norm (no collective).
-    local_sq = _segmented_local_sq(buckets, device=device, ext=ext, chunk_size=resolved_chunk_size)
+    local_sq = _segmented_local_sq(
+        buckets, device=resolved_device, ext=ext, chunk_size=resolved_chunk_size
+    )
 
     # Stage 2 -- the single, rank-uniform collective.
     global_sq = _apply_segment_reductions(local_sq, reduce_flags, process_group)
@@ -414,7 +422,9 @@ def clip_grad_norm_buckets_(
 
     # Stage 4 -- scale in place (no collective). found_inf never gates this.
     if max_norm is not None:
-        _segmented_scale(buckets, coefs, device=device, ext=ext, chunk_size=resolved_chunk_size)
+        _segmented_scale(
+            buckets, coefs, device=resolved_device, ext=ext, chunk_size=resolved_chunk_size
+        )
 
     # Stage 5 -- stats stay on the device; consumers own any host readback.
     stats = _build_stats(buckets, total_norms, coefs, max_norm=max_norm, fastpath=ext is not None)
@@ -424,6 +434,120 @@ def clip_grad_norm_buckets_(
         stats,
         fastpath=ext is not None,
         fallback_reason=None if ext is not None else "cuda_extension_unavailable",
+    )
+
+
+def _collect_model_owned_grads(model: nn.Module) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Collect unique rank-owned DMuon gradients across all ownership domains.
+
+    Every logical parameter element in the model is included at most once across
+    all ranks (DP/HSDP/EP/PP/TP):
+      - ``sharded_adamw`` params contribute only their valid slice
+        ``_sharded_adamw_grad[:_sharded_adamw_valid_numel]`` (never padding).
+      - TP-sharded Muon params contribute ``_tp_full_grad`` on the TP owner if
+        already gathered, or their disjoint TP shard ``_reduced_grad`` on each
+        DP-owner TP rank prior to TP gather.
+      - Owner-managed ``muon`` and ``adamw`` params contribute ``_reduced_grad``
+        on their unique global owner rank.
+    """
+
+    wait_all_reduces(model)
+    muon_grads: list[torch.Tensor] = []
+    adamw_grads: list[torch.Tensor] = []
+    for dp in get_dedicated_params(model):
+        if getattr(dp, "uses_sharded_adamw", lambda: False)():
+            grad = getattr(dp, "_sharded_adamw_grad", None)
+            valid = int(getattr(dp, "_sharded_adamw_valid_numel", 0) or 0)
+            if grad is not None and valid > 0:
+                adamw_grads.append(grad[:valid])
+            continue
+
+        route = getattr(dp, "_dmuon_route", "muon")
+        is_tp = bool(getattr(dp, "is_dtensor", False) and getattr(dp, "tp_group", None) is not None)
+        if is_tp and getattr(dp, "_tp_full_grad", None) is not None:
+            grad = dp._tp_full_grad if getattr(dp, "is_tp_owner", False) else None
+        elif getattr(dp, "is_owner", False):
+            grad = getattr(dp, "_reduced_grad", None)
+        else:
+            grad = None
+
+        if grad is None or grad.numel() == 0:
+            continue
+        if route == "muon":
+            muon_grads.append(grad)
+        else:
+            adamw_grads.append(grad)
+    return muon_grads, adamw_grads
+
+
+@torch.no_grad()
+def clip_model_grad_norm_(
+    model: nn.Module,
+    max_norm: float | None,
+    *,
+    mode: Literal["global", "per_algorithm"] = "global",
+    norm_reduce_group=None,
+    extra_grads: Sequence[torch.Tensor] = (),
+    extra_muon_grads: Sequence[torch.Tensor] = (),
+    extra_adamw_grads: Sequence[torch.Tensor] = (),
+    chunk_size: int | None = None,
+) -> SegmentedGradClipResult:
+    """Clip all DMuon-owned gradients on ``model`` across arbitrary ownership domains.
+
+    Because every logical parameter element has a unique owner (or disjoint
+    sharded slice) across all domains (DP/HSDP/CP/EP/PP/TP), a single
+    ``all_reduce(SUM)`` over ``norm_reduce_group`` (default: ``WORLD``) produces
+    the exact global norm.  Fixed bucket shapes are used on every rank so ranks
+    or pipeline stages with zero local gradients in a bucket stay in lockstep.
+
+    Args:
+        model: Model wrapped with :func:`dmuon.dedicate_params`.
+        max_norm: Maximum L2 norm, or ``None`` for stats-only evaluation.
+        mode: ``"global"`` clips all owned gradients with one shared norm;
+            ``"per_algorithm"`` clips ``"muon"`` and ``"adamw"`` (including
+            ``sharded_adamw``) independently in two fixed buckets.
+        norm_reduce_group: Process group for summing per-bucket squared norms.
+            Defaults to ``None`` (PyTorch default ``WORLD`` group).
+        extra_grads: Additional uniquely-owned gradients to include in
+            ``mode="global"``.
+        extra_muon_grads: Additional uniquely-owned Muon gradients.
+        extra_adamw_grads: Additional uniquely-owned AdamW gradients.
+        chunk_size: Optional override for the CUDA fast-clip chunk size.
+    """
+
+    if mode not in {"global", "per_algorithm"}:
+        raise ValueError(f"mode must be 'global' or 'per_algorithm', got {mode!r}")
+    if mode == "per_algorithm" and extra_grads:
+        raise ValueError(
+            "Use extra_muon_grads / extra_adamw_grads instead of extra_grads in "
+            "mode='per_algorithm'"
+        )
+
+    muon_grads, adamw_grads = _collect_model_owned_grads(model)
+    comm_ctx = get_comm_ctx(model)
+    device = getattr(comm_ctx, "device", None)
+
+    if mode == "global":
+        all_grads = [
+            *muon_grads,
+            *adamw_grads,
+            *extra_grads,
+            *extra_muon_grads,
+            *extra_adamw_grads,
+        ]
+        buckets: tuple[GradClipBucket, ...] = (GradClipBucket("global", all_grads, reduce=True),)
+    else:
+        buckets = (
+            GradClipBucket("muon", [*muon_grads, *extra_muon_grads], reduce=True),
+            GradClipBucket("adamw", [*adamw_grads, *extra_adamw_grads], reduce=True),
+        )
+
+    return clip_grad_norm_buckets_(
+        buckets,
+        max_norm,
+        process_group=norm_reduce_group,
+        chunk_size=chunk_size,
+        device=device,
     )
 
 
