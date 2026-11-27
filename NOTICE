@@ -27,6 +27,12 @@ Incorporated / adapted code
    adapted from this project. Refer to the upstream repository for its license
    terms.
 
+Ascend DeepGEMM kernels
+   https://github.com/tile-ai/tilelang/tree/v0.1.15/examples/ascend/deepgemm
+   Copyright (c) Tile-AI. The FP16 kernels in
+   dmuon/backend/tilelang/kernels/deepgemm adapt the MIT-licensed Ascend
+   example. Its license accompanies the sources in that directory.
+
 ================================================================================
 Design inspiration (no code incorporated)
 ================================================================================
