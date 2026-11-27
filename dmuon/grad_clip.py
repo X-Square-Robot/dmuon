@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 
 from ._core.device import default_device
 
@@ -90,6 +91,7 @@ class MuonGradClipContext:
     norm_type: float
     error_if_nonfinite: bool
     foreach: bool | None = None
+    norm_reduce_group: Any = None
 
 
 class MuonGradClipStrategy(Protocol):
@@ -113,6 +115,7 @@ class GlobalNormMuonClipStrategy:
             context.norm_type,
             error_if_nonfinite=context.error_if_nonfinite,
             foreach=context.foreach,
+            norm_reduce_group=context.norm_reduce_group,
         )
 
         max_norm = context.max_norm
@@ -174,18 +177,57 @@ def clip_grad_norm_(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
     strategy: str | MuonGradClipStrategy = "global_norm",
-) -> MuonGradClipStats:
-    """Clip DMuon-owned Muon gradients only.
+    mode: str | None = None,
+    norm_reduce_group: Any = None,
+) -> MuonGradClipStats | Any:
+    """Clip DMuon-owned gradients on a :class:`dmuon.Muon` optimizer or model.
 
-    This does **not** touch AdamW/non-dedicated parameters.  Training
-    frameworks should keep using PyTorch's native clipping for ordinary
-    ``param.grad`` tensors, and call this helper as the extra DMuon line.
+    - When passed a :class:`dmuon.Muon` optimizer with ``mode=None`` (default),
+      clips DMuon-owned Muon gradients only and returns :class:`MuonGradClipStats`,
+      preserving full backward compatibility with hybrid FSDP2/DDP setups.
+    - When passed an ``nn.Module`` wrapped by :func:`dmuon.dedicate_params` (or
+      when ``mode`` is explicitly set to ``"global"`` or ``"per_algorithm"``),
+      clips all uniquely-owned DMuon gradients across all ownership domains via
+      :func:`dmuon.clip_model_grad_norm_` and returns :class:`SegmentedGradClipResult`.
     """
+
+    if isinstance(optimizer, nn.Module):
+        if float(norm_type) != 2.0:
+            raise ValueError(f"Model multi-domain clipping supports L2 norm only, got {norm_type}")
+        from .fast_clip import clip_model_grad_norm_
+
+        result = clip_model_grad_norm_(
+            optimizer,
+            max_norm,
+            mode=mode or "global",
+            norm_reduce_group=norm_reduce_group,
+        )
+        if error_if_nonfinite and any(bool(s.found_inf.item()) for s in result.bucket_stats):
+            raise RuntimeError(
+                "The total norm for DMuon gradients is non-finite, so it cannot be clipped."
+            )
+        return result
 
     ensure = getattr(optimizer, "_ensure_grads_ready", None)
     if ensure is None or not hasattr(optimizer, "_dedicated_params"):
-        raise TypeError("dmuon.clip_grad_norm_ expects a dmuon.Muon optimizer")
+        raise TypeError("dmuon.clip_grad_norm_ expects a dmuon.Muon optimizer or nn.Module")
     ensure()
+    if mode is not None:
+        if float(norm_type) != 2.0:
+            raise ValueError(f"mode={mode!r} clipping supports L2 norm only, got {norm_type}")
+        from .fast_clip import clip_model_grad_norm_
+
+        result = clip_model_grad_norm_(
+            optimizer.model,
+            max_norm,
+            mode=mode,
+            norm_reduce_group=norm_reduce_group,
+        )
+        if error_if_nonfinite and any(bool(s.found_inf.item()) for s in result.bucket_stats):
+            raise RuntimeError(
+                "The total norm for DMuon gradients is non-finite, so it cannot be clipped."
+            )
+        return result
     stats = _clip_ready_muon_grad_norm_(
         optimizer,
         max_norm,
@@ -193,6 +235,7 @@ def clip_grad_norm_(
         error_if_nonfinite=error_if_nonfinite,
         foreach=foreach,
         strategy=strategy,
+        norm_reduce_group=norm_reduce_group,
     )
     optimizer._last_muon_grad_clip_stats = stats
     return stats
@@ -206,6 +249,7 @@ def _clip_ready_muon_grad_norm_(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
     strategy: str | MuonGradClipStrategy = "global_norm",
+    norm_reduce_group: Any = None,
 ) -> MuonGradClipStats:
     """Internal variant for callers that already ran ``_ensure_grads_ready``."""
 
@@ -220,6 +264,7 @@ def _clip_ready_muon_grad_norm_(
         norm_type=float(norm_type),
         error_if_nonfinite=error_if_nonfinite,
         foreach=foreach,
+        norm_reduce_group=norm_reduce_group,
     )
     stats = resolved(context)
     optimizer._last_muon_grad_clip_stats = stats
@@ -273,15 +318,16 @@ def _compute_total_norm(
     *,
     error_if_nonfinite: bool,
     foreach: bool | None,
+    norm_reduce_group: Any = None,
 ) -> torch.Tensor:
     if norm_type == float("inf"):
         local = _local_total_norm(entries, norm_type, optimizer, foreach=foreach)
-        _all_reduce_if_needed(local, op=dist.ReduceOp.MAX)
+        _all_reduce_if_needed(local, op=dist.ReduceOp.MAX, group=norm_reduce_group)
         total_norm = local
     else:
         local = _local_total_norm(entries, norm_type, optimizer, foreach=foreach)
         local_power = local.pow(norm_type)
-        _all_reduce_if_needed(local_power, op=dist.ReduceOp.SUM)
+        _all_reduce_if_needed(local_power, op=dist.ReduceOp.SUM, group=norm_reduce_group)
         total_norm = local_power.pow(1.0 / norm_type)
 
     if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
@@ -388,6 +434,11 @@ def _accumulator_device(
     return default_device()
 
 
-def _all_reduce_if_needed(tensor: torch.Tensor, *, op: dist.ReduceOp) -> None:
+def _all_reduce_if_needed(
+    tensor: torch.Tensor,
+    *,
+    op: dist.ReduceOp,
+    group: Any = None,
+) -> None:
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(tensor, op=op)
+        dist.all_reduce(tensor, op=op, group=group)

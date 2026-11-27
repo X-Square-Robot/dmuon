@@ -46,6 +46,7 @@ from .fast_clip import (
     GradClipBucketStats,
     SegmentedGradClipResult,
     clip_grad_norm_buckets_,
+    clip_model_grad_norm_,
     try_clip_optimizer_grad_norm_buckets_,
 )
 from .diagnostics import summarize_comm_plan, summarize_param_groups
@@ -101,6 +102,7 @@ __all__ = [
     "MatrixLayout",
     "clip_grad_norm_",
     "clip_grad_norm_buckets_",
+    "clip_model_grad_norm_",
     "try_clip_optimizer_grad_norm_buckets_",
     "register_muon_grad_clip_strategy",
     "MuonGradClipStats",
