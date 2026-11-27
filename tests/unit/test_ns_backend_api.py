@@ -63,16 +63,19 @@ def test_get_backend_status_shape():
         "quack_available",
         "cute_sm80_available",
         "cublas_always_available",
+        "compute_backend",
+        "device_type",
     }
     assert required <= set(st.keys())
     assert isinstance(st["sm_version"], int)
     assert isinstance(st["quack_available"], bool)
     assert isinstance(st["cute_sm80_available"], bool)
     assert st["cublas_always_available"] is True
+    assert st["compute_backend"] in {"torch", "tilelang"}
 
 
 def test_get_backend_status_auto_choice_is_concrete():
-    """``auto_choice`` must be a concrete backend (never 'auto' itself)
-    so callers can treat it as ground truth for what kernel will run."""
+    """``auto_choice`` is the concrete SYRK choice, never 'auto' itself.
+    ``compute_backend`` independently reports Torch versus TileLang arithmetic."""
     st = dmuon.get_backend_status()
     assert st["auto_choice"] in {"quack", "cute_sm80", "cublas"}

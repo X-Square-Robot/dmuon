@@ -84,6 +84,7 @@ plugins:
             Core Concepts: 核心概念
             User Guide: 使用指南
             Training: 训练流程
+            Ascend TileLang: 昇腾 TileLang
             Pure DMuon Routing: Pure DMuon 路由
             Matrix Layouts: 矩阵布局
             Ownership Domains: 所有权域（多并行）
@@ -152,6 +153,7 @@ nav:
     - Core Concepts: getting-started/concepts.md
   - User Guide:
     - Training: guides/training.md
+    - Ascend TileLang: guides/ascend-tilelang.md
     - Pure DMuon Routing: guides/pure-dmuon-routing.md
     - Matrix Layouts: guides/matrix-layouts.md
     - Ownership Domains: guides/ownership-domains.md

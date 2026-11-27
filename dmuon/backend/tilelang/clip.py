@@ -356,7 +356,9 @@ def _legacy_stats(total_norm, max_norm):
     return coef.reshape(()), clipped.reshape(()), found_inf.reshape(())
 
 
-def compute_total_norm_tilelang(optimizer, entries, norm_type, *, error_if_nonfinite, foreach=None):
+def compute_total_norm_tilelang(
+    optimizer, entries, norm_type, *, error_if_nonfinite, foreach=None, norm_reduce_group=None
+):
     """Legacy roundings and the scalar collective are preserved exactly."""
     if norm_type != 2.0:
         raise NotImplementedError("TileLang legacy clipping supports norm_type=2")
@@ -367,7 +369,7 @@ def compute_total_norm_tilelang(optimizer, entries, norm_type, *, error_if_nonfi
     power = torch.empty((1,), device=local.device, dtype=torch.float32)
     _scalar_kernel("square")(local.reshape(1), power)
     # Preserve scalar shape () used by the legacy distributed entry point.
-    _all_reduce_if_needed(power.reshape(()), op=dist.ReduceOp.SUM)
+    _all_reduce_if_needed(power.reshape(()), op=dist.ReduceOp.SUM, group=norm_reduce_group)
     total = torch.empty_like(power)
     _scalar_kernel("sqrt")(power, total)
     result = total.reshape(())
@@ -391,6 +393,7 @@ def global_norm_strategy_tilelang(context):
         context.norm_type,
         error_if_nonfinite=context.error_if_nonfinite,
         foreach=context.foreach,
+        norm_reduce_group=context.norm_reduce_group,
     )
     if context.max_norm is not None and context.max_norm < 0:
         raise ValueError(f"max_norm must be non-negative, got {context.max_norm}")

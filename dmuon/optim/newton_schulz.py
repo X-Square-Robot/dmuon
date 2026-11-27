@@ -1,8 +1,8 @@
 """Newton-Schulz orthogonalization with tiered hardware backends.
 
-Backend selection (auto-detected at import time):
-- **SM80+ & CuteDSL SYRK**: lower-triangle + mirror-write kernel (50% tile savings)
-- **Fallback**: ``@torch.compile`` pure PyTorch
+CUDA SYRK selection is resolved at import time; owner-local Torch versus
+Ascend TileLang arithmetic is selected for each input device. The fallback is
+``@torch.compile`` pure PyTorch where available.
 
 Two NS modes:
 - :func:`newton_schulz`: Gram-space NS on a full matrix (default public entry).
@@ -27,6 +27,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 from dmuon._core.device import cuda_is_available
+from dmuon.backend import resolve_compute_backend
 from dmuon.optim.syrk_dispatch import (
     HAS_SYRK as _HAS_SYRK,
     syrk_or_cublas as _syrk_or_cublas,
@@ -97,7 +98,8 @@ class NewtonSchulz:
             * ``"quack"`` — Tri Dao quack SYRK (SM90+, soft dep). Raises
               at construction if unavailable.
             * ``"cute_sm80"`` — DMuon-internal CuteDSL kernel (SM80/87).
-            * ``"cublas"`` — universal fallback; bit-exact across runs.
+            * ``"cublas"`` — universal CUDA fallback; bit-exact across runs.
+              Explicit cuBLAS requests raise on Ascend NPUs.
 
             Env var override: ``DMUON_NS_KERNEL`` takes precedence only
             when this argument is left at ``"auto"``.
@@ -111,6 +113,7 @@ class NewtonSchulz:
             forced to ``cublas`` (bit-exact reproducibility).  Explicit
             ``kernel=`` wins over ``deterministic`` — if both are given
             and they disagree, a warning is emitted and ``kernel`` wins.
+            Explicit cuBLAS and deterministic requests raise on Ascend NPUs.
 
     Example::
 
@@ -171,12 +174,18 @@ class NewtonSchulz:
                 chosen.value,
             )
 
+        # Preserve the explicit cuBLAS/deterministic contract before auto
+        # resolution: auto may also resolve to cuBLAS on NPU, but that alone
+        # must not disable the automatic TileLang compute backend.
+        force_torch_compute = chosen == SyrkBackend.CUBLAS
+
         # Validate availability early so the failure is at construction
         # time, not buried inside the first SYRK call.
         chosen = resolve_backend(chosen)
 
         self.backend = backend
         self.kernel = chosen
+        self._force_torch_compute = force_torch_compute
         # The missing wire (2026-08-05): syrk_or_cublas historically ignored
         # the resolved kernel and always autotuned cute_sm80-vs-cuBLAS, so
         # "quack" never actually ran. Publish the choice to the dispatch
@@ -191,7 +200,7 @@ class NewtonSchulz:
         # ``self.deterministic`` keep working unchanged.
         self.deterministic = chosen == SyrkBackend.CUBLAS
 
-    def local(self, G: Tensor, steps: int) -> Tensor:
+    def local(self, G: Tensor, steps: int, *, compute_backend: str = "auto") -> Tensor:
         """Run NS on a full (un-sharded) matrix.
 
         The runtime guarantees the matrix handed in here is the full
@@ -201,17 +210,20 @@ class NewtonSchulz:
         reassembled the full matrix on the TP owner before this call.
         """
         if self.backend == "gram":
-            return gram_newton_schulz(
-                G,
-                steps=steps,
-                coefficients=self.coefficients,
-                restart_iterations=self.restart_iterations,
-                deterministic=self.deterministic,
-            )
+            if G.device.type == "npu" and self._force_torch_compute:
+                raise ValueError(
+                    "kernel='cublas' and deterministic=True are CUDA-only. "
+                    "On Ascend, use kernel='auto' with compute_backend='torch' or 'tilelang'."
+                )
+            args = (G, steps, 1e-7, self.coefficients, self.restart_iterations, self.deterministic)
+            if self._force_torch_compute:
+                return _torch_gram_newton_schulz(*args)
+            return resolve_compute_backend(G.device, compute_backend).gram_newton_schulz(*args)
         return direct_newton_schulz(
             G,
             steps=steps,
             coefficients=self.coefficients,
+            compute_backend=compute_backend,
         )
 
     def __repr__(self) -> str:
@@ -230,6 +242,7 @@ def direct_newton_schulz(
     steps: int = 5,
     eps: float = 1e-7,
     coefficients: Optional[list[list[float]]] = None,
+    compute_backend: str = "auto",
 ) -> Tensor:
     """Standard Newton-Schulz orthogonalization in direct (parameter) space.
 
@@ -253,10 +266,17 @@ def direct_newton_schulz(
         eps: Normalization epsilon.
         coefficients: Per-step ``(a, b, c)`` coefficients. Length determines
             number of iterations. Defaults to :data:`DEFAULT_COEFFICIENTS`.
+        compute_backend: ``"auto"``, ``"torch"``, or ``"tilelang"``.
 
     Returns:
         Orthogonalized update, same shape as G, in original dtype.
     """
+    return resolve_compute_backend(G.device, compute_backend).direct_newton_schulz(
+        G, steps, eps, coefficients
+    )
+
+
+def _torch_direct_newton_schulz(G, steps, eps, coefficients):
     if coefficients is None:
         coefficients = DEFAULT_COEFFICIENTS
 
@@ -308,6 +328,7 @@ def newton_schulz(
     eps: float = 1e-7,
     coefficients: Optional[list[list[float]]] = None,
     restart_iterations: Optional[list[int]] = None,
+    compute_backend: str = "auto",
 ) -> Tensor:
     """Newton-Schulz orthogonalization (default: Gram-space backend).
 
@@ -322,6 +343,7 @@ def newton_schulz(
         eps: Normalization epsilon.
         coefficients: Per-step coefficients. Defaults to POLAR_EXPRESS_COEFFICIENTS.
         restart_iterations: Restart positions. Defaults to [2].
+        compute_backend: ``"auto"``, ``"torch"``, or ``"tilelang"``.
 
     Returns:
         Orthogonalized update.
@@ -332,6 +354,7 @@ def newton_schulz(
         eps=eps,
         coefficients=coefficients,
         restart_iterations=restart_iterations,
+        compute_backend=compute_backend,
     )
 
 
@@ -345,6 +368,7 @@ def gram_newton_schulz(
     coefficients: Optional[list[list[float]]] = None,
     restart_iterations: Optional[list[int]] = None,
     deterministic: bool = False,
+    compute_backend: str = "auto",
 ) -> Tensor:
     """Gram-space Newton-Schulz on a full (un-sharded) matrix.
 
@@ -365,10 +389,27 @@ def gram_newton_schulz(
         coefficients: Per-step coefficients. Defaults to POLAR_EXPRESS_COEFFICIENTS.
         restart_iterations: Iteration indices for restart. Defaults to [2].
         deterministic: If True, use cuBLAS for all ops (no SYRK kernel).
+            Explicit deterministic requests raise on Ascend NPUs.
+        compute_backend: ``"auto"``, ``"torch"``, or ``"tilelang"``.
 
     Returns:
         Orthogonalized update, same shape as G.
     """
+    if deterministic and G.device.type == "npu":
+        raise ValueError(
+            "deterministic=True is CUDA-only because it selects cuBLAS. "
+            "On Ascend, use deterministic=False with compute_backend='torch' or 'tilelang'."
+        )
+    if deterministic:
+        return _torch_gram_newton_schulz(
+            G, steps, eps, coefficients, restart_iterations, deterministic
+        )
+    return resolve_compute_backend(G.device, compute_backend).gram_newton_schulz(
+        G, steps, eps, coefficients, restart_iterations, deterministic
+    )
+
+
+def _torch_gram_newton_schulz(G, steps, eps, coefficients, restart_iterations, deterministic):
     if coefficients is None:
         coefficients = DEFAULT_COEFFICIENTS
     if restart_iterations is None:

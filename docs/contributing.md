@@ -55,12 +55,15 @@ first to verify your logic before using the distributed harness as a debug loop
 ### Native Ascend distributed tests (requires 4 NPUs)
 
 Use a matching PyTorch, `torch_npu`, and CANN environment and select four
-visible devices. The same mandatory entry provides a native NPU/HCCL gate:
+visible devices. The accelerated 950DT path also requires unmodified TileLang
+v0.1.15 built with `USE_ASCEND=ON`. Pass `compute_backend="torch"` to
+`dmuon.Muon` to validate the reference arithmetic without TileLang. The same
+mandatory entry provides a native NPU/HCCL gate:
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
-    tests/distributed/test_hsdp_correctness.py --device npu \
+    tests/distributed/test_hsdp_correctness.py --device npu --compute-backend tilelang \
     --output-dir /path/to/new-hsdp-proof
 ```
 

@@ -1,7 +1,7 @@
-"""Optional segmented CUDA fast path for gradient clipping.
+"""Optional segmented CUDA and Ascend TileLang fast paths for gradient clipping.
 
 The public training semantics stay segment-local: each bucket gets its own
-gradient norm and clip coefficient.  The CUDA path only changes how those
+gradient norm and clip coefficient. Accelerated backends only change how those
 segment-local norms are computed and applied.
 
 Distributed safety: the CUDA kernels accelerate only the *local* norm/scale
@@ -28,6 +28,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ._core.device import default_device
+from .backend import supports_tilelang_clip, use_tilelang
 
 from .grad_clip import MuonGradClipStats, _iter_muon_grad_entries
 from .utils import get_comm_ctx, get_dedicated_params, wait_all_reduces
@@ -386,6 +387,7 @@ def clip_grad_norm_buckets_(
     process_group=None,
     chunk_size: int | None = None,
     device: torch.device | None = None,
+    compute_backend: str = "auto",
 ) -> SegmentedGradClipResult:
     """Clip gradient buckets with segment-local, distributed-safe semantics.
 
@@ -394,13 +396,25 @@ def clip_grad_norm_buckets_(
     when the extension is unavailable) use the torch reference math.  The
     fast/slow choice is per tensor and purely local: it never changes the
     number or shape of collective operations, so this is safe to call from
-    every rank in lockstep.
+    every rank in lockstep. ``compute_backend`` defaults to ``"auto"``;
+    ``"torch"`` forces the reference arithmetic and ``"tilelang"`` requires
+    eligible Ascend TileLang inputs.
     """
 
     if max_norm is not None and float(max_norm) < 0:
         raise ValueError(f"max_norm must be non-negative, got {max_norm}")
 
     resolved_device = torch.device(device) if device is not None else _resolve_device(buckets)
+    if supports_tilelang_clip(
+        resolved_device,
+        (grad for bucket in buckets for grad in bucket.grads if grad is not None),
+        compute_backend=compute_backend,
+    ):
+        from .backend.tilelang.segmented_clip import clip_grad_norm_buckets_tilelang
+
+        return clip_grad_norm_buckets_tilelang(
+            buckets, max_norm, process_group=process_group, chunk_size=chunk_size
+        )
     ext = _load_fast_clip_extension() if resolved_device.type == "cuda" else None
     resolved_chunk_size = _resolve_chunk_size(chunk_size)
     reduce_flags = [1 if bucket.reduce else 0 for bucket in buckets]
@@ -491,6 +505,7 @@ def clip_model_grad_norm_(
     extra_muon_grads: Sequence[torch.Tensor] = (),
     extra_adamw_grads: Sequence[torch.Tensor] = (),
     chunk_size: int | None = None,
+    compute_backend: str = "auto",
 ) -> SegmentedGradClipResult:
     """Clip all DMuon-owned gradients on ``model`` across arbitrary ownership domains.
 
@@ -513,6 +528,7 @@ def clip_model_grad_norm_(
         extra_muon_grads: Additional uniquely-owned Muon gradients.
         extra_adamw_grads: Additional uniquely-owned AdamW gradients.
         chunk_size: Optional override for the CUDA fast-clip chunk size.
+        compute_backend: ``"auto"``, ``"torch"``, or ``"tilelang"``.
     """
 
     if mode not in {"global", "per_algorithm"}:
@@ -548,6 +564,7 @@ def clip_model_grad_norm_(
         process_group=norm_reduce_group,
         chunk_size=chunk_size,
         device=device,
+        compute_backend=compute_backend,
     )
 
 
@@ -562,8 +579,8 @@ def try_clip_optimizer_grad_norm_buckets_(
 ) -> SegmentedGradClipResult | None:
     """Fast path for Wall-X style regular/Muon/dedicated-AdamW clipping.
 
-    Returns ``None`` when the optimizer's communication device is non-CUDA,
-    the CUDA extension is unavailable, or the optimizer does not expose
+    Returns ``None`` when the optimizer's communication device has no
+    enabled compute fast path, or the optimizer does not expose
     ``_ensure_grads_ready``. The caller can then run its own clipping path.
     These early returns do not prepare gradients, scale tensors, or issue
     collectives. Distributed callers must use the same device type, extension
@@ -573,10 +590,15 @@ def try_clip_optimizer_grad_norm_buckets_(
     """
 
     device = getattr(getattr(optimizer, "_comm_ctx", None), "device", None)
-    if device is not None and torch.device(device).type != "cuda":
-        return None
-    if _load_fast_clip_extension() is None:
-        return None
+    compute_backend = getattr(optimizer, "_compute_backend", "auto")
+    tilelang = device is not None and use_tilelang(
+        torch.device(device), compute_backend=compute_backend
+    )
+    if not tilelang:
+        if device is not None and torch.device(device).type != "cuda":
+            return None
+        if _load_fast_clip_extension() is None:
+            return None
 
     ensure = getattr(optimizer, "_ensure_grads_ready", None)
     if ensure is None:
@@ -596,6 +618,7 @@ def try_clip_optimizer_grad_norm_buckets_(
         ),
         max_norm,
         process_group=process_group,
+        compute_backend=compute_backend,
     )
 
     muon_stats = result.stats_by_name.get("muon")
@@ -608,6 +631,8 @@ def try_clip_optimizer_grad_norm_buckets_(
             clipped=muon_stats.clipped,
             param_count=muon_stats.param_count,
             found_inf=muon_stats.found_inf,
-            strategy="segmented_cuda_fastpath",
+            strategy=("segmented_tilelang_fastpath" if result.fastpath else "segmented_torch")
+            if tilelang
+            else "segmented_cuda_fastpath",
         )
     return result

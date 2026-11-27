@@ -290,8 +290,9 @@ ns = dmuon.NewtonSchulz(kernel="cute_sm80")
     to emergency-disable the quack path without uninstalling the
     package; `kernel="auto"` then falls back to `cublas`.
 
-    `get_backend_status()["auto_choice"]` always reports the kernel
-    that will actually run, so you can see ground truth at a glance.
+    `get_backend_status()["auto_choice"]` reports the concrete SYRK kernel
+    choice. Read `get_backend_status()["compute_backend"]` separately for the
+    owner-local `torch` versus `tilelang` arithmetic selection on Ascend.
 
 ---
 

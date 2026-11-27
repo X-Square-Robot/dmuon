@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 
 from .._core.device import get_device_module
+from ..backend import normalize_compute_backend, resolve_compute_backend
 
 from ..grad_clip import (
     MuonGradClipStats,
@@ -101,6 +102,11 @@ class Muon(Optimizer):
         nesterov: If True (default), use Nesterov momentum lookahead
             before NS orthogonalization: ``ns_input = grad + μ * buf``.
             Recommended by original Muon paper and used by Moonlight.
+        compute_backend: Owner-local arithmetic backend. ``"auto"`` (default)
+            uses TileLang on eligible Ascend 950DT devices and the existing
+            backend elsewhere. ``"torch"`` forces the reference arithmetic;
+            ``"tilelang"`` requires TileLang on Ascend 950DT. This setting
+            covers Muon, AdamW, NS, and optimizer gradient clipping.
         replicate_async: If True (default), publish owner updates asynchronously
             and consume the events in the next forward. If False, drain the
             publish path inside ``step()`` for deterministic timing. When TP
@@ -168,6 +174,7 @@ class Muon(Optimizer):
         forward_prefetch_depth: int = 1,
         first_step_progress_log: bool = True,
         first_step_progress_log_limit: int = 8,
+        compute_backend: str = "auto",
     ):
         if isinstance(ns_backend, str):
             ns_backend = NewtonSchulz(backend=ns_backend)
@@ -180,6 +187,7 @@ class Muon(Optimizer):
         self._ns_steps = ns_steps
         self._ns = ns_backend
         self._nesterov = nesterov
+        self._compute_backend = normalize_compute_backend(compute_backend)
         self._grads_ready = False
         self._last_muon_grad_clip_stats: Optional[MuonGradClipStats] = None
         # Phase C: toggle between async (default, hides broadcast inside
@@ -1706,26 +1714,20 @@ class Muon(Optimizer):
             if dp_id not in self.state:
                 self.state[dp_id] = {}
             state = self.state[dp_id]
-            if "momentum_buffer" not in state:
-                state["momentum_buffer"] = grad.to(_muon_state_dtype(dp, grad.dtype)).clone()
-            else:
-                state["momentum_buffer"].mul_(mu).add_(grad)
-            buf = state["momentum_buffer"]
-
-            # Nesterov lookahead: ns_input = grad + μ * buf
-            ns_input = grad.add(buf, alpha=mu) if self._nesterov else buf
-
-            # Newton-Schulz on the full (un-sharded) matrix.
-            self._first_step_progress_shape(
-                dp,
-                ns_input,
-                path="tp_owner_full_matrix" if is_tp else "owner_full_matrix",
+            compute = resolve_compute_backend(
+                grad.device, getattr(self, "_compute_backend", "auto")
             )
-            profile_token = self._profile_event_start("ns_compute")
-            try:
-                update = self._ns_compute(ns_input, is_tp=is_tp)
-            finally:
-                self._profile_event_end(profile_token)
+            with compute.momentum_input(
+                grad, state, _muon_state_dtype(dp, grad.dtype), mu, self._nesterov
+            ) as ns_input:
+                self._first_step_progress_shape(
+                    dp, ns_input, path="tp_owner_full_matrix" if is_tp else "owner_full_matrix"
+                )
+                profile_token = self._profile_event_start("ns_compute")
+                try:
+                    update = self._ns_compute(ns_input, is_tp=is_tp)
+                finally:
+                    self._profile_event_end(profile_token)
             self._profile_add("ns_matrix_count", 1)
             self._profile_add("ns_input_numel", int(ns_input.numel()))
 
@@ -1739,12 +1741,9 @@ class Muon(Optimizer):
                 m_full = dp.full_shape[0]
                 n_full = dp.full_shape[1] if len(dp.full_shape) > 1 else m_full
                 scale = 0.2 * (max(m_full, n_full) ** 0.5)
-                update_full = update.view(dp.full_shape).to(
-                    device=dp._owned_data.device,
-                    dtype=dp._owned_data.dtype,
+                dp._tp_full_delta = compute.scaled_delta(
+                    update, dp.full_shape, dp._owned_data.device, dp._owned_data.dtype, -lr * scale
                 )
-                update_full.mul_(-lr * scale)
-                dp._tp_full_delta = update_full
                 dp._tp_wd_factor = (1.0 - lr * wd) if wd > 0 else 1.0
 
             else:
@@ -1754,11 +1753,8 @@ class Muon(Optimizer):
                 n = owned.view(m, -1).shape[1]
                 scale = 0.2 * (max(m, n) ** 0.5)
 
-                if wd > 0:
-                    owned.mul_(1.0 - lr * wd)
-                owned.add_(
-                    update.view(owned.shape).to(device=owned.device, dtype=owned.dtype),
-                    alpha=-lr * scale,
+                compute.apply_update_(
+                    owned, update, (1.0 - lr * wd) if wd > 0 else None, -lr * scale
                 )
 
             # Non-TP params: clear now.  TP params defer the clear to
@@ -1779,7 +1775,10 @@ class Muon(Optimizer):
         ns_graph.py capture protocol).
         """
         if ns_input.device.type != "cuda":
-            return self._ns.local(ns_input, self._ns_steps)
+            compute_backend = getattr(self, "_compute_backend", "auto")
+            if compute_backend == "auto":
+                return self._ns.local(ns_input, self._ns_steps)
+            return self._ns.local(ns_input, self._ns_steps, compute_backend=compute_backend)
 
         from dmuon.optim import ns_graph as _ns_graph
 
@@ -1914,28 +1913,10 @@ class Muon(Optimizer):
             key = (state["step"], param.dtype, param.device, grad.dtype)
             buckets.setdefault(key, []).append((param, grad, state["exp_avg"], state["exp_avg_sq"]))
 
-        for (step, _pdt, _pdev, _gdt), items in buckets.items():
-            params = [it[0] for it in items]
-            grads = [it[1] for it in items]
-            exp_avgs = [it[2] for it in items]
-            exp_avg_sqs = [it[3] for it in items]
-
-            if wd > 0:
-                torch._foreach_mul_(params, 1.0 - lr * wd)
-
-            torch._foreach_mul_(exp_avgs, beta1)
-            torch._foreach_add_(exp_avgs, grads, alpha=1.0 - beta1)
-            torch._foreach_mul_(exp_avg_sqs, beta2)
-            torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
-
-            bc1 = 1.0 - beta1**step
-            bc2 = 1.0 - beta2**step
-            step_size = lr / bc1
-
-            denom = torch._foreach_sqrt(exp_avg_sqs)
-            torch._foreach_div_(denom, bc2**0.5)
-            torch._foreach_add_(denom, eps)
-            torch._foreach_addcdiv_(params, exp_avgs, denom, value=-step_size)
+        for (step, _pdt, device, _gdt), items in buckets.items():
+            resolve_compute_backend(
+                device, getattr(self, "_compute_backend", "auto")
+            ).adamw_bucket_(items, step, lr, (beta1, beta2), wd, eps)
 
     def zero_grad(self, set_to_none: bool = True):
         """Clear gradients.

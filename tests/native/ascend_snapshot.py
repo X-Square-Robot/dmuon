@@ -25,6 +25,7 @@ def main():
     )
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--pathway", choices=("ddp", "fsdp2"), default="fsdp2")
+    parser.add_argument("--compute-backend", choices=("auto", "torch", "tilelang"), default="auto")
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -34,6 +35,8 @@ def main():
         sys.path.insert(0, str(args.package_root.resolve()))
     if args.legacy_bootstrap is not None:
         runpy.run_path(str(args.legacy_bootstrap), run_name="__dmuon_legacy_bootstrap__")
+    # Legacy packages predate compute_backend; keep their original call signatures.
+    helper_backend = None if args.legacy_bootstrap is not None else args.compute_backend
 
     import torch
     import torch_npu  # Registers native NPU support; no transfer shim.
@@ -60,6 +63,7 @@ def main():
         "momentum_policy": "optim_dtype",
         "package": str(package_path),
         "pathway": args.pathway,
+        "compute_backend": args.compute_backend,
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
         "legacy_bootstrap": str(args.legacy_bootstrap),
@@ -72,7 +76,9 @@ def main():
     result = {"ns": {}, "clip": {}, "training": {}}
     for shape, dtype, family in ns_cases():
         key = f"{shape}:{dtype}:{family}"
-        result["ns"][key] = run_ns(dmuon, device, shape, dtype, family)
+        result["ns"][key] = run_ns(
+            dmuon, device, shape, dtype, family, compute_backend=helper_backend
+        )
     for dtype in (torch.float32, torch.float16, torch.bfloat16):
         for segmented in (False, True):
             for value in ([3.0, 4.0], [0.0, 0.0], [float("inf"), 1.0], [float("nan"), 1.0]):
@@ -85,10 +91,13 @@ def main():
                         max_norm,
                         segmented=segmented,
                         dtype=dtype,
+                        compute_backend=helper_backend,
                     )
-    result["empty_clip"] = run_empty_clip(dmuon, device)
+    result["empty_clip"] = run_empty_clip(dmuon, device, compute_backend=helper_backend)
     result["nonfinite_errors"] = {
-        f"{dtype}:{value}": run_nonfinite_clip_error(dmuon, device, value, dtype=dtype)
+        f"{dtype}:{value}": run_nonfinite_clip_error(
+            dmuon, device, value, dtype=dtype, compute_backend=helper_backend
+        )
         for dtype in (torch.float32, torch.float16, torch.bfloat16)
         for value in (float("inf"), float("nan"))
     }
@@ -122,6 +131,7 @@ def main():
                         asynchronous=asynchronous,
                         no_sync=no_sync,
                         verify_restore=args.verify_restore,
+                        compute_backend=helper_backend,
                     )
                 except AssertionError as error:
                     failure = getattr(error, "restore_failure", None)

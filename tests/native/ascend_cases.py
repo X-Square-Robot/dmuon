@@ -80,7 +80,7 @@ def ns_cases():
         yield shape, torch.bfloat16, "random"
 
 
-def run_ns(dmuon, device, shape, dtype, family):
+def run_ns(dmuon, device, shape, dtype, family, compute_backend="auto"):
     generator = torch.Generator().manual_seed(10233)
     if family == "zero":
         matrix = torch.zeros(shape)
@@ -91,7 +91,10 @@ def run_ns(dmuon, device, shape, dtype, family):
     else:
         matrix = torch.randn(shape, generator=generator)
     matrix = matrix.to(device=device, dtype=dtype)
-    output = dmuon.NewtonSchulz().local(matrix, 5)
+    if compute_backend is None:
+        output = dmuon.NewtonSchulz().local(matrix, 5)
+    else:
+        output = dmuon.NewtonSchulz().local(matrix, 5, compute_backend=compute_backend)
     assert output.shape == matrix.shape
     assert output.dtype == matrix.dtype
     assert torch.isfinite(output).all()
@@ -100,18 +103,23 @@ def run_ns(dmuon, device, shape, dtype, family):
     return cpu_tree(output)
 
 
-def run_clip(dmuon, device, value, max_norm, *, segmented, dtype=torch.float32):
+def run_clip(
+    dmuon, device, value, max_norm, *, segmented, dtype=torch.float32, compute_backend="auto"
+):
     grad = torch.tensor(value, device=device, dtype=dtype)
     original = grad.clone()
     if segmented:
+        backend_kwargs = {} if compute_backend is None else {"compute_backend": compute_backend}
         result = dmuon.clip_grad_norm_buckets_(
             [
                 dmuon.GradClipBucket("muon", [grad], reduce=False),
                 dmuon.GradClipBucket("empty", [], reduce=False),
             ],
             max_norm,
+            **backend_kwargs,
         )
-        assert not result.fastpath
+        if compute_backend == "torch":
+            assert not result.fastpath
         stats = result.stats_by_name["muon"]
     else:
         dp = SimpleNamespace(_reduced_grad=grad, param_name="proj", is_dtensor=False)
@@ -120,6 +128,8 @@ def run_clip(dmuon, device, value, max_norm, *, segmented, dtype=torch.float32):
             _comm_ctx=SimpleNamespace(device=device),
             _ensure_grads_ready=lambda: None,
         )
+        if compute_backend is not None:
+            optimizer._compute_backend = compute_backend
         stats = dmuon.clip_grad_norm_(optimizer, max_norm)
     # Stats-only calls retain Python coefficient/flag unions on the public
     # Muon API; the segmented API returns device tensors for those fields.
@@ -144,24 +154,27 @@ def run_clip(dmuon, device, value, max_norm, *, segmented, dtype=torch.float32):
     }
 
 
-def run_empty_clip(dmuon, device):
+def run_empty_clip(dmuon, device, compute_backend="auto"):
     optimizer = SimpleNamespace(
         _dedicated_params=[],
         _comm_ctx=SimpleNamespace(device=device),
         _ensure_grads_ready=lambda: None,
     )
+    if compute_backend is not None:
+        optimizer._compute_backend = compute_backend
     stats = dmuon.clip_grad_norm_(optimizer, None)
     assert stats.total_norm.device == device
     assert stats.total_norm.item() == 0 and stats.param_count == 0
     assert stats.clip_coef == 1.0 and stats.clipped is False
     assert not bool(stats.found_inf)
-    segmented = dmuon.clip_grad_norm_buckets_([], None)
+    backend_kwargs = {} if compute_backend is None else {"compute_backend": compute_backend}
+    segmented = dmuon.clip_grad_norm_buckets_([], None, **backend_kwargs)
     assert segmented.total_norm.device == device
     assert segmented.total_norm.item() == 0 and segmented.bucket_stats == ()
     return {"muon": cpu_tree(stats.as_dict()), "segmented": cpu_tree(segmented.total_norm)}
 
 
-def run_nonfinite_clip_error(dmuon, device, value, *, dtype=torch.float32):
+def run_nonfinite_clip_error(dmuon, device, value, *, dtype=torch.float32, compute_backend="auto"):
     dp = SimpleNamespace(
         _reduced_grad=torch.tensor([value], device=device, dtype=dtype),
         param_name="proj",
@@ -172,6 +185,8 @@ def run_nonfinite_clip_error(dmuon, device, value, *, dtype=torch.float32):
         _comm_ctx=SimpleNamespace(device=device),
         _ensure_grads_ready=lambda: None,
     )
+    if compute_backend is not None:
+        optimizer._compute_backend = compute_backend
     try:
         dmuon.clip_grad_norm_(optimizer, 1.0, error_if_nonfinite=True)
     except RuntimeError as error:
@@ -264,7 +279,17 @@ class TinyModel(nn.Module):
 
 
 def build_model(
-    dmuon, mesh, device, dtype, *, cast, pathway, asynchronous, sharded_adamw=False, grad_dtype=None
+    dmuon,
+    mesh,
+    device,
+    dtype,
+    *,
+    cast,
+    pathway,
+    asynchronous,
+    sharded_adamw=False,
+    grad_dtype=None,
+    compute_backend="auto",
 ):
     torch.manual_seed(10233)
     model = TinyModel(dtype).to(device)
@@ -316,6 +341,7 @@ def build_model(
         weight_decay=0.01,
         replicate_async=asynchronous,
         first_step_progress_log=False,
+        **({} if compute_backend is None else {"compute_backend": compute_backend}),
     )
     return model, optimizer
 
@@ -405,6 +431,7 @@ def run_training(
     sharded_adamw=False,
     grad_dtype=None,
     verify_restore=True,
+    compute_backend="auto",
 ):
     model, optimizer = build_model(
         dmuon,
@@ -416,6 +443,7 @@ def run_training(
         asynchronous=asynchronous,
         sharded_adamw=sharded_adamw,
         grad_dtype=grad_dtype,
+        compute_backend=compute_backend,
     )
     result = []
     input_dtype = torch.bfloat16 if cast and dtype == torch.float32 else dtype
@@ -448,6 +476,7 @@ def run_training(
             asynchronous=asynchronous,
             sharded_adamw=sharded_adamw,
             grad_dtype=grad_dtype,
+            compute_backend=compute_backend,
         )
         dmuon.set_model_state_dict(restored, saved["model"])
         dmuon.set_optimizer_state_dict(restored, restored_optimizer, saved["optimizer"])

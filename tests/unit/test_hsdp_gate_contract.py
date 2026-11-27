@@ -82,5 +82,6 @@ def test_mandatory_entry_dispatches_native_npu(monkeypatch):
             "resume_after": 2,
             "output_dir": "/unused-cpu-test-proof",
             "model_cls": module.TinyModel,
+            "compute_backend": "auto",
         }
     ]

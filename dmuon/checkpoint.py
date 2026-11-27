@@ -882,9 +882,7 @@ def get_optimizer_state_dict(
         for dp in muon_dps
     ]
     if muon_dps:
-        synced_has_state = _all_reduce_per_domain_max(
-            muon_dps, local_has_state, include_tp=True
-        )
+        synced_has_state = _all_reduce_per_domain_max(muon_dps, local_has_state, include_tp=True)
         for dp, has_state in zip(muon_dps, synced_has_state):
             if not has_state:
                 continue
