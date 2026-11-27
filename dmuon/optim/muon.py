@@ -217,7 +217,14 @@ class Muon(Optimizer):
         self._all_dedicated_params = []
         self._dedicated_params = []
         seen_dps: set[int] = set()
+        retention_contexts = {id(comm_ctx): comm_ctx}
         for state in iter_dedicated_states(model):
+            context = (
+                getattr(state, "comm_ctx", None)
+                or getattr(state.group, "comm_ctx", None)
+                or comm_ctx
+            )
+            retention_contexts[id(context)] = context
             for dp in state.group.params:
                 if id(dp) in seen_dps:
                     continue
@@ -225,6 +232,7 @@ class Muon(Optimizer):
                 self._all_dedicated_params.append(dp)
                 if dp.is_owner:
                     self._dedicated_params.append(dp)
+        self._parameter_retention_contexts = tuple(retention_contexts.values())
         self._dedicated_param_fqns_by_id = self._compute_dedicated_param_fqns(
             model, self._all_dedicated_params
         )
@@ -1365,6 +1373,10 @@ class Muon(Optimizer):
         )
         return stats
 
+    def _assert_no_parameter_retention(self, operation: str) -> None:
+        for context in getattr(self, "_parameter_retention_contexts", (self._comm_ctx,)):
+            context.assert_no_parameter_retention(operation)
+
     @torch.no_grad()
     def step(self, closure=None):
         """Perform a single optimization step.
@@ -1379,6 +1391,7 @@ class Muon(Optimizer):
            scatter/broadcast immediately after that group's Muon update, and
            the next forward consumes the pending event before reading it.
         """
+        self._assert_no_parameter_retention("Muon.step")
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -1931,6 +1944,7 @@ class Muon(Optimizer):
         gradients (from gradient accumulation).  Dedicated params' _reduced_grad
         is normally cleared in step(), but is also cleared here for safety.
         """
+        self._assert_no_parameter_retention("Muon.zero_grad")
         self._grads_ready = False
         self._last_muon_grad_clip_stats = None
         for p in self._fsdp_params:

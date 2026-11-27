@@ -5,10 +5,21 @@ import torch
 import torch.nn as nn
 
 from dmuon.checkpoint import get_optimizer_state_dict, set_optimizer_state_dict
+from dmuon._core.comm import DedicatedCommContext
 
 
 class FakeDedicatedParam:
     pass
+
+
+def dedicated_state(param):
+    # Keep checkpoint fixtures faithful to the real state/context relationship.
+    # The uninitialized real context exercises its inactive retention guard
+    # without allocating an accelerator stream or process group.
+    return SimpleNamespace(
+        group=SimpleNamespace(params=[param]),
+        comm_ctx=DedicatedCommContext.__new__(DedicatedCommContext),
+    )
 
 
 @pytest.mark.parametrize("cpu_offload", [False, True])
@@ -20,7 +31,7 @@ def test_plain_adamw_export_honors_offload_and_rank_filter(monkeypatch, cpu_offl
     model.proj = nn.Linear(2, 2, bias=False)
     dp = FakeDedicatedParam()
     dp.module, dp.param_name, dp.device = model.proj, "weight", torch.device("cpu")
-    model.proj._dedicated_state = SimpleNamespace(group=SimpleNamespace(params=[dp]))
+    model.proj._dedicated_state = dedicated_state(dp)
     state = {
         "exp_avg": torch.ones(2, 2),
         "exp_avg_sq": torch.full((2, 2), 0.25),
@@ -71,7 +82,7 @@ def test_set_optimizer_state_dict_restores_muon_momentum_to_compute_dtype():
     dp.is_owner = True
     dp.tp_group = None
     dp._owned_data = None
-    model.proj._dedicated_state = SimpleNamespace(group=SimpleNamespace(params=[dp]))
+    model.proj._dedicated_state = dedicated_state(dp)
     optimizer = SimpleNamespace(state={})
     state_dict = {
         "dedicated": {"proj.weight": {"momentum_buffer": torch.ones(2, 2, dtype=torch.float32)}}
@@ -118,7 +129,7 @@ def test_restored_muon_momentum_matches_fresh_optimizer_state(
     dp.is_owner = True
     dp.tp_group = None
     dp._owned_data = None
-    model.proj._dedicated_state = SimpleNamespace(group=SimpleNamespace(params=[dp]))
+    model.proj._dedicated_state = dedicated_state(dp)
     optimizer = SimpleNamespace(state={})
     grad = torch.tensor([[2048.0, 1.0], [0.125, -4.0]], dtype=grad_dtype)
     fresh = grad.to(_muon_state_dtype(dp, grad.dtype)).clone()

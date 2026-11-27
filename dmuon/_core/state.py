@@ -140,6 +140,7 @@ class DedicatedState:
         self.group = group
         self.comm_ctx = comm_ctx
         self.reshard_after_forward = reshard_after_forward
+        self._retain_unsharded_in_no_sync = False
         # Linked by api.py for forward prefetch (next layer's group)
         self._next_group: Optional["DedicatedParamGroup"] = None
         self._next_groups: list["DedicatedParamGroup"] = []
@@ -161,6 +162,8 @@ class DedicatedState:
         Also wraps an input tensor through _DedicatedPostBackward so that
         gradient reduce + reshard fires after this module's backward.
         """
+        if getattr(self.comm_ctx, "_parameter_retention_cleanup_error", None) is not None:
+            self.comm_ctx.assert_no_parameter_retention("model forward")
         if (
             not _is_backward_pass()
             and self.comm_ctx.all_states
@@ -264,7 +267,13 @@ class DedicatedState:
                 # reduce wait is equivalent to FSDP2's buffer-safety wait.
                 prev.wait_for_reduce()
         self.group.reduce_grads()
-        self.group.reshard()
+        # Retain only compute weights; reduce_grads still owns accumulation and
+        # clears live gradients. The synchronized backward keeps normal release.
+        if not (
+            getattr(self, "_retain_unsharded_in_no_sync", False)
+            and not self.group.reduce_grads_enabled
+        ):
+            self.group.reshard()
         self.comm_ctx.last_reduced_group = self.group
         self.group._post_backward_fired = True
 

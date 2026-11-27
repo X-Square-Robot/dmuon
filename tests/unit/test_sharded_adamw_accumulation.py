@@ -9,6 +9,7 @@ from torch import nn
 
 from dmuon._backends.fsdp2.group import DedicatedParamGroup
 from dmuon._backends.fsdp2.param import _normalize_tp_local_grad
+from dmuon._core.comm import DedicatedCommContext
 from dmuon.optim.muon import Muon
 
 
@@ -311,11 +312,14 @@ def test_fp32_stash_without_final_raw_grad_does_not_assign_parameter_grad(
 
 
 def optimizer_fixture(group, param):
-    return SimpleNamespace(
-        _fsdp_params=[],
-        _all_dedicated_params=[param],
-        _comm_ctx=SimpleNamespace(all_states=[SimpleNamespace(group=group)]),
-    )
+    optimizer = Muon.__new__(Muon)
+    optimizer._fsdp_params = []
+    optimizer._all_dedicated_params = [param]
+    # Exercise the real lifecycle guard without constructing device streams.
+    context = DedicatedCommContext.__new__(DedicatedCommContext)
+    context.all_states = [SimpleNamespace(group=group)]
+    optimizer._comm_ctx = context
+    return optimizer
 
 
 @pytest.mark.parametrize("sharded", [False, True])

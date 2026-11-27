@@ -176,7 +176,8 @@ def test_original_model_api_backward_and_actual_muon(cpu_transport, shape, layou
         MatrixLayout.view(2, 3, 2, 8).permute(1, 0, 2, 3).reshape(3, 4, 8),
     ],
 )
-def test_no_sync_and_original_parameter_semantic_groups(cpu_transport, layout):
+@pytest.mark.parametrize("retain", [False, True])
+def test_no_sync_and_original_parameter_semantic_groups(cpu_transport, layout, retain):
     model = Model(torch.randn(12, 8))
     reference = deepcopy(model)
     dmuon.dedicate_params(
@@ -184,6 +185,7 @@ def test_no_sync_and_original_parameter_semantic_groups(cpu_transport, layout):
         Mesh(),
         predicate=lambda _n, _p: True,
         process_group_policy="shared",
+        reshard_after_forward=not retain,
         param_policy_fn=lambda _n, _p: {"matrix_layout": layout},
     )
     optimizer = dmuon.Muon(
@@ -193,11 +195,18 @@ def test_no_sync_and_original_parameter_semantic_groups(cpu_transport, layout):
         first_step_progress_log=False,
         param_groups=[{"params": [model.weight], "lr": 0.007, "weight_decay": 0}],
     )
-    for microbatch in range(2):
-        hidden = torch.randn(3, 8, requires_grad=True)
-        with dmuon.no_sync(model) if microbatch == 0 else nullcontext():
-            model(hidden).sum().backward()
-        reference(hidden).sum().backward()
+    with dmuon.retain_unsharded_params(model) if retain else nullcontext():
+        for microbatch in range(2):
+            hidden = torch.randn(3, 8, requires_grad=True)
+            with dmuon.no_sync(model) if microbatch == 0 else nullcontext():
+                model(hidden).sum().backward()
+            reference(hidden).sum().backward()
+            if retain and microbatch == 0:
+                assert all(unit._is_unsharded for unit in dmuon.get_dedicated_params(model))
+                with pytest.raises(RuntimeError, match="outside retain_unsharded_params"):
+                    dmuon.set_model_state_dict(model, {})
+                with pytest.raises(RuntimeError, match="outside retain_unsharded_params"):
+                    dmuon.set_optimizer_state_dict(model, optimizer, {})
     dmuon.prepare_muon_grads(model)
     plan = layout.compile(reference.weight.shape)
     gradient = plan.pack(reference.weight.grad)
@@ -393,7 +402,8 @@ def test_model_load_invalidates_live_compute_slot(cpu_transport):
         ("muon", "broadcast", MatrixLayout.whole()),
         ("muon", "broadcast", MatrixLayout.view(3, 4, 8)),
         (
-            "muon", "broadcast",
+            "muon",
+            "broadcast",
             MatrixLayout.view(2, 3, 2, 8).permute(1, 0, 2, 3).reshape(3, 4, 8),
         ),
     ],
@@ -411,18 +421,28 @@ def test_model_load_refreshes_zero2_eval_copies(
 
     monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
     monkeypatch.setattr(
-        torch.distributed, "reduce_scatter_tensor",
+        torch.distributed,
+        "reduce_scatter_tensor",
         lambda output, source, **_kwargs: output.copy_(source),
     )
     model = Model(torch.ones(12, 8)).eval()
-    policy = dict(route=route, param_dtype=torch.bfloat16, grad_dtype=torch.bfloat16,
-                  master_dtype=torch.float32)
+    policy = dict(
+        route=route,
+        param_dtype=torch.bfloat16,
+        grad_dtype=torch.bfloat16,
+        master_dtype=torch.float32,
+    )
     if layout is not None:
         policy["matrix_layout"] = layout
     dmuon.dedicate_params(
-        model, Mesh(), lambda _n, _p: True, reshard_after_forward=False,
-        compute_dtype=torch.bfloat16, process_group_policy="shared",
-        muon_forward_unshard=placement, param_policy={"defaults": policy},
+        model,
+        Mesh(),
+        lambda _n, _p: True,
+        reshard_after_forward=False,
+        compute_dtype=torch.bfloat16,
+        process_group_policy="shared",
+        muon_forward_unshard=placement,
+        param_policy={"defaults": policy},
     )
     group = model._dedicated_comm_ctx.all_states[0].group
     hidden = torch.ones(3, 8, dtype=torch.bfloat16)
@@ -434,7 +454,9 @@ def test_model_load_refreshes_zero2_eval_copies(
     assert not group._is_unsharded
     torch.testing.assert_close(
         dmuon.get_model_state_dict(model, rank0_only=False)["weight"],
-        target, rtol=0, atol=0,
+        target,
+        rtol=0,
+        atol=0,
     )
     with eval_context():
         actual = model(hidden).clone()
@@ -452,10 +474,14 @@ def test_model_load_partial_only_invalidates_affected_group(cpu_transport):
     model = nn.Sequential(nn.Linear(8, 8, bias=False), nn.Linear(8, 8, bias=False)).eval()
     with torch.no_grad():
         for parameter in model.parameters():
-            parameter.fill_(1.)
+            parameter.fill_(1.0)
     dmuon.dedicate_params(
-        model, Mesh(), lambda _n, _p: True, reshard_after_forward=False,
-        compute_dtype=torch.bfloat16, process_group_policy="shared",
+        model,
+        Mesh(),
+        lambda _n, _p: True,
+        reshard_after_forward=False,
+        compute_dtype=torch.bfloat16,
+        process_group_policy="shared",
         hook_boundary_predicate=lambda module: isinstance(module, nn.Linear),
     )
     groups = [state.group for state in model._dedicated_comm_ctx.all_states]
@@ -463,11 +489,11 @@ def test_model_load_partial_only_invalidates_affected_group(cpu_transport):
     with torch.no_grad():
         model(hidden)
         assert all(group._is_unsharded for group in groups)
-        dmuon.set_model_state_dict(model, {"0.weight": torch.full((8, 8), 2.)})
+        dmuon.set_model_state_dict(model, {"0.weight": torch.full((8, 8), 2.0)})
         assert not groups[0]._is_unsharded
         assert groups[1]._is_unsharded
         count = len(cpu_transport)
-        torch.testing.assert_close(model(hidden), torch.full((2, 8), 128., dtype=torch.bfloat16))
+        torch.testing.assert_close(model(hidden), torch.full((2, 8), 128.0, dtype=torch.bfloat16))
         assert len(cpu_transport) == count + 1
         count = len(cpu_transport)
         dmuon.set_model_state_dict(model, {})
@@ -483,8 +509,12 @@ def test_model_load_reads_live_checkpoint_views_before_releasing_storage(cpu_tra
     model = Model(torch.ones(12, 8)).eval()
     policy = {} if layout is None else {"matrix_layout": layout}
     dmuon.dedicate_params(
-        model, Mesh(), lambda _n, _p: True, reshard_after_forward=False,
-        compute_dtype=torch.bfloat16, process_group_policy="shared",
+        model,
+        Mesh(),
+        lambda _n, _p: True,
+        reshard_after_forward=False,
+        compute_dtype=torch.bfloat16,
+        process_group_policy="shared",
         param_policy={"defaults": policy},
     )
     with torch.no_grad():
@@ -493,7 +523,7 @@ def test_model_load_reads_live_checkpoint_views_before_releasing_storage(cpu_tra
         # Deliberately no clone: these checkpoint bytes share live storage.
         checkpoint = {"weight": model.weight.detach()}
         for dp in dmuon.get_dedicated_params(model):
-            dp._owned_data.fill_(3.)
+            dp._owned_data.fill_(3.0)
         dmuon.set_model_state_dict(model, checkpoint)
         torch.testing.assert_close(model(hidden), expected, rtol=0, atol=0)
     model._dedicated_comm_ctx.all_states[0].group.reshard()
@@ -516,8 +546,12 @@ def test_model_load_drains_old_publish_and_prefetch_before_writing(cpu_transport
     monkeypatch.setattr(Stream, "wait_event", wait_event)
     model = Model(torch.ones(4, 4)).eval()
     dmuon.dedicate_params(
-        model, Mesh(), lambda _n, _p: True, reshard_after_forward=False,
-        compute_dtype=torch.bfloat16, process_group_policy="shared",
+        model,
+        Mesh(),
+        lambda _n, _p: True,
+        reshard_after_forward=False,
+        compute_dtype=torch.bfloat16,
+        process_group_policy="shared",
     )
     group = model._dedicated_comm_ctx.all_states[0].group
     dp = dmuon.get_dedicated_params(model)[0]
@@ -527,24 +561,27 @@ def test_model_load_drains_old_publish_and_prefetch_before_writing(cpu_transport
 
     def finish_old_publish():
         trace.append("publish")
-        dp._owned_data.fill_(3.)
+        dp._owned_data.fill_(3.0)
 
     def finish_old_prefetch():
         trace.append("prefetch")
-        assert torch.all(dp._owned_data == 3.)  # checkpoint has not overwritten it yet
+        assert torch.all(dp._owned_data == 3.0)  # checkpoint has not overwritten it yet
 
     group._replicate_broadcast_state = SimpleNamespace(
-        event=PendingEvent(finish_old_publish), replicate_input=dp._owned_data,
+        event=PendingEvent(finish_old_publish),
+        replicate_input=dp._owned_data,
     )
     group._broadcast_event = PendingEvent(finish_old_prefetch)
-    dmuon.set_model_state_dict(model, {"weight": torch.full((4, 4), 2.)})
+    dmuon.set_model_state_dict(model, {"weight": torch.full((4, 4), 2.0)})
     assert trace == ["publish", "prefetch"]
     assert group._replicate_broadcast_state is None and group._broadcast_event is None
-    assert torch.all(dp._owned_data == 2.)
+    assert torch.all(dp._owned_data == 2.0)
     with torch.no_grad():
         torch.testing.assert_close(
             model(torch.ones(2, 4, dtype=torch.bfloat16)),
-            torch.full((2, 4), 8., dtype=torch.bfloat16), rtol=0, atol=0,
+            torch.full((2, 4), 8.0, dtype=torch.bfloat16),
+            rtol=0,
+            atol=0,
         )
     group.reshard()
 

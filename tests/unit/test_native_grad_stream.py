@@ -66,6 +66,9 @@ class Gradient:
     def record_stream(self, stream):
         self.storage.readers.add(stream)
 
+    def is_contiguous(self):
+        return self.storage.values.is_contiguous()
+
     def _copy(self, dtype):
         copied = Gradient(
             torch.empty_like(self.storage.values, dtype=dtype), self.runtime, self.device

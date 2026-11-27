@@ -32,7 +32,12 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ._backends.fsdp2 import DedicatedParam
-from .utils import get_dedicated_params, wait_all_replicate_broadcasts, iter_dedicated_states
+from .utils import (
+    _assert_no_parameter_retention,
+    get_dedicated_params,
+    iter_dedicated_states,
+    wait_all_replicate_broadcasts,
+)
 
 try:
     from torch.distributed.tensor import DTensor as _DTensor
@@ -585,6 +590,7 @@ def get_model_state_dict(
     """
     # Phase C.3: drain any pending async replicate broadcast so every
     # owner's ``_owned_data`` reflects the latest optimizer update.
+    _assert_no_parameter_retention(model, "get_model_state_dict")
     wait_all_replicate_broadcasts(model)
     # ZeRO-2 eval can leave BF16 compute views registered on the module.
     # Export persistent shards, including their original dtype and precision.
@@ -689,6 +695,7 @@ def set_model_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) 
         state_dict: Full state dict mapping FQN to unsharded tensors.
     """
     # 1. Identify dedicated param FQNs.
+    _assert_no_parameter_retention(model, "set_model_state_dict")
     dp_fqns = _compute_dedicated_fqns(model)
     parents = _matrix_parents(model)
     parent_tensors = {}
@@ -844,6 +851,7 @@ def get_optimizer_state_dict(
     # Phase C.3: the momentum buffer is only on the global owner, which
     # is the same rank that writes ``_owned_data`` at step end; draining
     # pending async broadcast makes both consistent with the snapshot.
+    _assert_no_parameter_retention(model, "get_optimizer_state_dict")
     wait_all_replicate_broadcasts(model)
     # Optimizer states are keyed by persistent parameters, not compute views.
     _reshard_fsdp_modules(model.modules())
@@ -993,6 +1001,7 @@ def set_optimizer_state_dict(model: nn.Module, optimizer: Any, state_dict: dict)
         state_dict: Optimizer state dict as produced by
             :func:`get_optimizer_state_dict`.
     """
+    _assert_no_parameter_retention(model, "set_optimizer_state_dict")
     expected_layouts = _layout_state(model)
     if state_dict.get("matrix_layouts", {}) != expected_layouts:
         raise ValueError(

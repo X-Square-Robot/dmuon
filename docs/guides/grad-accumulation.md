@@ -30,6 +30,44 @@ for i, batch in enumerate(dataloader):
 
 ## How It Works
 
+### Keeping dedicated weights resident during accumulation
+
+For a pure dedicated-ownership model configured with
+`reshard_after_forward=False`, opt in around the complete accumulation window:
+
+```python
+optimizer.zero_grad()
+with dmuon.retain_unsharded_params(model):
+    for micro in range(accum_steps):
+        ctx = dmuon.no_sync(model) if micro < accum_steps - 1 else nullcontext()
+        with ctx:
+            loss = model(batches[micro]).loss / accum_steps
+            loss.backward()
+optimizer.step()
+```
+
+This defers weight release after the `no_sync` backward passes. Gradient
+accumulation and live-gradient clearing still run on every microbatch; the
+last synchronized backward reduces and releases weights normally. Context
+exit releases remaining weights, including prefetched groups, even if the
+window is incomplete or raises. It does not discard accumulated gradients.
+
+The context is off by default and requires the complete ownership model.
+DDP and mixed FSDP2 models are unsupported. Full compute weights may remain
+resident on every rank alongside gradients and activations, so validate peak
+memory before enabling it. All ranks must follow the same schedule. Nested
+retention contexts are supported; nested `no_sync` contexts are unsupported.
+
+Call optimizer step, `zero_grad`, checkpoint save/load and update publication
+outside the context. DMuon's public entry points reject these operations
+while retention is active. Do not mutate parameters or call native
+`load_state_dict` inside the context. If cleanup fails, rebuild the model
+before continuing; no update or communication is replayed automatically.
+Weight cleanup does not roll back a failed backward pass or guarantee that
+its partially computed gradients can be reused.
+
+### Gradient synchronization
+
 `dmuon.no_sync(model)` disables gradient communication for **both** parameter types:
 
 - **Dedicated params**: Skips the reduce to owner. Gradients accumulate locally on each rank in `_accumulated_grad`.
@@ -99,7 +137,7 @@ for i, batch in enumerate(dataloader):
     Divide the loss by `accum_steps` before `.backward()` so the accumulated gradient is equivalent to a single large-batch gradient.
 
 !!! note "DMuon-Z2 and gradient accumulation"
-    Note that `reshard_after_forward=False` (DMuon-Z2) interacts with gradient accumulation by keeping packed buffers resident across micro-batches — see [Z2 vs Z3 Modes](z2-z3-modes.md) for the memory implication.
+    `reshard_after_forward=False` (DMuon-Z2) retains packed buffers through the same microbatch's forward and backward. Cross-microbatch retention requires the opt-in context above; see [Z2 vs Z3 Modes](z2-z3-modes.md) for the memory implications of the default modes.
 
 ## See also
 
