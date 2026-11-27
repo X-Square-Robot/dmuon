@@ -239,10 +239,9 @@ class Muon(Optimizer):
             or getattr(getattr(dp, "_orig_param", None), "_dedicated_mode", None) == "ddp_tp"
             for dp in self._all_dedicated_params
         )
-        self._has_hsdp_sharded_muon_forward = getattr(
-            self._comm_ctx, "replicate_group", None
-        ) is not None and any(
-            getattr(dp, "uses_sharded_muon_forward", lambda: False)()
+        self._has_hsdp_sharded_muon_forward = any(
+            getattr(dp, "replicate_group", None) is not None
+            and getattr(dp, "uses_sharded_muon_forward", lambda: False)()
             for dp in self._all_dedicated_params
         )
         if self._has_hsdp_sharded_muon_forward:
@@ -541,8 +540,12 @@ class Muon(Optimizer):
         with an explicit publish-event dependency.
         """
 
-        comm_ctx = getattr(group, "comm_ctx", None)
-        if getattr(comm_ctx, "replicate_group", None) is None:
+        replicate_group = (
+            group._replicate_group
+            if hasattr(group, "_replicate_group")
+            else getattr(getattr(group, "comm_ctx", None), "replicate_group", None)
+        )
+        if replicate_group is None:
             return False
         return any(
             getattr(dp, "uses_sharded_muon_forward", lambda: False)()

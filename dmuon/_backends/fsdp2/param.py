@@ -141,10 +141,20 @@ class DedicatedParam:
         tp_group: Optional[dist.ProcessGroup] = None,
         route_hint: Optional[str] = None,
         muon_forward_unshard: str = "broadcast",
+        domain_name: str = "default",
+        grad_reduce_op: str = "avg",
+        grad_scale: float = 1.0,
         _install_placeholder: bool = True,
     ):
         self.module = module
         self.param_name = param_name
+        self.domain_name: str = str(domain_name)
+        if grad_reduce_op not in {"avg", "sum"}:
+            raise ValueError(
+                f"grad_reduce_op must be 'avg' or 'sum', got {grad_reduce_op!r}"
+            )
+        self._grad_reduce_op: str = grad_reduce_op
+        self._grad_scale: float = float(grad_scale)
         # Phase A (HSDP-native refactor): ``owner_rank`` is a 2D coordinate
         # ``(owner_shard, owner_replicate)``.  Plain ``int`` is still accepted
         # for the 1D shard-only path and is promoted to ``(int, 0)``.
@@ -579,10 +589,11 @@ class DedicatedParam:
         grad = self._unsharded_param.grad.data
         grad = self.local_grad_for_reduce(grad)
         grad = grad.contiguous()
+        reduce_op = dist.ReduceOp.SUM if self._grad_reduce_op == "sum" else dist.ReduceOp.AVG
         return dist.reduce(
             grad,
             dst=self._owner_global_rank,
-            op=dist.ReduceOp.AVG,
+            op=reduce_op,
             group=self.dp_group,
             async_op=async_op,
         )

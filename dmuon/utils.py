@@ -337,7 +337,12 @@ def _dispatch_post_step_async(g, phase_recorder=None) -> None:
                     with _phase("tp_scatter_delta"):
                         scatter_async()
             with _profile_range("dmuon.replicate_broadcast.async"):
-                if getattr(getattr(g, "comm_ctx", None), "replicate_group", None) is None:
+                group_replicate = (
+                    g._replicate_group
+                    if hasattr(g, "_replicate_group")
+                    else getattr(getattr(g, "comm_ctx", None), "replicate_group", None)
+                )
+                if group_replicate is None:
                     g.replicate_broadcast_async()
                 else:
                     with _phase("replicate_broadcast"):
@@ -464,7 +469,11 @@ def fence_isolated_process_groups(model: nn.Module) -> None:
         comm_ctx = getattr(group, "comm_ctx", None)
         candidates = [
             getattr(group, "_dp_group", None),
-            getattr(comm_ctx, "replicate_group", None),
+            (
+                group._replicate_group
+                if hasattr(group, "_replicate_group")
+                else getattr(comm_ctx, "replicate_group", None)
+            ),
         ]
         for param in getattr(group, "params", ()):
             candidates.append(getattr(param, "tp_group", None))

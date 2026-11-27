@@ -169,6 +169,16 @@ def _uniform_param_attr(params: list[DedicatedParam], attr: str):
     return next(iter(values)) if values else None
 
 
+def _uniform_identity_attr(params: list[DedicatedParam], attr: str):
+    if not params:
+        return None
+    first = getattr(params[0], attr, None)
+    for p in params[1:]:
+        if getattr(p, attr, None) is not first:
+            raise ValueError(f"DedicatedParamGroup expects uniform {attr}")
+    return first
+
+
 def _needs_post_step_replicate_broadcast(p: DedicatedParam) -> bool:
     # Production type-split AdamW uses DMuon owner update + post-step publish,
     # matching Muon tensors.  Replicate-all-reduce mode lets every shard-owner
@@ -450,7 +460,14 @@ class DedicatedParamGroup:
 
         # Cached per-group metadata (FSDP2 alignment phase 1 — previously
         # recomputed in every unshard / reduce_grads call).
-        self._dp_group: Optional[dist.ProcessGroup] = params[0].dp_group if params else None
+        self._dp_group: Optional[dist.ProcessGroup] = _uniform_identity_attr(params, "dp_group")
+        self._replicate_group: Optional[dist.ProcessGroup] = _uniform_identity_attr(
+            params, "replicate_group"
+        )
+        self._domain_name: str = _uniform_param_attr(params, "domain_name") or "default"
+        self._grad_reduce_op: str = _uniform_param_attr(params, "_grad_reduce_op") or "avg"
+        raw_grad_scale = _uniform_param_attr(params, "_grad_scale")
+        self._grad_scale: float = 1.0 if raw_grad_scale is None else float(raw_grad_scale)
         self._param_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_param_dtype")
         self._grad_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_grad_dtype")
         self._output_dtype: Optional[torch.dtype] = _uniform_param_attr(params, "_output_dtype")
@@ -1029,6 +1046,18 @@ class DedicatedParamGroup:
                 free_storage(full_padded)
         self._is_unsharded = False
 
+    def _effective_replicate_group(self) -> Optional[dist.ProcessGroup]:
+        if hasattr(self, "_replicate_group"):
+            return self._replicate_group
+        return getattr(getattr(self, "comm_ctx", None), "replicate_group", None)
+
+    def _effective_grad_reduce_op(self) -> dist.ReduceOp:
+        op_name = getattr(self, "_grad_reduce_op", "avg")
+        return dist.ReduceOp.SUM if op_name == "sum" else dist.ReduceOp.AVG
+
+    def _effective_grad_scale(self) -> float:
+        return float(getattr(self, "_grad_scale", 1.0))
+
     # ---- gradient reduction — dispatch phase ----
 
     @dynamo_disable
@@ -1089,7 +1118,8 @@ class DedicatedParamGroup:
 
         reduce_stream = self.comm_ctx.reduce_stream
         replicate_stream = self.comm_ctx.replicate_reduce_stream
-        replicate_group = self.comm_ctx.replicate_group
+        replicate_group = self._effective_replicate_group()
+        reduce_op = self._effective_grad_reduce_op()
         has_replicate = replicate_group is not None and self.replicate_grads_enabled
         replicate_gated = replicate_group is not None and not self.replicate_grads_enabled
 
@@ -1134,7 +1164,7 @@ class DedicatedParamGroup:
                             dist.reduce(
                                 grad,
                                 dst=self._global_owner_ranks[p.owner_rank],
-                                op=dist.ReduceOp.AVG,
+                                op=reduce_op,
                                 group=dp_group,
                             )
                             _clear_raw_grad(p)
@@ -1172,7 +1202,7 @@ class DedicatedParamGroup:
                             dist.reduce_scatter_tensor(
                                 sharded_grad,
                                 reduce_input,
-                                op=dist.ReduceOp.AVG,
+                                op=reduce_op,
                                 group=dp_group,
                             )
                             _clear_raw_grad(p)
@@ -1237,8 +1267,9 @@ class DedicatedParamGroup:
         wait_event: Optional[torch.cuda.Event],
         group_name: str,
     ) -> torch.cuda.Event:
-        replicate_group = self.comm_ctx.replicate_group
+        replicate_group = self._effective_replicate_group()
         assert replicate_group is not None
+        reduce_op = self._effective_grad_reduce_op()
         replicate_stream = self.comm_ctx.replicate_reduce_stream
         profile_start = profile_end = None
         stage2_bytes = 0
@@ -1266,14 +1297,14 @@ class DedicatedParamGroup:
                         if _adamw_replicate_allreduce_enabled(p) or _sharded_adamw_enabled(p):
                             dist.all_reduce(
                                 grad,
-                                op=dist.ReduceOp.AVG,
+                                op=reduce_op,
                                 group=replicate_group,
                             )
                         else:
                             dist.reduce(
                                 grad,
                                 dst=p._owner_replicate_global_rank,
-                                op=dist.ReduceOp.AVG,
+                                op=reduce_op,
                                 group=replicate_group,
                             )
                 if profile_end is not None:
@@ -1304,7 +1335,7 @@ class DedicatedParamGroup:
         local_adamw_owner = _adamw_replicate_allreduce_enabled(p) and p._owned_data is not None
         if p.is_owner or local_adamw_owner:
             return True
-        replicate_group = self.comm_ctx.replicate_group
+        replicate_group = self._effective_replicate_group()
         if replicate_group is None:
             return False
         return self._dp_group.rank() == p.owner_shard
@@ -1370,6 +1401,7 @@ class DedicatedParamGroup:
 
         target_stream = stream if stream is not None else self._device_module.current_stream()
         replicate_state = self._replicate_reduce_state
+        grad_scale = self._effective_grad_scale()
 
         def _wait_and_unpack() -> None:
             if self._post_reduce_event is not None:
@@ -1386,7 +1418,11 @@ class DedicatedParamGroup:
                     # it as a collective output would overwrite prior microbatches.
                     grad_buf.record_stream(target_stream)
                     if p._sharded_adamw_grad is None:
+                        if grad_scale != 1.0:
+                            grad_buf.mul_(grad_scale)
                         p._sharded_adamw_grad = grad_buf
+                    elif grad_scale != 1.0:
+                        p._sharded_adamw_grad.add_(grad_buf, alpha=grad_scale)
                     else:
                         p._sharded_adamw_grad.add_(grad_buf)
                     continue
@@ -1398,7 +1434,12 @@ class DedicatedParamGroup:
                 grad_buf.record_stream(target_stream)
                 new_grad = grad_buf.view(p._orig_size)
                 if p._reduced_grad is not None:
-                    p._reduced_grad.add_(new_grad)
+                    if grad_scale != 1.0:
+                        p._reduced_grad.add_(new_grad, alpha=grad_scale)
+                    else:
+                        p._reduced_grad.add_(new_grad)
+                elif grad_scale != 1.0:
+                    p._reduced_grad = new_grad.mul(grad_scale)
                 else:
                     p._reduced_grad = new_grad.clone()
 
@@ -1767,7 +1808,7 @@ class DedicatedParamGroup:
 
         No-op when ``replicate_group`` is None (pure 1D shard-only).
         """
-        replicate_group = self.comm_ctx.replicate_group
+        replicate_group = self._effective_replicate_group()
         if replicate_group is None:
             return
 
@@ -1832,7 +1873,7 @@ class DedicatedParamGroup:
         ``_owned_data``; checkpoint save paths must also drain pending
         state via :func:`dmuon.utils.wait_all_replicate_broadcasts`.
         """
-        replicate_group = self.comm_ctx.replicate_group
+        replicate_group = self._effective_replicate_group()
         if replicate_group is None:
             return
 
@@ -1939,7 +1980,7 @@ class DedicatedParamGroup:
             )
 
         dp_group = self._dp_group
-        replicate_group = self.comm_ctx.replicate_group
+        replicate_group = self._effective_replicate_group()
         local_shard_rank = dp_group.rank()
         local_replicate_rank = replicate_group.rank() if replicate_group else 0
         publish_stream = self.comm_ctx.replicate_broadcast_stream

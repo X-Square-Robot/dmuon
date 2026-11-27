@@ -28,7 +28,7 @@ def _validate_1d_mesh(mesh: Any, *, field_name: str) -> None:
     if mesh is None:
         raise ValueError(f"OwnershipDomain.{field_name} cannot be None")
     ndim = getattr(mesh, "ndim", None)
-    if ndim != 1:
+    if ndim is not None and ndim != 1:
         raise ValueError(
             f"OwnershipDomain.{field_name} must be a 1D DeviceMesh, got ndim={ndim!r}"
         )
