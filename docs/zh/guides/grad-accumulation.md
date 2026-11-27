@@ -94,8 +94,21 @@ for i, batch in enumerate(dataloader):
 !!! tip "Loss 缩放"
     在 `.backward()` 前将 loss 除以 `accum_steps`，这样累积后的梯度等价于单次大批次的梯度。
 
-!!! note "DMuon-Z2 与梯度累积"
-    注意 `reshard_after_forward=False`（DMuon-Z2）会在微批次之间保持 packed buffer 常驻，与梯度累积有交互——显存影响详见 [Z2 与 Z3 模式](z2-z3-modes.md)。
+### 在梯度累积期间保留权重
+
+纯 DMuon dedicated FSDP2 模型可以在完整累积窗口外包一层 `retain_unsharded_params`。所有组都需要设置 `reshard_after_forward=False`，各 rank 使用同样的微批次顺序。
+
+```python
+optimizer.zero_grad()
+with dmuon.retain_unsharded_params(model):
+    for micro in range(accum_steps):
+        ctx = dmuon.no_sync(model) if micro < accum_steps - 1 else nullcontext()
+        with ctx:
+            (model(batches[micro]).loss / accum_steps).backward()
+optimizer.step()
+```
+
+`no_sync` 的每次反向仍会累积梯度。最后一次同步反向照常归约并释放权重，退出窗口时还会释放未使用的预取权重。各 rank 需为未分片权重预留额外显存。优化器更新、清除梯度、保存或加载 checkpoint 以及发布权重都放在窗口外。若释放权重失败，应重建模型再继续训练。
 
 ## 相关文档
 

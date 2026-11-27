@@ -289,6 +289,7 @@ def dispatch_backend() -> None:
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--resume-after", type=int)
     parser.add_argument("--output-dir")
+    parser.add_argument("--compute-backend", choices=("auto", "torch", "tilelang"), default="auto")
     args = parser.parse_args()
     if args.device == "npu":
         from ascend_hsdp_correctness import main as native_main
@@ -298,10 +299,18 @@ def dispatch_backend() -> None:
             resume_after=args.resume_after,
             output_dir=args.output_dir,
             model_cls=TinyModel,
+            compute_backend=args.compute_backend,
         )
     else:
-        if args.steps != 10 or args.resume_after is not None or args.output_dir is not None:
-            parser.error("--steps, --resume-after, and --output-dir apply to the NPU gate")
+        if (
+            args.steps != 10
+            or args.resume_after is not None
+            or args.output_dir is not None
+            or args.compute_backend != "auto"
+        ):
+            parser.error(
+                "--steps, --resume-after, --output-dir, and --compute-backend apply to the NPU gate"
+            )
         main()
 
 

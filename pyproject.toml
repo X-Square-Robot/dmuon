@@ -14,7 +14,7 @@ version = "0.2.0"
 description = "Dedicated parameter ownership for distributed training with matrix optimizers"
 readme = "README.md"
 license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license-files = ["LICENSE", "NOTICE", "dmuon/backend/tilelang/kernels/deepgemm/LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.6.0",

@@ -313,6 +313,13 @@ def _get_grad_for_reduce(
         # the reduction instead of allocating another full gradient tensor.
         grad = p._accumulated_grad
     else:
+        # Localization may redistribute a DTensor or materialize a strided
+        # reshape. Keep the original NPU allocation alive for that read.
+        if raw_grad.device.type == "npu":
+            local_source = getattr(raw_grad, "_local_tensor", raw_grad)
+            if local_source is not raw_grad or not local_source.is_contiguous():
+                runtime = get_device_module(local_source.device)
+                local_source.record_stream(runtime.current_stream(local_source.device))
         grad = p.local_grad_for_reduce(raw_grad.data)
         if grad.device.type != "cpu":
             # clone/cast below may read a compute-stream allocation from the

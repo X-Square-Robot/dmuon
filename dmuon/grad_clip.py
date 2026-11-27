@@ -16,6 +16,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ._core.device import default_device
+from .backend import supports_tilelang_clip
 
 try:
     from torch.utils._foreach_utils import (
@@ -109,6 +110,18 @@ class GlobalNormMuonClipStrategy:
 
     @torch.no_grad()
     def __call__(self, context: MuonGradClipContext) -> MuonGradClipStats:
+        if (
+            context.norm_type == 2.0
+            and context.foreach is not True
+            and supports_tilelang_clip(
+                _accumulator_device(context.optimizer, context.entries),
+                (entry.grad for entry in context.entries),
+                compute_backend=getattr(context.optimizer, "_compute_backend", "auto"),
+            )
+        ):
+            from .backend.tilelang.clip import global_norm_strategy_tilelang
+
+            return global_norm_strategy_tilelang(context)
         total_norm_t = _compute_total_norm(
             context.optimizer,
             context.entries,
@@ -222,6 +235,7 @@ def clip_grad_norm_(
             max_norm,
             mode=mode,
             norm_reduce_group=norm_reduce_group,
+            compute_backend=getattr(optimizer, "_compute_backend", "auto"),
         )
         if error_if_nonfinite and any(bool(s.found_inf.item()) for s in result.bucket_stats):
             raise RuntimeError(

@@ -110,8 +110,12 @@ DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation
 NPU 设备。DMuon 优化器、参数策略、梯度裁剪与检查点 API 和 CUDA 使用相同接口。
 不要为 DMuon 导入 `torch_npu.contrib.transfer_to_npu`。
 
-Ascend 使用共享的 eager PyTorch Newton–Schulz 路径。CUDA 专属的 SYRK 内核、
-fast-clip 扩展和 CUDA graph replay 仅用于 CUDA。
+Ascend 950DT 默认使用 TileLang 计算后端。在训练环境中用 `USE_ASCEND=ON` 和
+`USE_CUDA=OFF` 编译上游 TileLang。使用 `dmuon.Muon(..., compute_backend="torch")`
+可选择原生 PyTorch 实现，使用 `compute_backend="tilelang"` 则要求 TileLang 可用，
+不会静默回退。独立的 Newton–Schulz 和分桶裁剪 API 也接受同名参数。
+参见[上游构建说明](https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/README.md)
+和 [950DT 实测](../guides/ascend-tilelang.md)。
 
 ### 原生 FSDP2 集成
 

@@ -68,7 +68,7 @@ def get_ns_backend() -> str:
     elif choice == SyrkBackend.CUTE_SM80:
         detail = "DMuon internal"
     else:
-        detail = "PyTorch eager on NPU" if default_device().type == "npu" else "universal fallback"
+        detail = "Torch SYRK fallback" if default_device().type == "npu" else "universal fallback"
     return f"Gram NS · kernel={choice.value} (SM{_SM_VERSION}, {detail})"
 
 
@@ -78,16 +78,23 @@ def get_backend_status() -> dict:
     Returns a plain dict with:
 
       * ``sm_version``                  — int, detected compute capability (0 on CPU)
-      * ``auto_choice``                  — which backend ``kernel="auto"`` resolves to
+      * ``auto_choice``                  — SYRK-only choice for ``kernel="auto"``
+      * ``compute_backend``              — owner-local ``torch`` or ``tilelang``
+      * ``device_type``                  — default compute device type
       * ``quack_available``              — bool, soft-dep flag
       * ``cute_sm80_available``          — bool, CuteDSL SYRK importable
       * ``cublas_always_available``      — bool, always ``True``
 
     Useful for programmatic checks and bug reports.
     """
+    from dmuon.backend import use_tilelang
     from dmuon.kernels.syrk_backends import get_backend_status as _status
 
-    return _status()
+    status = _status()
+    device = default_device()
+    status["compute_backend"] = "tilelang" if use_tilelang(device) else "torch"
+    status["device_type"] = device.type
+    return status
 
 
 # ---------------------------------------------------------------------------

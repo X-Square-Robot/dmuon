@@ -1,5 +1,6 @@
 """Utility functions."""
 
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 import os
 from typing import Optional
@@ -9,7 +10,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from ._backends.ddp import DedicatedParamGroupDDP
-from ._backends.fsdp2 import DedicatedParam
+from ._backends.fsdp2 import DedicatedParam, DedicatedParamGroup
 from ._core.comm import DedicatedCommContext
 from ._core.device import get_device_module
 from ._core.owner_rank import OwnerRankLike, normalize_owner_rank
@@ -60,6 +61,16 @@ def get_owned_params(model: nn.Module, rank: OwnerRankLike) -> list[DedicatedPar
 def get_comm_ctx(model: nn.Module) -> Optional[DedicatedCommContext]:
     """Get the DedicatedCommContext from a model, if it exists."""
     return getattr(model, "_dedicated_comm_ctx", None)
+
+
+def _assert_no_parameter_retention(model: nn.Module, operation: str) -> None:
+    contexts = [get_comm_ctx(model)]
+    contexts.extend(state.comm_ctx for state in iter_dedicated_states(model))
+    seen: set[int] = set()
+    for context in contexts:
+        if context is not None and id(context) not in seen:
+            seen.add(id(context))
+            context.assert_no_parameter_retention(operation)
 
 
 def collect_forward_unshard_profile(
@@ -373,6 +384,7 @@ def broadcast_all_updates(model: nn.Module) -> None:
     so sync/async modes enter collective-bearing groups in one deterministic
     sequence.
     """
+    _assert_no_parameter_retention(model, "broadcast_all_updates")
     groups = _ordered_post_step_groups(model)
     for g in groups:
         _dispatch_post_step_sync(g)
@@ -398,6 +410,7 @@ def broadcast_all_updates_async(model: nn.Module) -> None:
     The async path keeps one pending event per group; the next forward drains
     the event before reading the group's data.
     """
+    _assert_no_parameter_retention(model, "broadcast_all_updates_async")
     model_order = list(_iter_groups(model))
     # TP scatter uses collectives on the TP process group.  Every rank in that
     # group must enter those scatters in exactly the same order, so do not use
@@ -496,6 +509,96 @@ def fence_isolated_process_groups(model: nn.Module) -> None:
 
     for process_group in process_groups:
         dist.barrier(group=process_group)
+
+
+@contextmanager
+def retain_unsharded_params(model: nn.Module) -> Iterator[None]:
+    """Retain dedicated compute weights across an accumulation window.
+
+    Opt in around the complete window, including its final synchronized
+    backward. Earlier microbatches still use :func:`no_sync`; only their
+    post-backward weight release is deferred. Gradient accumulation, casts,
+    reductions and the final synchronized release are unchanged.
+
+    Pass the complete model managed by ``dedicate_params`` with
+    ``reshard_after_forward=False`` for every group. DDP and mixed FSDP2 models
+    are unsupported. Call ``zero_grad`` before entry, and optimizer step,
+    checkpoint save/load and update publication after exit. All ranks must
+    follow the same schedule. Do not mutate parameters or use native
+    ``load_state_dict`` inside the window. Nesting this context is supported;
+    nesting ``no_sync`` is not supported.
+
+    Exit also releases prefetched/unvisited groups and an incomplete window,
+    using the original event-safe reshard path. It does not clear accumulated
+    gradients. Complete weights can occupy the whole model on every rank;
+    account for activations, gradients and communication buffers separately.
+
+    Args:
+        model: Complete model managed by ``dedicate_params``.
+
+    Yields:
+        None. The dedicated compute weights remain resident inside the context.
+    """
+    states = list(iter_dedicated_states(model))
+    if not states:
+        raise ValueError("retain_unsharded_params requires a dedicated-ownership model")
+    if any(
+        callable(getattr(module, "set_reshard_after_backward", None)) for module in model.modules()
+    ):
+        raise ValueError("retain_unsharded_params does not support mixed FSDP2 models")
+    contexts = {}
+    selected_states = {}
+    for state in states:
+        if not isinstance(state.group, DedicatedParamGroup) or state.reshard_after_forward:
+            raise ValueError(
+                "retain_unsharded_params requires dedicated ownership with "
+                "reshard_after_forward=False for every group"
+            )
+        context = state.comm_ctx
+        if state.group.comm_ctx is not context:
+            raise ValueError("dedicated state and group must share one communication context")
+        contexts[id(context)] = context
+        selected_states.setdefault(id(context), set()).add(id(state))
+    for key, context in contexts.items():
+        if selected_states[key] != {id(state) for state in context.all_states}:
+            raise ValueError("retain_unsharded_params requires the complete ownership model")
+        if context._parameter_retention_cleanup_error is not None:
+            context.assert_no_parameter_retention("retain_unsharded_params")
+
+    previous_flags = [(state, state._retain_unsharded_in_no_sync) for state in states]
+    previous_depths = [
+        (context, context._parameter_retention_depth) for context in contexts.values()
+    ]
+    # An inner context must not release any group already owned by its outer
+    # context. Coverage checks above also include forward-prefetch targets.
+    previously_retained = {id(state.group) for state, flag in previous_flags if flag}
+    cleanup_groups = {}
+    for state, _ in previous_flags:
+        if id(state.group) not in previously_retained:
+            cleanup_groups[id(state.group)] = state.group
+        state._retain_unsharded_in_no_sync = True
+    for context, depth in previous_depths:
+        context._parameter_retention_depth = depth + 1
+    try:
+        yield
+    finally:
+        cleanup_errors = []
+        try:
+            for group in cleanup_groups.values():
+                try:
+                    group.reshard()
+                except BaseException as error:
+                    # Cleanup is attempted once per group; no compute replay.
+                    cleanup_errors.append(error)
+            if cleanup_errors:
+                for context, _ in previous_depths:
+                    context._parameter_retention_cleanup_error = str(cleanup_errors[0])
+                raise cleanup_errors[0]
+        finally:
+            for state, flag in previous_flags:
+                state._retain_unsharded_in_no_sync = flag
+            for context, depth in previous_depths:
+                context._parameter_retention_depth = depth
 
 
 @contextmanager

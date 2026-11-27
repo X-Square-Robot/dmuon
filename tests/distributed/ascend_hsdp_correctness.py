@@ -111,7 +111,12 @@ def same_on_all_ranks(value: Any, device: torch.device, stage: str) -> list[str]
 
 
 def build_stack(
-    model_cls: type[nn.Module], initial: dict[str, Any], device: torch.device, mesh: Any, hsdp: bool
+    model_cls: type[nn.Module],
+    initial: dict[str, Any],
+    device: torch.device,
+    mesh: Any,
+    hsdp: bool,
+    compute_backend: str = "auto",
 ) -> tuple[nn.Module, dmuon.Muon]:
     """Use the original model, parameter predicate and optimizer configuration."""
     model = model_cls().to(device)
@@ -134,6 +139,7 @@ def build_stack(
         adamw_lr=1e-3,
         adamw_betas=(0.9, 0.999),
         adamw_weight_decay=0.01,
+        compute_backend=compute_backend,
     )
     return model, optimizer
 
@@ -199,6 +205,7 @@ def main(
     resume_after: int | None = None,
     output_dir: str | Path | None = None,
     model_cls: type[nn.Module] | None = None,
+    compute_backend: str = "auto",
 ) -> None:
     """Run strict cross-mesh comparison and two HSDP disk-restart updates.
 
@@ -225,6 +232,7 @@ def main(
         "rank": rank,
         "steps": steps,
         "resume_after": resume_after,
+        "compute_backend": compute_backend,
         "global_optimizer_calls": 0,
         "rtol": 0,
         "atol": 0,
@@ -271,8 +279,12 @@ def main(
         ]
         mesh_a = init_device_mesh("npu", (4,))
         mesh_b = init_device_mesh("npu", (2, 2), mesh_dim_names=("replicate", "shard"))
-        model_a, optimizer_a = build_stack(model_cls, initial, device, mesh_a, False)
-        model_b, optimizer_b = build_stack(model_cls, initial, device, mesh_b, True)
+        model_a, optimizer_a = build_stack(
+            model_cls, initial, device, mesh_a, False, compute_backend
+        )
+        model_b, optimizer_b = build_stack(
+            model_cls, initial, device, mesh_b, True, compute_backend
+        )
         initial_a, initial_b = snapshot(model_a, optimizer_a), snapshot(model_b, optimizer_b)
         collective_check(
             "initial cross-mesh state",
@@ -307,7 +319,9 @@ def main(
         del model_a, optimizer_a, model_b, optimizer_b, initial_a, initial_b, state_a, state_b
         gc.collect()
         torch.npu.empty_cache()
-        restored, restored_optimizer = build_stack(model_cls, initial, device, mesh_b, True)
+        restored, restored_optimizer = build_stack(
+            model_cls, initial, device, mesh_b, True, compute_backend
+        )
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         assert checkpoint["next_step"] == resume_after
         dmuon.set_model_state_dict(restored, checkpoint["model"])

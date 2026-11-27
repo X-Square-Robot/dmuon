@@ -121,6 +121,8 @@ class DedicatedCommContext:
         self.all_states: list[DedicatedState] = []
         self.forward_prefetch_depth = 1
         self.post_backward_final_callback_queued: bool = False
+        self._parameter_retention_depth = 0
+        self._parameter_retention_cleanup_error: Optional[str] = None
         # Rolling-drain pointer for the 1-outstanding reduce policy; see the
         # class docstring's "Rolling reduce drain" section.  Untyped because
         # it holds whichever concrete group type the active backend uses
@@ -160,6 +162,17 @@ class DedicatedCommContext:
                 "prefetch_unready_sharded_muon_publish_waits_queued": 0,
             }
         )
+
+    def assert_no_parameter_retention(self, operation: str) -> None:
+        """Reject mutation/snapshot boundaries while compute weights are retained."""
+        cleanup_error = getattr(self, "_parameter_retention_cleanup_error", None)
+        if cleanup_error is not None:
+            raise RuntimeError(
+                f"{operation} is unavailable after parameter-retention cleanup failed: "
+                f"{cleanup_error}. Rebuild the model before continuing."
+            )
+        if getattr(self, "_parameter_retention_depth", 0):
+            raise RuntimeError(f"{operation} must run outside retain_unsharded_params(model)")
 
     @staticmethod
     def _normalize_tp_buffer_reuse(value: bool | str) -> str:

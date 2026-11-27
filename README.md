@@ -64,8 +64,30 @@ Optional CUDA kernels: `pip install -e ".[syrk]"` (SM80) or
 **Ascend NPU (experimental):** activate CANN, then run
 `DMUON_BUILD_FAST_CLIP=0 pip install -e . --no-build-isolation`. Import `torch_npu`
 and use an `"npu"` device mesh with the `hccl` backend and the same public API.
-CUDA-only SYRK, fast-clip kernels, and CUDA-graph Newton–Schulz are skipped on NPU.
-See the [installation guide](docs/getting-started/installation.md#ascend-950dt-experimental)
+On 950DT, build TileLang v0.1.15 with `USE_ASCEND=ON USE_CUDA=OFF`,
+then select the owner-local compute backend before launching training:
+
+| Setting | Behavior |
+|:---|:---|
+| `compute_backend="auto"` (default) | Use TileLang on 950DT when available; otherwise fall back to PyTorch. Other devices keep their existing backend. |
+| `compute_backend="tilelang"` | Require TileLang on 950DT; raise an actionable error if it is unavailable or unsupported. |
+| `compute_backend="torch"` | Always use the native PyTorch implementation. |
+
+```python
+# One optimizer-level setting covers Muon, AdamW, NS, and optimizer clipping.
+optimizer = dmuon.Muon(model, compute_backend="auto")
+optimizer = dmuon.Muon(model, compute_backend="tilelang")  # no silent fallback
+optimizer = dmuon.Muon(model, compute_backend="torch")
+
+# Standalone APIs accept the same optional setting (default: "auto").
+dmuon.gram_newton_schulz(G, compute_backend="tilelang")
+dmuon.clip_grad_norm_buckets_(buckets, 1.0, compute_backend="torch")
+```
+
+Explicit `kernel="cublas"` or `deterministic=True` is CUDA-only and raises on
+Ascend; CUDA keeps its existing Newton–Schulz behavior. See the
+[950DT optimizer benchmark](docs/guides/ascend-tilelang.md),
+[installation guide](docs/getting-started/installation.md#ascend-950dt-experimental),
 and [test instructions](tests/README.md) for details.
 
 ## 3-Line Integration

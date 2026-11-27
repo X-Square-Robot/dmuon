@@ -58,7 +58,10 @@ def test_segmented_clip_device_contract(monkeypatch, path, values, max_norm):
         ),
         max_norm,
     )
-    assert result.fastpath is (path == "cuda_extension")
+    expected_fastpath = path == "cuda_extension" or (
+        path == "npu" and fast_clip.supports_tilelang_clip(device, (grad,))
+    )
+    assert result.fastpath is expected_fastpath
     for stats in result.bucket_stats:
         for field in ("total_norm", "clip_coef", "clipped", "found_inf"):
             tensor = getattr(stats, field)
@@ -277,24 +280,34 @@ class _FakeOptimizer:
 
 
 @pytest.mark.parametrize("device", ["cpu", "privateuseone:0"])
-def test_optimizer_fast_clip_early_return_on_non_cuda_device(monkeypatch, device):
+def test_optimizer_fast_clip_early_return_on_unsupported_device(monkeypatch, device):
     grad = torch.tensor([3.0, 4.0])
     original = grad.clone()
     optimizer = _FakeOptimizer(grad)
     optimizer._comm_ctx = SimpleNamespace(device=device)
 
     def unexpected_call(*args, **kwargs):
-        raise AssertionError("Non-CUDA early return must not load kernels or issue collectives")
+        raise AssertionError("Unsupported-device early return must not load kernels or collect")
 
     monkeypatch.setattr(fast_clip, "_load_fast_clip_extension", unexpected_call)
     monkeypatch.setattr(fast_clip.dist, "all_reduce", unexpected_call)
-    assert (
-        try_clip_optimizer_grad_norm_buckets_(
-            optimizer, regular_grads=[grad], adamw_grads=[], max_norm=1.0
+    supports_tilelang = fast_clip.use_tilelang(torch.device(device))
+    if supports_tilelang:
+        monkeypatch.setattr(
+            fast_clip,
+            "clip_grad_norm_buckets_",
+            lambda *args, **kwargs: SimpleNamespace(stats_by_name={}, fastpath=True),
         )
-        is None
+    result = try_clip_optimizer_grad_norm_buckets_(
+        optimizer, regular_grads=[grad], adamw_grads=[], max_norm=1.0
     )
-    assert optimizer._ensure_calls == 0
+    if supports_tilelang:
+        # Ascend exposes its NPU backend through the privateuseone alias.
+        assert result is not None
+        assert optimizer._ensure_calls == 1
+    else:
+        assert result is None
+        assert optimizer._ensure_calls == 0
     torch.testing.assert_close(grad, original, rtol=0, atol=0)
 
 

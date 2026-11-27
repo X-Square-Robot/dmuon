@@ -120,8 +120,13 @@ and public interfaces with CUDA across DDP, FSDP2, and HSDP.
 - **Empty shards:** initialize AdamW state and advance step counters while
   excluding zero-length shards from foreach kernel launches.
 
-On Ascend, DMuon uses the shared eager PyTorch Newton–Schulz path.
-CUDA-specific SYRK kernels, fast-clip extensions, and CUDA graph replay remain CUDA features.
+Ascend 950DT defaults to the TileLang compute backend. Build upstream TileLang
+with `USE_ASCEND=ON` and `USE_CUDA=OFF` in the training environment. Select
+`dmuon.Muon(..., compute_backend="torch")` for the native PyTorch implementation,
+or `compute_backend="tilelang"` to require TileLang without a silent fallback.
+Standalone Newton–Schulz and bucket-clipping APIs accept the same argument.
+See the [upstream build instructions](https://github.com/tile-ai/tilelang/blob/v0.1.15/tilelang/ascend/README.md)
+and the [950DT benchmark](../guides/ascend-tilelang.md).
 
 ### Installation
 
